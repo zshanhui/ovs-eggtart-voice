@@ -205,10 +205,51 @@ class MatchaTRTBackend(TTSBackend):
             self.synthesize(t)
         logger.info("Warmup: %.1fs", time.time() - start)
 
-    STRESS_MARKS = "ˈˌ"
+    STRESS_MARKS = "ˈˌː"  # Primary stress, secondary stress, length mark
 
     def _phonemize_english(self, text: str) -> list[str]:
-        """Use espeak-ng for English IPA with --ipa=1 (_ separated)."""
+        """Phonemize English text using piper-phonemize (same as sherpa-onnx).
+
+        Falls back to subprocess espeak-ng if piper-phonemize is unavailable.
+        """
+        # Try piper-phonemize first (same library as sherpa-onnx)
+        try:
+            import piper_phonemize
+            # phonemize_espeak returns List[List[str]] (sentences of phonemes)
+            sentences = piper_phonemize.phonemize_espeak(text, "en-us")
+            if not sentences:
+                logger.warning("piper-phonemize returned empty for: %r", text)
+                return self._phonemize_english_subprocess(text)
+
+            # Flatten and process phonemes
+            out = []
+            for phoneme_list in sentences:
+                for ph in phoneme_list:
+                    if ph == " ":  # Space between words
+                        continue
+                    # Strip stress marks
+                    ph_stripped = ph.lstrip(self.STRESS_MARKS)
+                    if not ph_stripped:
+                        continue
+                    # Try whole phoneme first, then single chars
+                    if ph_stripped in self._token_to_id:
+                        out.append(ph_stripped)
+                    else:
+                        for ch in ph_stripped:
+                            if ch in self._token_to_id:
+                                out.append(ch)
+                            else:
+                                logger.warning("Unknown phoneme: %r (from %r)", ch, ph)
+            return out
+        except ImportError:
+            logger.info("piper-phonemize not available, falling back to espeak-ng subprocess")
+            return self._phonemize_english_subprocess(text)
+        except Exception as e:
+            logger.warning("piper-phonemize failed: %s, falling back to subprocess", e)
+            return self._phonemize_english_subprocess(text)
+
+    def _phonemize_english_subprocess(self, text: str) -> list[str]:
+        """Fallback: use espeak-ng subprocess for English IPA with --ipa=1."""
         import subprocess
         try:
             cmd = ["espeak-ng", "--ipa=1", "-v", "en-us", "-q", "--", text]
@@ -225,7 +266,7 @@ class MatchaTRTBackend(TTSBackend):
             for ph in raw.split("_"):
                 if not ph:
                     continue
-                # Strip leading stress marks (they're in tokens.txt but may affect quality)
+                # Strip leading stress marks
                 ph_stripped = ph.lstrip(self.STRESS_MARKS)
                 # Try full phoneme first (e.g. "oʊ"), then fallback to single chars
                 if ph_stripped in self._token_to_id:
@@ -389,10 +430,21 @@ class MatchaTRTBackend(TTSBackend):
 
         estimator_ms = (time.time() - t0) * 1000
 
-        # Denormalize mel
+        # Denormalize + clip mel (matches rkvoice matcha.py:429-430)
         mel = z * MEL_SIGMA + MEL_MEAN
-        est_frames = int((11.9 * num_tokens + 51) * length_scale[0] * 1.2 + 0.5)
-        mel_frames = min(est_frames, MAX_MEL_FRAMES)
+        mel = np.clip(mel, -25.0, 8.0)
+
+        # Derive mel_frames from encoder mask (1=valid, 0=padding).
+        # Heuristic 11.9·num_tokens+51 saturates at 600 for English long inputs.
+        mask_valid = int(mask[0, 0, :].astype(np.float32).sum() + 0.5)
+        if mask_valid <= 0:
+            est_frames = int((11.9 * num_tokens + 51) * length_scale[0] * 1.2 + 0.5)
+            mel_frames = min(est_frames, MAX_MEL_FRAMES)
+            logger.warning("matcha mask sum=0, falling back to heuristic mel_frames=%d", mel_frames)
+        else:
+            mel_frames = min(mask_valid, MAX_MEL_FRAMES)
+        logger.debug("matcha frames: tokens=%d mask=%d mel_frames=%d (~%.2fs)",
+                     num_tokens, mask_valid, mel_frames, mel_frames * HOP_LENGTH / SAMPLE_RATE)
 
         # Vocos
         t0 = time.time()
