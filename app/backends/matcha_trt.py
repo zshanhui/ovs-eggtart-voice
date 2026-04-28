@@ -174,10 +174,20 @@ class MatchaTRTBackend(TTSBackend):
         self._token_to_id = {}
         if os.path.exists(TOKENS_PATH):
             with open(TOKENS_PATH, "r", encoding="utf-8") as f:
-                for i, line in enumerate(f):
-                    parts = line.strip().split()
-                    if len(parts) >= 1:
-                        self._token_to_id[parts[0]] = i + 1
+                for line in f:
+                    raw = line.rstrip("\n").rstrip("\r")
+                    if not raw:
+                        continue
+                    # Format: "<token><ws><id>". Token may itself be a single space.
+                    rsep = max(raw.rfind(" "), raw.rfind("\t"))
+                    if rsep < 0:
+                        continue
+                    tok = raw[:rsep] or " "  # leading-whitespace line → space token
+                    try:
+                        tid = int(raw[rsep + 1:])
+                    except ValueError:
+                        continue
+                    self._token_to_id[tok] = tid
             logger.info("Loaded %d tokens from %s", len(self._token_to_id), TOKENS_PATH)
 
     def _load_engines(self):
@@ -221,27 +231,28 @@ class MatchaTRTBackend(TTSBackend):
             self.synthesize(t)
         logger.info("Warmup: %.1fs", time.time() - start)
 
-    STRESS_MARKS = "ˈˌː"  # Primary stress, secondary stress, length mark
-
     def _phonemize_english(self, text: str) -> list[str]:
-        """Phonemize English via piper-phonemize (same lib as sherpa-onnx)."""
+        """Phonemize English via piper-phonemize (same lib as sherpa-onnx).
+
+        Preserves stress marks (ˈˌ), length mark (ː), and word-boundary
+        spaces — all are real tokens in tokens.txt. Stripping them strips
+        prosody information the acoustic model was trained to consume.
+        """
         import piper_phonemize
         sentences = piper_phonemize.phonemize_espeak(text, "en-us")
         if not sentences:
             logger.warning("piper-phonemize returned empty for: %r", text)
             return []
         out = []
-        for phoneme_list in sentences:
+        for sent_idx, phoneme_list in enumerate(sentences):
+            if sent_idx > 0 and " " in self._token_to_id:
+                out.append(" ")  # sentence separator
             for ph in phoneme_list:
-                if ph == " ":
-                    continue
-                ph_stripped = ph.lstrip(self.STRESS_MARKS)
-                if not ph_stripped:
-                    continue
-                if ph_stripped in self._token_to_id:
-                    out.append(ph_stripped)
+                if ph in self._token_to_id:
+                    out.append(ph)
                 else:
-                    for ch in ph_stripped:
+                    # Multi-char phoneme: split into single chars
+                    for ch in ph:
                         if ch in self._token_to_id:
                             out.append(ch)
                         else:
