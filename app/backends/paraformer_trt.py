@@ -60,7 +60,7 @@ TOKENS_PATH = os.environ.get(
 
 # Streaming parameters — match sherpa-onnx training distribution
 # (https://huggingface.co/csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en)
-CHUNK_SIZE_SEC = 0.67      # 67 fbank frames per chunk
+CHUNK_SIZE_SEC = 0.67      # 670ms chunk for low-latency partials
 LEFT_CONTEXT_SEC = 2.68    # 4 prior chunks of left context (encoder_chunk_look_back=4)
 
 # FBank parameters (kaldi-compatible)
@@ -80,7 +80,7 @@ CIF_THRESHOLD = 1.0
 # Defer the last N LFR frames of each chunk's CIF to the next chunk:
 # these frames have no right-context in the current encoder run; they'll
 # reach full context once they become history in the next chunk's run.
-RIGHT_LOOKAHEAD_LFR = 1
+RIGHT_LOOKAHEAD_LFR = 15
 CIF_TAIL_THRESHOLD = 0.5    # Minimum weight to fire tail token on finalize
 
 # Tokens
@@ -457,8 +457,10 @@ class ParaformerTRTStream(ASRStream):
         enc_t = enc[0]
         alphas_t = alphas[0]
 
+        # cif_processed_lfr is absolute LFR index from utterance start.
+        # Encoder runs on full all_lfr, so cif_start_local == absolute index.
         cif_end = enc_t.shape[0] - RIGHT_LOOKAHEAD_LFR
-        cif_start = max(self._cif_processed_lfr, hist_stacked)
+        cif_start = self._cif_processed_lfr
         if cif_end <= cif_start:
             self._chunk_count += 1
             return
