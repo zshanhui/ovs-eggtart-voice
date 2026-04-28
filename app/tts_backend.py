@@ -126,5 +126,9 @@ def create_backend(backend_name: Optional[str] = None) -> TTSBackend:
             from backends.qwen3_trt import Qwen3TRTBackend
             logger.info("Using Qwen3TRTBackend from local backends/")
         return Qwen3TRTBackend()
+    elif backend_name == "matcha_trt":
+        from backends.matcha_trt import MatchaTRTBackend
+        logger.info("Using MatchaTRTBackend from local backends/")
+        return MatchaTRTBackend()
     else:
         raise ValueError(f"Unknown TTS backend: {backend_name}")
