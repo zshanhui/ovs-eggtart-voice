@@ -274,8 +274,9 @@ def decode_ids(token_ids: list[int], tokens: list[str]) -> str:
     Skips BLANK/SOS/EOS and suppresses immediate adjacent-id repeats
     (e.g. [6049, 6049] → one "好"). EOS is skipped, NOT used as a stop:
     Paraformer streaming may emit EOS mid-stream as cache-flush artifact.
+    BPE continuation suffix "@@" is stripped and merged with next token.
     """
-    chars = []
+    pieces = []
     prev_tid: Optional[int] = None
     for tid in token_ids:
         if tid in (BLANK_ID, SOS_ID, EOS_ID):
@@ -286,9 +287,11 @@ def decode_ids(token_ids: list[int], tokens: list[str]) -> str:
             token = tokens[tid]
             if token.startswith("<") and token.endswith(">"):
                 continue
-            chars.append(token)
+            if token.endswith("@@"):
+                token = token[:-2]
+            pieces.append(token)
             prev_tid = tid
-    return "".join(chars)
+    return "".join(pieces)
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +649,7 @@ class ParaformerTRTBackend(ASRBackend):
         # only when audio exceeds engine max.
         ENGINE_MAX_FRAMES = 400
         chunk_frames = min(ENGINE_MAX_FRAMES, max(40, feats.shape[0]))
-        all_text_parts = []
+        all_token_ids: list[int] = []
         carry_w = 0.0
         carry_e = np.zeros(512, dtype=np.float32)
         cache = [np.zeros((1, 512, 10), dtype=np.float32) for _ in range(16)]
@@ -677,10 +680,7 @@ class ParaformerTRTBackend(ASRBackend):
                 cache,
             )
             if sample_ids is not None:
-                new_ids = sample_ids.tolist()
-                text = decode_ids(new_ids, self._tokens)
-                if text:
-                    all_text_parts.append(text)
+                all_token_ids.extend(sample_ids.tolist())
 
         # Flush tail
         if carry_w >= CIF_TAIL_THRESHOLD:
@@ -690,11 +690,9 @@ class ParaformerTRTBackend(ASRBackend):
                 dummy_enc, 1, acoustic_embeds, 1, cache,
             )
             if sample_ids is not None:
-                text = decode_ids(sample_ids.tolist(), self._tokens)
-                if text:
-                    all_text_parts.append(text)
+                all_token_ids.extend(sample_ids.tolist())
 
-        full_text = "".join(all_text_parts)
+        full_text = decode_ids(all_token_ids, self._tokens)
         return TranscriptionResult(text=full_text, language=language)
 
     def transcribe_audio(self, audio: np.ndarray, language: str = "auto") -> TranscriptionResult:
