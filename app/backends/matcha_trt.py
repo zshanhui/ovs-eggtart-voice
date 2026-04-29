@@ -148,10 +148,14 @@ class MatchaTRTBackend(TTSBackend):
         """
         import onnxruntime as ort
         path = os.path.join(_MODEL_BASE, "model-steps-3.onnx")
-        providers = [
-            ("CUDAExecutionProvider", {"device_id": 0, "arena_extend_strategy": "kSameAsRequested"}),
-            "CPUExecutionProvider",
-        ]
+        ep_override = os.environ.get("MATCHA_ACOUSTIC_EP", "").upper()
+        if ep_override == "CPU":
+            providers = ["CPUExecutionProvider"]
+        else:
+            providers = [
+                ("CUDAExecutionProvider", {"device_id": 0, "arena_extend_strategy": "kSameAsRequested"}),
+                "CPUExecutionProvider",
+            ]
         sess_opt = ort.SessionOptions()
         sess_opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self._acoustic_ort = ort.InferenceSession(path, sess_opt, providers=providers)
