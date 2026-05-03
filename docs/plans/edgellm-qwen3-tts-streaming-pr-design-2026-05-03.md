@@ -247,6 +247,41 @@ However, this tighter profile should not become the default yet. On the same Nan
 
 The regression came from larger streaming chunks: the new profile ran the 75-frame chunk at about `1158 ms`, while the old engine handled the same shape at about `578 ms`. Keep the old Code2Wav engine for the runtime path until profile/tactic selection is understood.
 
+The old self-implemented path was checked again as a possible escape hatch. Its ORT CUDA EP fallback is not automatically faster on the current Nano image. Host Python only has CPU ORT:
+
+```text
+onnxruntime 1.23.2 providers ['AzureExecutionProvider', 'CPUExecutionProvider']
+```
+
+The old `jetson-voice-speech:v3.4-slim` container exposes CUDA/TensorRT providers, but CUDA EP initially failed because the container lacked JetPack 6 CUDA libraries:
+
+```text
+Failed to load library libonnxruntime_providers_cuda.so with error: libcublasLt.so.12: cannot open shared object file
+```
+
+Mounting the host CUDA/TensorRT libraries fixes provider loading:
+
+```bash
+docker run --rm --runtime nvidia --network host \
+  -v /home/harvest:/home/harvest \
+  -v /usr/local/cuda-12.6:/usr/local/cuda-12.6:ro \
+  -v /usr/lib/aarch64-linux-gnu:/host-usr-lib-aarch64:ro \
+  -e LD_LIBRARY_PATH=/usr/local/cuda-12.6/targets/aarch64-linux/lib:/host-usr-lib-aarch64 \
+  jetson-voice-speech:v3.4-slim \
+  python3 /home/harvest/vocoder_ort_bench.py \
+    --model /home/harvest/voice_test/models/qwen3-tts/onnx/vocoder_fp16.onnx \
+    --provider cuda
+```
+
+Steady-state CUDA EP timing with zero RVQ codes was about `548 ms` per invocation for `1/5/10/20/25/50/75/100/150` input frames, and the ONNX output tensor stayed at `8.0 s` of audio. This means the old ORT path is effectively a fixed-cost full decoder call for this exported model. It can match the rough `~0.55 s` Code2Wav floor, but it does not directly provide a `100 ms` first-vocoder path.
+
+Current conclusion: keep EdgeLLM TRT Code2Wav as the default PR path, keep `async_code2wav` opt-in, and treat sub-500ms V2V as a pipeline problem rather than a simple vocoder backend swap. The useful next optimizations are:
+
+1. overlap Code2Wav with subsequent Talker/CP only on devices where a second CUDA stream shows real overlap;
+2. add a dedicated two-stage TTS worker mode for 16GB devices so Talker/CP and Code2Wav can be scheduled independently;
+3. investigate graph surgery or a new exported vocoder that returns only the needed streaming samples instead of an 8s fixed output;
+4. hide the remaining first-vocoder floor with ASR partials/speculative TTS in the voice-to-voice pipeline.
+
 TTS correctness requires the special CodePredictor path on the current Nano runtime:
 
 ```bash
