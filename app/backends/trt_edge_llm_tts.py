@@ -260,6 +260,19 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
     def generate_streaming(self, text: str, **kwargs):
         """Yield raw PCM int16 chunks from the resident EdgeLLM TTS worker."""
         req_id = uuid.uuid4().hex
+        streaming_profile = str(
+            kwargs.get("streaming_profile", os.environ.get("EDGE_LLM_TTS_STREAMING_PROFILE", "low_latency"))
+        ).lower()
+        if streaming_profile in ("playback", "smooth"):
+            default_first_chunk_frames = 20
+            default_chunk_frames = 20
+            default_chunk_growth_frames = 30
+            default_max_chunk_frames = 120
+        else:
+            default_first_chunk_frames = 1
+            default_chunk_frames = 25
+            default_chunk_growth_frames = 50
+            default_max_chunk_frames = 150
         request = {
             "id": req_id,
             "text": text,
@@ -274,11 +287,11 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             "stream_only": True,
             "first_chunk_frames": kwargs.get(
                 "first_chunk_frames",
-                int(os.environ.get("EDGE_LLM_TTS_FIRST_CHUNK_FRAMES", "1")),
+                int(os.environ.get("EDGE_LLM_TTS_FIRST_CHUNK_FRAMES", str(default_first_chunk_frames))),
             ),
             "chunk_frames": kwargs.get(
                 "chunk_frames",
-                int(os.environ.get("EDGE_LLM_TTS_CHUNK_FRAMES", "25")),
+                int(os.environ.get("EDGE_LLM_TTS_CHUNK_FRAMES", str(default_chunk_frames))),
             ),
             "adaptive_chunks": kwargs.get(
                 "adaptive_chunks",
@@ -287,11 +300,11 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             ),
             "max_chunk_frames": kwargs.get(
                 "max_chunk_frames",
-                int(os.environ.get("EDGE_LLM_TTS_MAX_CHUNK_FRAMES", "150")),
+                int(os.environ.get("EDGE_LLM_TTS_MAX_CHUNK_FRAMES", str(default_max_chunk_frames))),
             ),
             "chunk_growth_frames": kwargs.get(
                 "chunk_growth_frames",
-                int(os.environ.get("EDGE_LLM_TTS_CHUNK_GROWTH_FRAMES", "50")),
+                int(os.environ.get("EDGE_LLM_TTS_CHUNK_GROWTH_FRAMES", str(default_chunk_growth_frames))),
             ),
             "chunk_format": "pcm_s16le",
             "chunk_transport": "base64",

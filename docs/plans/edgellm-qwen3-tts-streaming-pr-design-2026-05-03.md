@@ -189,6 +189,13 @@ There is a separate playback-continuity tradeoff. `first_chunk_frames=1` gives t
 
 For V2V latency reporting, keep two metrics: first emitted audio (`~0.64s` in low-TTFT mode) and first self-sustaining playback buffer (`~1.7s` with `first_chunk_frames=20`). The former is useful for immediate feedback; the latter better predicts whether playback will sound continuous without client-side buffering.
 
+The Python backend exposes this as `EDGE_LLM_TTS_STREAMING_PROFILE`:
+
+```text
+low_latency: first=1, chunk=25, growth=50, max=150
+playback:    first=20, chunk=20, growth=30, max=120
+```
+
 The remaining RTF cost is mostly from Code2Wav itself. A background Code2Wav queue with a separate CUDA stream was tested as an experimental `async_code2wav` path, but it did not materially improve Nano hot metrics:
 
 ```json
