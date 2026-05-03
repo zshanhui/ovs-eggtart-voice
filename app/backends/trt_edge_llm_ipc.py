@@ -93,6 +93,9 @@ TTS_SPECIAL_CP_EMBED_FP32 = os.environ.get(
 
 # ASR engine directories
 _ASR_PRUNED_ENGINE_DIR = os.path.expanduser(
+    "~/qwen3-asr-edgellm-runtime/engines/thinker_prunedembed35k_kv512"
+)
+_ASR_OFFICIAL_PRUNED_ENGINE_DIR = os.path.expanduser(
     "~/qwen3-asr-edgellm-runtime/engines/thinker_pruned35k_kv512"
 )
 _ASR_DIALOG_ENGINE_DIR = os.path.expanduser(
@@ -102,6 +105,8 @@ ASR_ENGINE_DIR = os.environ.get(
     "EDGE_LLM_ASR_ENGINE_DIR",
     _ASR_PRUNED_ENGINE_DIR
     if os.path.exists(os.path.join(_ASR_PRUNED_ENGINE_DIR, "llm.engine"))
+    else _ASR_OFFICIAL_PRUNED_ENGINE_DIR
+    if os.path.exists(os.path.join(_ASR_OFFICIAL_PRUNED_ENGINE_DIR, "llm.engine"))
     else _ASR_DIALOG_ENGINE_DIR
     if os.path.exists(os.path.join(_ASR_DIALOG_ENGINE_DIR, "llm.engine"))
     else os.path.expanduser("~/qwen3-asr-trt-edge-llm-export/engines/thinker"),
