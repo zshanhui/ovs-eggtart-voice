@@ -455,6 +455,32 @@ Decision:
   - frame count and duration.
 - If the single-profile iterative prefill is the quality source, rebuild W8A16 with a true prefill profile instead of accepting iterative prefill.
 
+## Updated W8A16 Decision After KV-Capacity Repair
+
+The one-frame W8A16 failure has a concrete runtime root cause:
+
+```text
+Clamped maxAudioLength from 30 to 1 (prefill=9, KV capacity=1)
+```
+
+The single-profile W8A16 engine has `inputs_embeds` max seqLen `1`, but its past-KV bindings support a longer cache. The runtime incorrectly used the input max as `maxKVCacheCapacity`, so the generation loop clamped `maxAudioLength` to one frame. Repairing the runtime to use the past-KV max fixed the frame-count failure without changing EOS or sampling.
+
+Post-repair status:
+
+- TTS-only W8A16 plus5k/vocoder50 generates `30` frames and `115,200` PCM bytes, with no clamp warning.
+- Dual-resident W8A16 plus5k/vocoder50 passes real `/tts/stream` while ASR remains resident.
+- Dual-resident memory headroom is about `435-520 MB` during startup warmup and about `447-449 MB` on later real requests.
+- Sequential body-read timing for `/tts/stream`:
+  - `你好`: first body `2.564 s`, total `2.564 s`, `80,644` bytes.
+  - `你好，今天天气很好。`: first body `2.414 s`, total `6.119 s`, `230,404` bytes.
+
+Updated decision:
+
+- Promote W8A16 from "memory-only branch" to the next candidate to quality-gate.
+- Do not widen TTS vocab beyond plus5k on BF16 before this gate; W8A16 gives more headroom with no extra first-request engine load.
+- The remaining blocker is quality, not frame count. Run listen review, ASR round-trip, duration/silence checks, and BF16-vs-W8 fixed-text comparisons before accepting it as the low-latency Nano path.
+- Keep the runtime invariant permanently: generation length limits must be derived from past-KV capacity, never from the one-token input profile max.
+
 ## TTS Pruned Vocab +5k Decision
 
 The first expansion from `35669` rows to `40669` rows passed the real dual-resident streaming gate:

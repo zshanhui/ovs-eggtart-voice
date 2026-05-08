@@ -745,3 +745,68 @@ Decision:
 - Keep `+5k` as the current widest BF16 dual-resident vocab that has passed the streaming gate.
 - Do not jump to `+10k` on BF16 until another memory cut is available. The expected tensor cost is only another `~19.5 MB`, but the measured `after_tts_runtime` floor is already too low.
 - W8A16 memory could support a wider vocab, but W8 output quality is not usable yet, so it remains a separate repair branch.
+
+## Run 13 - W8A16 KV-Capacity Repair + Plus5k + Vocoder50
+
+Root cause found from worker stderr after adding a smoke-test `--print-stderr` option:
+
+```text
+Clamped maxAudioLength from 30 to 1 (prefill=9, KV capacity=1)
+```
+
+The previous W8A16 "quality" failure was therefore not fixed by EOS or sampling knobs. The single-profile W8A16 Talker reports `inputs_embeds` max seqLen `1`, but its past-KV bindings support a longer sequence. The runtime had propagated `maxSeqLen()` into `maxKVCacheCapacity`, so generation was clamped to one frame even after iterative prefill was added.
+
+Runtime repair in `/home/harvest/project/tensorrt-edge-llm-hlm-current/cpp/runtime/qwen3OmniTTSRuntime.cpp`:
+
+- expose `Qwen3TTSTalkerEngine::maxKVSeqLen()`;
+- set `mTalkerLLMConfig.maxKVCacheCapacity` from the past-KV max, not from the one-token input profile max;
+- rebuild `/home/harvest/project/tensorrt-edge-llm-hlm-current/build_hlm_current/examples/omni/qwen3_tts_worker`.
+
+TTS-only post-fix W8A16 smoke, plus5k pruned vocab, vocoder50:
+
+| Mode | Frames | PCM bytes | First chunk | Total | RTF | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| greedy | 30 | 115,200 | 3.649 s | 4.765 s | 1.985 | no clamp warning |
+| sampling | 30 | 115,200 | 3.445 s | 4.572 s | 1.905 | no clamp warning |
+
+Dual-resident W8A16 result with ASR warmup enabled:
+
+| Stage | MemAvailable |
+|---|---:|
+| TTS `worker_entry_before_plugin` | 4147 MB |
+| TTS `worker_before_tts_runtime` | 4072 MB |
+| TTS `worker_after_tts_runtime` | 779 MB |
+| TTS `worker_after_ready` | 779 MB |
+| startup warmup `worker_before_lazy_code2wav` | 849 MB |
+| startup warmup `worker_after_lazy_code2wav` | 520 MB |
+| startup warmup `worker_after_code2wav_final_chunk` | 435 MB |
+| later real requests after Code2Wav chunks | 447-449 MB |
+
+Real `/tts/stream` requests while ASR remained resident:
+
+```text
+POST /tts/stream {"text":"你好","language":"chinese"}
+HTTP 200, downloaded 192,004 bytes, time_starttransfer 0.058 s, time_total 5.459 s
+
+POST /tts/stream {"text":"你好，今天天气很好。","language":"chinese"}
+HTTP 200, downloaded 230,404 bytes, time_starttransfer 0.059 s, time_total 11.537 s
+```
+
+The two curl requests above were launched concurrently, so use them as functional/fit proof only. A sequential body-read check showed actual body arrival and total time:
+
+```text
+{"text":"你好","status":200,"bytes":80644,"chunks_read":20,"first_body_s":2.564,"total_s":2.564}
+{"text":"你好，今天天气很好。","status":200,"bytes":230404,"chunks_read":57,"first_body_s":2.414,"total_s":6.119}
+```
+
+Outcome:
+
+- The W8A16 one-frame failure is fixed at the runtime level. W8A16 can now generate multi-frame audio through the same streaming endpoint while ASR remains resident.
+- The dual-resident memory headroom is now around `435-520 MB` through Code2Wav warmup and about `447-449 MB` on later real requests, versus about `103-144 MB` for BF16 plus5k.
+- This is the first W8A16 branch that is both memory-useful and functionally streamable. It still needs the normal TTS quality gate: listen review, duration/silence checks, ASR round-trip, and comparison against the BF16 explicit-KV baseline.
+
+Lessons to carry forward:
+
+- For single-profile decode engines, `inputs_embeds` max seqLen and past-KV max length are different constraints. Generation length clamps must use past-KV capacity.
+- If a W8A16 run emits one frame, inspect stderr and runtime length clamps before changing EOS bias, min-EOS, top-k/top-p, or sampling seeds.
+- `curl time_starttransfer` on `/tts/stream` measures HTTP header timing, not first PCM body bytes. Use a body-reading client for first-audio latency.

@@ -38,6 +38,7 @@ def main() -> None:
     parser.add_argument("--language", default="chinese")
     parser.add_argument("--max-audio-length", type=int, default=50)
     parser.add_argument("--min-audio-length", type=int, default=10)
+    parser.add_argument("--print-stderr", action="store_true")
     args = parser.parse_args()
 
     env = os.environ.copy()
@@ -148,6 +149,10 @@ def main() -> None:
         ),
         flush=True,
     )
+    if args.print_stderr and stderr_lines:
+        print("stderr_begin", flush=True)
+        print("".join(stderr_lines), flush=True)
+        print("stderr_end", flush=True)
     proc.terminate()
     try:
         proc.wait(timeout=5)
