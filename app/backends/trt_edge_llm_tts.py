@@ -364,7 +364,11 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         env.setdefault("EDGE_LLM_TTS_LAZY_CODE2WAV", "0")
         # Keep each streaming Code2Wav invocation within the vocoder100 fast
         # profile: first chunk 50 frames, then 97 new frames + 3 context.
-        env.setdefault("EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES", "0" if _env_flag("EDGE_LLM_TTS_STATEFUL_CODE2WAV") else "3")
+        if _env_flag("EDGE_LLM_TTS_STATEFUL_CODE2WAV"):
+            env.setdefault("EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES", "0")
+            env.setdefault("QWEN3_TTS_CP_DECODE_CUDA_GRAPH", "1")
+        else:
+            env.setdefault("EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES", "3")
         return env
 
     def _worker_stderr_snip(self) -> str:
