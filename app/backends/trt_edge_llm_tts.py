@@ -369,6 +369,9 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             env.setdefault("QWEN3_TTS_CP_DECODE_CUDA_GRAPH", "1")
         else:
             env.setdefault("EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES", "3")
+        vocab_pruned = os.environ.get("EDGE_LLM_TTS_VOCAB_PRUNED")
+        if vocab_pruned is not None:
+            env.setdefault("QWEN3_TTS_VOCAB_PRUNED", vocab_pruned)
         return env
 
     def _worker_stderr_snip(self) -> str:

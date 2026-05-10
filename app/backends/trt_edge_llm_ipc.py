@@ -101,6 +101,14 @@ TTS_TALKER_DIR = os.environ.get(
     "EDGE_LLM_TTS_TALKER_DIR",
     os.path.join(_TTS_DEFAULT_ROOT, "engines", "talker"),
 )
+TTS_FULL_TALKER_DIR = os.environ.get("EDGE_LLM_TTS_FULL_TALKER_DIR", TTS_TALKER_DIR)
+TTS_PRUNED_TALKER_DIR = os.environ.get("EDGE_LLM_TTS_PRUNED_TALKER_DIR", TTS_TALKER_DIR)
+_TTS_VOCAB_PRUNED = os.environ.get("EDGE_LLM_TTS_VOCAB_PRUNED", os.environ.get("QWEN3_TTS_VOCAB_PRUNED", "auto")).lower()
+if "EDGE_LLM_TTS_TALKER_DIR" not in os.environ:
+    if _TTS_VOCAB_PRUNED in ("1", "true", "yes"):
+        TTS_TALKER_DIR = TTS_PRUNED_TALKER_DIR
+    elif _TTS_VOCAB_PRUNED in ("0", "false", "no"):
+        TTS_TALKER_DIR = TTS_FULL_TALKER_DIR
 TTS_CODE_PREDICTOR_DIR = os.environ.get(
     "EDGE_LLM_TTS_CP_DIR",
     os.path.join(os.path.dirname(TTS_TALKER_DIR), "code_predictor"),
@@ -131,15 +139,31 @@ _ASR_OFFICIAL_PRUNED_ENGINE_DIR = os.path.expanduser(
 _ASR_DIALOG_ENGINE_DIR = os.path.expanduser(
     "~/qwen3-asr-edgellm-runtime/engines/thinker_kv512"
 )
+_ASR_EXPORT_ENGINE_DIR = os.path.expanduser("~/qwen3-asr-trt-edge-llm-export/engines/thinker")
+ASR_FULL_ENGINE_DIR = os.environ.get(
+    "EDGE_LLM_ASR_FULL_ENGINE_DIR",
+    _ASR_DIALOG_ENGINE_DIR
+    if os.path.exists(os.path.join(_ASR_DIALOG_ENGINE_DIR, "llm.engine"))
+    else _ASR_EXPORT_ENGINE_DIR,
+)
+ASR_PRUNED_ENGINE_DIR = os.environ.get(
+    "EDGE_LLM_ASR_PRUNED_ENGINE_DIR",
+    _ASR_PRUNED_ENGINE_DIR
+    if os.path.exists(os.path.join(_ASR_PRUNED_ENGINE_DIR, "llm.engine"))
+    else _ASR_OFFICIAL_PRUNED_ENGINE_DIR,
+)
+_ASR_VOCAB_PRUNED = os.environ.get("EDGE_LLM_ASR_VOCAB_PRUNED", "auto").lower()
 ASR_ENGINE_DIR = os.environ.get(
     "EDGE_LLM_ASR_ENGINE_DIR",
-    _ASR_PRUNED_ENGINE_DIR
+    ASR_PRUNED_ENGINE_DIR
+    if _ASR_VOCAB_PRUNED in ("1", "true", "yes")
+    else ASR_FULL_ENGINE_DIR
+    if _ASR_VOCAB_PRUNED in ("0", "false", "no")
+    else _ASR_PRUNED_ENGINE_DIR
     if os.path.exists(os.path.join(_ASR_PRUNED_ENGINE_DIR, "llm.engine"))
     else _ASR_OFFICIAL_PRUNED_ENGINE_DIR
     if os.path.exists(os.path.join(_ASR_OFFICIAL_PRUNED_ENGINE_DIR, "llm.engine"))
-    else _ASR_DIALOG_ENGINE_DIR
-    if os.path.exists(os.path.join(_ASR_DIALOG_ENGINE_DIR, "llm.engine"))
-    else os.path.expanduser("~/qwen3-asr-trt-edge-llm-export/engines/thinker"),
+    else ASR_FULL_ENGINE_DIR,
 )
 ASR_AUDIO_ENC_DIR = os.environ.get(
     "EDGE_LLM_ASR_AUDIO_ENC_DIR",

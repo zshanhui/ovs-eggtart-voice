@@ -51,3 +51,63 @@ def test_tts_code_predictor_dir_can_be_overridden(monkeypatch, tmp_path):
     ipc = _reload_ipc(monkeypatch)
 
     assert ipc.TTS_CODE_PREDICTOR_DIR == str(cp_dir)
+
+
+def test_tts_vocab_pruned_selects_configured_talker_dir(monkeypatch, tmp_path):
+    full_dir = tmp_path / "talker_full"
+    pruned_dir = tmp_path / "talker_pruned"
+    monkeypatch.setenv("EDGE_LLM_TTS_FULL_TALKER_DIR", str(full_dir))
+    monkeypatch.setenv("EDGE_LLM_TTS_PRUNED_TALKER_DIR", str(pruned_dir))
+    monkeypatch.setenv("EDGE_LLM_TTS_VOCAB_PRUNED", "1")
+    monkeypatch.delenv("EDGE_LLM_TTS_TALKER_DIR", raising=False)
+
+    ipc = _reload_ipc(monkeypatch)
+
+    assert ipc.TTS_TALKER_DIR == str(pruned_dir)
+
+    monkeypatch.setenv("EDGE_LLM_TTS_VOCAB_PRUNED", "0")
+    ipc = _reload_ipc(monkeypatch)
+
+    assert ipc.TTS_TALKER_DIR == str(full_dir)
+
+
+def test_tts_talker_dir_override_wins_over_vocab_pruned(monkeypatch, tmp_path):
+    explicit_dir = tmp_path / "explicit"
+    pruned_dir = tmp_path / "talker_pruned"
+    monkeypatch.setenv("EDGE_LLM_TTS_TALKER_DIR", str(explicit_dir))
+    monkeypatch.setenv("EDGE_LLM_TTS_PRUNED_TALKER_DIR", str(pruned_dir))
+    monkeypatch.setenv("EDGE_LLM_TTS_VOCAB_PRUNED", "1")
+
+    ipc = _reload_ipc(monkeypatch)
+
+    assert ipc.TTS_TALKER_DIR == str(explicit_dir)
+
+
+def test_asr_vocab_pruned_selects_configured_engine_dir(monkeypatch, tmp_path):
+    full_dir = tmp_path / "asr_full"
+    pruned_dir = tmp_path / "asr_pruned"
+    monkeypatch.setenv("EDGE_LLM_ASR_FULL_ENGINE_DIR", str(full_dir))
+    monkeypatch.setenv("EDGE_LLM_ASR_PRUNED_ENGINE_DIR", str(pruned_dir))
+    monkeypatch.setenv("EDGE_LLM_ASR_VOCAB_PRUNED", "1")
+    monkeypatch.delenv("EDGE_LLM_ASR_ENGINE_DIR", raising=False)
+
+    ipc = _reload_ipc(monkeypatch)
+
+    assert ipc.ASR_ENGINE_DIR == str(pruned_dir)
+
+    monkeypatch.setenv("EDGE_LLM_ASR_VOCAB_PRUNED", "0")
+    ipc = _reload_ipc(monkeypatch)
+
+    assert ipc.ASR_ENGINE_DIR == str(full_dir)
+
+
+def test_asr_engine_dir_override_wins_over_vocab_pruned(monkeypatch, tmp_path):
+    explicit_dir = tmp_path / "explicit_asr"
+    pruned_dir = tmp_path / "asr_pruned"
+    monkeypatch.setenv("EDGE_LLM_ASR_ENGINE_DIR", str(explicit_dir))
+    monkeypatch.setenv("EDGE_LLM_ASR_PRUNED_ENGINE_DIR", str(pruned_dir))
+    monkeypatch.setenv("EDGE_LLM_ASR_VOCAB_PRUNED", "1")
+
+    ipc = _reload_ipc(monkeypatch)
+
+    assert ipc.ASR_ENGINE_DIR == str(explicit_dir)
