@@ -41,6 +41,8 @@ ASR text: `请关闭卧室的空调。`
 | `orin-nano` | MAXN_SUPER | warm | `174.3ms` | `445.7ms` | `620.0ms` | `~759MB` |
 | `orin-nx` | 40W | round 0 | `184.6ms` | `486.9ms` | `671.5ms` | not sampled |
 | `orin-nx` | 40W | round 1 | `184.3ms` | `486.0ms` | `670.3ms` | not sampled |
+| `orin-nx` | 40W locked | round 0 | `185.1ms` | `426.4ms` | `611.5ms` | `~8.8GB` |
+| `orin-nx` | 40W locked | round 1 | `172.0ms` | `425.8ms` | `597.8ms` | `~8.8GB` |
 
 ### Highperf TTS-Only
 
@@ -53,6 +55,7 @@ Streaming policy: stateful Code2Wav, `first_chunk_frames=7`, `chunk_frames=10`, 
 | `orin-nano` | 25W | `~601-602ms` | `0.696-0.703` | ASR round-trip exact on two WAVs |
 | `orin-nano` | MAXN_SUPER | `~540-542ms` | `0.641-0.648` | Same highperf engine set |
 | `orin-nx` | 40W | `~588-591ms` | `0.702-0.711` | From-zero transferred highperf artifacts; ASR round-trip exact |
+| `orin-nx` | 40W locked | `~533-535ms` | `0.619-0.628` | `jetson_clocks` locked; nano-imported engines; ASR round-trip exact |
 
 ## Official Smoke
 
@@ -66,6 +69,7 @@ Latest smoke:
 | `official` TTS worker | `orin-nx` | pass | Generated `/tmp/qwen3_profile_regression_0510_nx/official_nx.wav`; short `你好`, `audio_s=0.72`, `total_ms=1633.1`, `rtf=2.27`; not a quality or dual-resident gate |
 | `highperf` V2V | `orin-nano` | pass | MAXN warm `EOS -> first audio=620.0ms`, ASR text exact |
 | `highperf` V2V | `orin-nx` | pass | 40W warm `EOS -> first audio=670.3-671.5ms`, ASR text exact |
+| `highperf` V2V | `orin-nx` | pass | 40W locked warm `EOS -> first audio=597.8-611.5ms`, ASR text exact |
 
 ## NX From-Zero Replication Log
 
@@ -111,3 +115,33 @@ Quality check:
 | `/tmp/qwen3_profile_regression_0510_nx/highperf_tts_nx.smoke_1.wav` | `今天我们继续验证低延迟流式生成的效果。` | exact |
 
 Note: the Python backend still logs `Code2Wav not found at .../tokenizer_decoder/code2wav.engine` because the highperf path supplies stateful Code2Wav via `EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR`. The warning is expected for this configuration, but should be cleaned up later to reduce confusion.
+
+### NX 40W Locked Run
+
+Date: 2026-05-11.
+
+Runtime state:
+
+- `nvpmodel`: 40W mode id `4`
+- `jetson_clocks`: enabled
+- CPU: `1497MHz`
+- GPU: `1173MHz`
+- EMC: `3199MHz`
+- Idle before run: `~10GB MemAvailable`
+
+Engine set: `nano-imported-on-nx-40w-locked`. These engines were transferred from `orin-nano` and must be preserved separately from any later NX-native rebuild.
+
+Artifacts and logs:
+
+- Output directory: `/tmp/qwen3_profile_opt_0511_nx`
+- TTS-only log: `/tmp/qwen3_profile_opt_0511_nx/tts_only_nano_imported_40w_locked.log`
+- V2V log: `/tmp/qwen3_profile_opt_0511_nx/v2v_nano_imported_40w_locked.log`
+- Quality round-trip log: `/tmp/qwen3_profile_opt_0511_nx/quality_roundtrip_tts_wav_40w_locked.log`
+- Engine manifest: `/tmp/qwen3_profile_opt_0511_nx/engine_manifest_nano_imported_40w_locked.txt`
+
+Quality check:
+
+| WAV | ASR text | Result |
+| --- | --- | --- |
+| `/tmp/qwen3_quality_product_set1.smoke_1.wav` | `请关闭卧室的空调。` | exact |
+| `/tmp/qwen3_profile_opt_0511_nx/highperf_tts_nx_40w_locked.smoke_1.wav` | `今天我们继续验证低延迟流式生成的效果。` | exact |
