@@ -40,6 +40,14 @@ from backends.trt_edge_llm_ipc import (
 
 logger = logging.getLogger(__name__)
 
+_QWEN3_TTS_MODEL_BASE = os.environ.get("JETSON_VOICE_TTS_MODEL_BASE", os.environ.get("QWEN3_MODEL_BASE", "/opt/models/qwen3-tts"))
+_QWEN3_SPEAKER_ENCODER = os.environ.get(
+    "QWEN3_SPEAKER_ENCODER", os.path.join(_QWEN3_TTS_MODEL_BASE, "onnx", "speaker_encoder.onnx")
+)
+_QWEN3_EXTRACT_SCRIPT = os.environ.get(
+    "QWEN3_EXTRACT_SCRIPT", os.path.join(_QWEN3_TTS_MODEL_BASE, "extract_speaker_emb.py")
+)
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -281,7 +289,12 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
     @property
     def capabilities(self) -> set[TTSCapability]:
-        return {TTSCapability.BASIC_TTS, TTSCapability.MULTI_LANGUAGE, TTSCapability.STREAMING}
+        caps = {TTSCapability.BASIC_TTS, TTSCapability.MULTI_LANGUAGE, TTSCapability.STREAMING}
+        if self._product_backend is not None:
+            caps |= self._product_backend.capabilities
+        else:
+            caps.add(TTSCapability.VOICE_CLONE)
+        return caps
 
     @property
     def sample_rate(self) -> int:
@@ -483,6 +496,9 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             "max_audio_length": kwargs.get("max_audio_length", _DEFAULT_MAX_AUDIO_LENGTH),
             "min_audio_length": kwargs.get("min_audio_length", _DEFAULT_MIN_AUDIO_LENGTH),
         }
+        speaker_embedding = kwargs.get("speaker_embedding")
+        if speaker_embedding:
+            request["speaker_embedding_b64"] = base64.b64encode(speaker_embedding).decode("ascii")
         with self._worker_lock:
             self._ensure_worker()
             assert self._worker is not None and self._worker.stdin is not None and self._worker.stdout is not None
@@ -618,6 +634,9 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             "chunk_format": "pcm_s16le",
             "chunk_transport": "base64",
         }
+        speaker_embedding = kwargs.get("speaker_embedding")
+        if speaker_embedding:
+            request["speaker_embedding_b64"] = base64.b64encode(speaker_embedding).decode("ascii")
 
         with self._worker_lock:
             self._ensure_worker()
@@ -725,6 +744,73 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             language=language,
             **kwargs,
         )
+
+    def clone_voice(
+        self,
+        text: str,
+        speaker_embedding: bytes,
+        language: Optional[str] = None,
+        speed: Optional[float] = None,
+        **kwargs,
+    ) -> tuple[bytes, dict]:
+        if self._product_backend is not None:
+            return self._product_backend.clone_voice(
+                text=text,
+                speaker_embedding=speaker_embedding,
+                language=language,
+                speed=speed,
+                **kwargs,
+            )
+        if len(speaker_embedding) % 4 != 0:
+            raise ValueError("speaker_embedding must be a float32 byte vector")
+        return self.synthesize(
+            text,
+            speed=speed,
+            language=language,
+            speaker_embedding=speaker_embedding,
+            **kwargs,
+        )
+
+    def extract_speaker_embedding(self, audio_wav_bytes: bytes) -> bytes:
+        if self._product_backend is not None:
+            return self._product_backend.extract_speaker_embedding(audio_wav_bytes)
+        if not os.path.exists(_QWEN3_SPEAKER_ENCODER):
+            raise NotImplementedError(f"speaker encoder not found: {_QWEN3_SPEAKER_ENCODER}")
+        if not os.path.exists(_QWEN3_EXTRACT_SCRIPT):
+            raise NotImplementedError(f"speaker extraction script not found: {_QWEN3_EXTRACT_SCRIPT}")
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wf:
+            wf.write(audio_wav_bytes)
+            wav_path = wf.name
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as ef:
+            emb_path = ef.name
+
+        try:
+            result = subprocess.run(
+                [
+                    "python3",
+                    _QWEN3_EXTRACT_SCRIPT,
+                    "--audio",
+                    wav_path,
+                    "--model",
+                    _QWEN3_SPEAKER_ENCODER,
+                    "--output",
+                    emb_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Embedding extraction failed: {result.stderr}")
+            with open(emb_path, "rb") as f:
+                return f.read()
+        finally:
+            for path in (wav_path, emb_path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def _synthesize_single(
         self,

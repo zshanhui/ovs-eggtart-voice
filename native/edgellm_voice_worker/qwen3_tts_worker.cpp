@@ -12,6 +12,7 @@
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -220,6 +221,59 @@ std::string base64EncodePcm16(std::vector<int16_t> const& samples)
     return base64Encode(reinterpret_cast<uint8_t const*>(samples.data()), samples.size() * sizeof(int16_t));
 }
 
+std::vector<uint8_t> base64Decode(std::string const& input)
+{
+    std::array<int8_t, 256> table{};
+    table.fill(-1);
+    for (int i = 0; i < 26; ++i)
+    {
+        table[static_cast<uint8_t>('A' + i)] = i;
+        table[static_cast<uint8_t>('a' + i)] = i + 26;
+    }
+    for (int i = 0; i < 10; ++i)
+    {
+        table[static_cast<uint8_t>('0' + i)] = i + 52;
+    }
+    table[static_cast<uint8_t>('+')] = 62;
+    table[static_cast<uint8_t>('/')] = 63;
+
+    std::vector<uint8_t> out;
+    out.reserve(input.size() * 3 / 4);
+    int val = 0;
+    int bits = -8;
+    for (unsigned char c : input)
+    {
+        if (c == '=')
+        {
+            break;
+        }
+        int8_t decoded = table[c];
+        if (decoded < 0)
+        {
+            continue;
+        }
+        val = (val << 6) + decoded;
+        bits += 6;
+        if (bits >= 0)
+        {
+            out.push_back(static_cast<uint8_t>((val >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
+std::vector<float> float32VectorFromBytes(std::vector<uint8_t> const& bytes)
+{
+    if (bytes.size() % sizeof(float) != 0)
+    {
+        throw std::runtime_error("speaker_embedding_b64 size is not a float32 vector");
+    }
+    std::vector<float> values(bytes.size() / sizeof(float));
+    std::memcpy(values.data(), bytes.data(), bytes.size());
+    return values;
+}
+
 Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
 {
     Qwen3OmniTTSRuntime::TalkerGenerationRequest req;
@@ -232,9 +286,12 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
     req.predictorTopK = item.value("predictor_top_k", 0);
     req.predictorTopP = item.value("predictor_top_p", 0.0f);
     req.maxAudioLength = item.value("max_audio_length", 4096);
-    req.minAudioLength = item.value("min_audio_length", 2);
     req.language = item.value("language", "");
     req.speakerName = item.value("speaker", "");
+    if (item.contains("speaker_embedding_b64") && item["speaker_embedding_b64"].is_string())
+    {
+        req.speakerEmbedding = float32VectorFromBytes(base64Decode(item["speaker_embedding_b64"].get<std::string>()));
+    }
 
     Message msg;
     msg.role = "user";
@@ -245,6 +302,41 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
     req.messages.push_back(std::move(msg));
     return req;
 }
+
+class TtsStreamAdapter
+{
+public:
+    using SubmitChunkFn = std::function<void(bool isFinal)>;
+
+    TtsStreamAdapter(bool enabled, std::vector<std::vector<int32_t>>& frames, int32_t const& nextChunkAt,
+        SubmitChunkFn submitChunk)
+        : mEnabled(enabled)
+        , mFrames(frames)
+        , mNextChunkAt(nextChunkAt)
+        , mSubmitChunk(std::move(submitChunk))
+    {
+    }
+
+    Qwen3OmniTTSRuntime::FrameCallback callback()
+    {
+        return [this](std::vector<int32_t> const& frameCodes, int32_t totalFrames) { onCodecFrame(frameCodes, totalFrames); };
+    }
+
+private:
+    void onCodecFrame(std::vector<int32_t> const& frameCodes, int32_t totalFrames)
+    {
+        mFrames.push_back(frameCodes);
+        if (mEnabled && totalFrames >= mNextChunkAt)
+        {
+            mSubmitChunk(false);
+        }
+    }
+
+    bool mEnabled{false};
+    std::vector<std::vector<int32_t>>& mFrames;
+    int32_t const& mNextChunkAt;
+    SubmitChunkFn mSubmitChunk;
+};
 } // namespace
 
 int main(int argc, char** argv)
@@ -303,10 +395,7 @@ int main(int argc, char** argv)
             std::string const id = item.value("id", "");
             bool const streamOutput = item.value("stream", false);
             bool const streamOnly = item.value("stream_only", false);
-            bool const asyncCode2Wav = streamOnly
-                && item.value("async_code2wav",
-                    std::getenv("EDGE_LLM_TTS_ASYNC_CODE2WAV") != nullptr
-                        && std::string(std::getenv("EDGE_LLM_TTS_ASYNC_CODE2WAV")) != "0");
+            bool const asyncCode2Wav = false;
             int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames", 5));
             int32_t const chunkFrames = std::max(1, item.value("chunk_frames", 25));
             bool const adaptiveChunks = item.value("adaptive_chunks",
@@ -533,7 +622,9 @@ int main(int argc, char** argv)
                 processChunk(job);
             };
 
-            bool ok = ttsRuntime->handleAudioGeneration(request, talkerResponse, stream);
+            TtsStreamAdapter streamAdapter(streamOutput, streamedFrames, nextChunkAt, submitChunk);
+            auto frameCallback = streamOutput ? streamAdapter.callback() : Qwen3OmniTTSRuntime::FrameCallback{};
+            bool ok = ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, frameCallback);
             auto const genEnd = std::chrono::steady_clock::now();
             if (!ok || talkerResponse.rvqCodes.empty())
             {
@@ -580,6 +671,10 @@ int main(int argc, char** argv)
                     {"samples", streamedSamples},
                     {"sample_rate", streamSampleRate},
                     {"audio_s", audioSeconds},
+                    {"chunk_count", chunkIndex},
+                    {"audio_complete", true},
+                    {"final_chunk_index", chunkIndex > 0 ? chunkIndex - 1 : -1},
+                    {"last_chunk_was_final", chunkIndex > 0 && lastEmittedFrames == talkerResponse.numFrames},
                     {"generation_ms", std::chrono::duration<double, std::milli>(genEnd - genStart).count()},
                     {"code2wav_ms", streamedCode2WavMs},
                     {"first_chunk_ms",

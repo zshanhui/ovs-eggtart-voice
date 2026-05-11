@@ -24,6 +24,8 @@
         "tts/talker/text_embedding.safetensors",
         "tts/talker/text_projection.safetensors",
         "tts/tokenizer/tokenizer.json",
+        "tts/tokenizer/tokenizer_config.json",
+        "tts/tokenizer/processed_chat_template.json",
         "engines/orin-nano/highperf/talker_w8a16_outputk/talker_decode_w8a16_outputk.engine",
         "engines/orin-nano/highperf/code_predictor/cp_dir/qwen3_tts_cp.engine",
         "engines/orin-nano/highperf/code_predictor/cp_dir/config.json",
@@ -59,6 +61,8 @@
         "tts/talker/text_embedding.safetensors",
         "tts/talker/text_projection.safetensors",
         "tts/tokenizer/tokenizer.json",
+        "tts/tokenizer/tokenizer_config.json",
+        "tts/tokenizer/processed_chat_template.json",
         "engines/orin-nx/highperf/talker_w8a16_outputk/talker_decode_w8a16_outputk.engine",
         "engines/orin-nx/highperf/code_predictor/cp_dir/qwen3_tts_cp.engine",
         "engines/orin-nx/highperf/code_predictor/cp_dir/config.json",
@@ -84,7 +88,9 @@
         "engines/orin-nano/official/code_predictor/llm.engine",
         "engines/orin-nano/official/code_predictor/config.json",
         "engines/orin-nano/official/code2wav/code2wav.engine",
-        "tts/tokenizer/tokenizer.json"
+        "tts/tokenizer/tokenizer.json",
+        "tts/tokenizer/tokenizer_config.json",
+        "tts/tokenizer/processed_chat_template.json"
       ]
     }
   }
