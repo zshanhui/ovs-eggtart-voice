@@ -1,0 +1,3 @@
+[submodule "third_party/rkvoice-stream"]
+	path = third_party/rkvoice-stream
+	url = https://github.com/suharvest/rkvoice-stream.git
