@@ -148,14 +148,40 @@ The service is model-agnostic at the API level — clients send audio/text, get 
 
 Qwen3-ASR and Qwen3-TTS are exposed to Jetson Voice as the `multilanguage`
 mode. The product service stays in this repository; Qwen-specific export,
-engine build, worker/runtime glue, and performance scripts should live in the
-standalone Qwen project
+engine build, worker/runtime glue, and performance scripts live in the
+standalone companion repo
 [`suharvest/qwen3-edgellm-jetson`](https://github.com/suharvest/qwen3-edgellm-jetson).
 Large model artifacts live in the Hugging Face artifact repository
 [`harvestsu/qwen3-edgellm-jetson-artifacts`](https://huggingface.co/harvestsu/qwen3-edgellm-jetson-artifacts)
 described by the manifest in `qwen3-edgellm-jetson/deploy/artifacts/qwen3_manifest.json`.
 
-For deployment, prefer selecting one JSON profile:
+**Quickest path on a fresh Orin NX (one shot, end-to-end):**
+
+```bash
+git clone https://github.com/suharvest/qwen3-edgellm-jetson.git
+bash qwen3-edgellm-jetson/scripts/reproduce_qwen3_highperf.sh \
+  --reference /path/to/24kHz_mono.wav   # optional: also gates voice clone
+```
+
+The orchestrator clones this repo + the EdgeLLM fork, builds the runtime,
+downloads + SHA-256-verifies the HF artifacts, builds the slim docker
+image (`Dockerfile.slim.qwen3`), starts the service, and runs
+`scripts/verify_reproduction.sh` which fail-fasts on plugin-symbol set,
+artifact integrity, TTS→ASR loopback, and voice clone. Exit 0 means the
+slim container on port 18092 is healthy and serving the validated stack.
+
+After that, you can sanity-check a running service against an existing
+deployment with the same verifier alone:
+
+```bash
+bash qwen3-edgellm-jetson/scripts/verify_reproduction.sh \
+    --plugin /opt/edgellm-bin/libNvInfer_edgellm_plugin.so \
+    --artifact-root /opt/models/qwen3-edgellm \
+    --service-url http://localhost:18092 \
+    [--embedding /tmp/precomputed_speaker_emb.b64]
+```
+
+For manual deployments, profile selection follows the existing pattern:
 
 ```bash
 JETSON_VOICE_PROFILE=multilanguage-qwen-highperf uvicorn app.main:app --host 0.0.0.0 --port 8621
