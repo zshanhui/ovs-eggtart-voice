@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "description": "Qwen3 ASR/TTS artifacts consumed by Jetson Voice multilanguage profiles. Large files live in the Hugging Face repo; this manifest records expected layout and required files.",
-  "hf_repo_id": "REPLACE_WITH_HF_ORG/qwen3-edgellm-jetson-artifacts",
+  "hf_repo_id": "harvestsu/qwen3-edgellm-jetson-artifacts",
   "repo_type": "model",
   "revision": "main",
   "artifact_sets": {
