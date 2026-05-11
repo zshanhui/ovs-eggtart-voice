@@ -40,3 +40,6 @@ models/qwen3-asr-v2/
 benchmark/cpp/*.so
 benchmark/cpp/build*/
 benchmark/cpp/prebuilt/
+
+# Local archive of process WAV/JSON outputs (not tracked)
+archive/
