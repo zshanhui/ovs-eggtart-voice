@@ -1,0 +1,11 @@
+{
+  "name": "rk3588-default",
+  "description": "Stub profile for Rockchip RK3588 NPU. Backend registry keys rk.asr/rk.tts are wired in Step 4; selecting this profile before Step 4 lands will fail at factory time.",
+  "asr_backend": "rk.asr",
+  "tts_backend": "rk.tts",
+  "execution_policy": {
+    "mode": "serialized",
+    "shared_resource": "npu"
+  },
+  "env": {}
+}
