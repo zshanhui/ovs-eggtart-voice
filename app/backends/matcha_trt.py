@@ -272,6 +272,17 @@ class MatchaTRTBackend(TTSBackend):
         space_id = self._token_to_id.get(" ")
         prev_was_english = False
 
+        # Full-width → half-width punctuation (tokens.txt has ASCII
+        # punctuation only; CJK variants must be mapped or the model
+        # gets no prosody cues).
+        _FW_PUNCT = {
+            "，": ",", "。": ".", "！": "!", "？": "?",
+            "、": ",", "；": ";", "：": ":",
+            "（": "(", "）": ")", "［": "[", "］": "]",
+            "【": "[", "】": "]", "〈": "<", "〉": ">",
+            "《": "<", "》": ">",
+        }
+
         segments = re.findall(
             r'[一-鿿]+|[A-Za-z][A-Za-z\' ]*[A-Za-z]|[A-Za-z]|[^一-鿿A-Za-z]+',
             text,
@@ -296,6 +307,14 @@ class MatchaTRTBackend(TTSBackend):
                 if not phonemes:
                     logger.warning("Empty phonemes for English seg %r", seg)
                 prev_was_english = True
+            else:
+                # Punctuation / whitespace / other: map full-width to
+                # half-width and look up each character in token table.
+                for ch in seg:
+                    mapped = _FW_PUNCT.get(ch, ch)
+                    tid = self._token_to_id.get(mapped)
+                    if tid is not None:
+                        tokens.append(tid)
 
         return tokens
 
