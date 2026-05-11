@@ -1,0 +1,128 @@
+# syntax=docker/dockerfile:1.6
+#
+# Seeed Local Voice — Jetson Orin Nano / NX / AGX (JetPack 6.x, CUDA 12.6, TRT 10.3)
+#
+# Single Dockerfile consolidating the previous variants:
+#   - Dockerfile               (full dustynv-based image, baked sherpa+librosa)
+#   - Dockerfile.slim          (multi-stage slim, host GPU lib mounts)
+#   - Dockerfile.slim.qwen3    (slim + Qwen3 highperf multilanguage)
+#   - Dockerfile.v34           (clean rebuild without sherpa for multilanguage)
+#
+# Two build modes via LANGUAGE_MODE build-arg:
+#   zh_en          — Paraformer ASR + Matcha TTS via sherpa-onnx (default, smaller)
+#   multilanguage  — Qwen3 ASR + Qwen3 TTS TensorRT (no sherpa/librosa)
+#
+# Build:
+#   docker build -f deploy/docker/Dockerfile.jetson \
+#                --build-arg LANGUAGE_MODE=zh_en \
+#                -t seeed-local-voice:jetson-zh-en .
+#
+#   docker build -f deploy/docker/Dockerfile.jetson \
+#                --build-arg LANGUAGE_MODE=multilanguage \
+#                -t seeed-local-voice:jetson-multilang .
+#
+# Runtime (multilanguage / highperf) requires host JetPack libs:
+#   -v /usr/lib/aarch64-linux-gnu:/host-libs:ro
+#   -v /usr/local/cuda/lib64:/host-cuda:ro
+#   -v <qwen3-edgellm-jetson>:/opt/qwen3-edgellm-jetson:ro
+#   -v <qwen3-models>:/opt/models/qwen3-edgellm:ro
+#   -e LD_LIBRARY_PATH=/host-libs:/host-cuda:/usr/local/lib/python3.10/dist-packages/onnxruntime/capi
+#   -e SEEED_LOCAL_VOICE_PROFILE=jetson-multilang-highperf
+
+ARG LANGUAGE_MODE=zh_en
+
+FROM dustynv/onnxruntime:1.20-r36.4.0 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+
+# System deps (patchelf only needed for sherpa-onnx patching in zh_en mode)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libasound2 libsndfile1 sox patchelf curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# FastAPI + runtime deps (shared by both modes)
+RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple \
+        fastapi \
+        "uvicorn[standard]" \
+        soundfile \
+        python-multipart \
+        numpy \
+        tokenizers \
+        "transformers<5" \
+        "webrtcvad-wheels>=2.0.14" \
+        "cuda-python>=12,<13" \
+        websockets \
+        requests
+
+# ----------------------------------------------------------------------------
+# Mode-specific layer: zh_en (sherpa-onnx + librosa) — Paraformer + Matcha
+# ----------------------------------------------------------------------------
+FROM base AS mode-zh_en
+
+RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple \
+        librosa \
+        'sherpa-onnx==1.12.28'
+
+# Patch sherpa-onnx to use system onnxruntime 1.20 (CUDA 12.6)
+COPY scripts/patch_sherpa_ort.py /tmp/
+RUN python3 /tmp/patch_sherpa_ort.py && rm /tmp/patch_sherpa_ort.py
+
+# Install patched sherpa-onnx .so files (Paraformer streaming EOF fix)
+COPY patches/sherpa-onnx-lib/ /tmp/sherpa-onnx-lib/
+RUN SITE_LIB=/usr/local/lib/python3.10/dist-packages/sherpa_onnx/lib && \
+    cp /tmp/sherpa-onnx-lib/*.so "$SITE_LIB/" && \
+    rm -rf /tmp/sherpa-onnx-lib && \
+    python3 -c "import sherpa_onnx; print(f'sherpa_onnx {sherpa_onnx.__version__} patched OK')"
+
+ENV SEEED_LOCAL_VOICE_PROFILE_DEFAULT=jetson-zh-en
+
+# ----------------------------------------------------------------------------
+# Mode-specific layer: multilanguage (Qwen3 TRT, no sherpa/librosa)
+# ----------------------------------------------------------------------------
+FROM base AS mode-multilanguage
+
+# Qwen3-TTS/ASR TensorRT backend (prebuilt .so for Jetson Orin)
+RUN pip3 install --no-cache-dir \
+        git+https://github.com/suharvest/jetson-qwen3-speech.git@v0.1.0
+
+ENV SEEED_LOCAL_VOICE_PROFILE_DEFAULT=jetson-multilang-highperf
+
+# ----------------------------------------------------------------------------
+# Final stage: select mode via build-arg LANGUAGE_MODE
+# ----------------------------------------------------------------------------
+FROM mode-${LANGUAGE_MODE} AS final
+
+ARG LANGUAGE_MODE
+ENV LANGUAGE_MODE=${LANGUAGE_MODE}
+
+# Clean up build-only tools to keep image lean
+RUN apt-get purge -y patchelf 2>/dev/null || true && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*
+
+# Application code
+# NOTE: app/backends/rk/ is import-time gated (no rkvoice_stream installed here);
+# leaving it in the image as dead code keeps the COPY simple.
+COPY app/      /opt/speech/app/
+COPY configs/  /opt/speech/configs/
+COPY voices/   /opt/speech/voices/
+COPY scripts/  /opt/speech/scripts/
+
+# Models are downloaded on first start by app/core/model_downloader.py based on
+# LANGUAGE_MODE / SEEED_LOCAL_VOICE_PROFILE. Cached in /opt/models volume.
+RUN mkdir -p /opt/models /opt/edgellm-bin /opt/models/qwen3-edgellm /opt/qwen3-edgellm-jetson
+
+ENV MODEL_DIR=/opt/models \
+    NVIDIA_VISIBLE_DEVICES=all \
+    CUDA_MODULE_LOADING=LAZY \
+    ORT_CUDA_ARENA_EXTEND_STRATEGY=kSameAsRequested
+
+LABEL org.opencontainers.image.title="Seeed Local Voice" \
+      org.opencontainers.image.source="https://github.com/suharvest/seeed-local-voice" \
+      org.opencontainers.image.description="GPU-accelerated speech service for Jetson Orin"
+
+WORKDIR /opt/speech/app
+EXPOSE 8000
+
+CMD ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
