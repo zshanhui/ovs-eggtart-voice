@@ -224,12 +224,25 @@ def strip_language_prefix(text: str) -> str:
     return text
 
 
+def default_asr_engine() -> str:
+    candidates = [
+        "/home/harvest/qwen3-asr-edgellm-runtime/engines/thinker_full_in128_kv256_fp8embed_0510",
+        "/home/harvest/qwen3-asr-edgellm-runtime/engines/thinker_full_in128_kv256_0510",
+        "/home/harvest/qwen3-asr-edgellm-runtime/engines/thinker_kv512",
+        "/home/harvest/qwen3-asr-trt-edge-llm-export/engines/thinker",
+    ]
+    for candidate in candidates:
+        if (Path(candidate) / "llm.engine").exists():
+            return candidate
+    return candidates[1]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("wav", nargs="+", type=Path)
     parser.add_argument("--asr-worker", default="/home/harvest/project/jetson-voice/build/edgellm_voice_worker/workers/qwen3_asr_worker")
     parser.add_argument("--asr-plugin", default="/home/harvest/project/tensorrt-edge-llm/build_sm87/libNvInfer_edgellm_plugin.so")
-    parser.add_argument("--asr-engine", default="/home/harvest/qwen3-asr-edgellm-runtime/engines/thinker_prunedembed35k_kv512")
+    parser.add_argument("--asr-engine", default=default_asr_engine())
     parser.add_argument("--asr-audio-encoder", default="/home/harvest/qwen3-asr-trt-edge-llm-export/engines/audio_encoder")
     parser.add_argument("--mel-tensor-name", default="mel")
     parser.add_argument("--asr-max-generate-length", type=int, default=200)
