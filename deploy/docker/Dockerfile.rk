@@ -93,7 +93,8 @@ LABEL org.opencontainers.image.title="Seeed Local Voice (Rockchip)" \
       org.opencontainers.image.source="https://github.com/suharvest/seeed-local-voice" \
       org.opencontainers.image.description="Speech service on Rockchip NPU (RK3576 / RK3588)"
 
-WORKDIR /app/app
+WORKDIR /app
+ENV PYTHONPATH=/app
 EXPOSE 8000
 
-CMD ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
