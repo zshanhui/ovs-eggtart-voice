@@ -15,6 +15,7 @@
     "EDGE_LLM_QWEN3_PROFILE": "official",
     "EDGE_LLM_ASR_WORKER": "1",
     "EDGE_LLM_TTS_WORKER": "1",
+    "EDGE_LLM_ASR_PLUGIN_PATH": "/opt/edgellm/libNvInfer_edgellm_plugin.so",
     "EDGE_LLM_TTS_BACKEND": "edgellm_worker",
     "EDGE_LLM_ASR_VOCAB_PRUNED": "0",
     "EDGE_LLM_TTS_VOCAB_PRUNED": "0",
