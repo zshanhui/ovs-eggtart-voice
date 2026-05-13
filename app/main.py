@@ -688,3 +688,317 @@ async def _asr_stream_backend(
             await ws.close()
         except Exception:
             pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Unified V2V WebSocket: ASR + TTS + VAD + barge-in
+# ──────────────────────────────────────────────────────────────────────
+
+@app.websocket("/v2v/stream")
+async def v2v_stream(ws: WebSocket):
+    """Unified bi-directional WebSocket: speech in, partials + audio out.
+
+    Client may enable any subset of features via the first ``config``
+    JSON frame. See ``docs/api/v2v-stream.md`` for the protocol spec.
+    Minimum viable patterns:
+
+      TTS-only (LLM token stream → audio):
+        send {"type":"config", "tts_language":"zh"}
+        send {"type":"text", "text":"..."} repeatedly
+        send {"type":"tts_flush"}; await binary chunks + tts_done
+
+      ASR-only (mic → text, with auto VAD endpoint):
+        send {"type":"config", "asr_language":"zh", "vad":"silero"}
+        send PCM binary chunks
+        await asr_partial / asr_endpoint / asr_final
+
+      V2V (full duplex):
+        config with both asr_language + tts_language
+        interleave binary (mic) with text (LLM tokens)
+        receive partials, endpoints, audio
+        send {"type":"abort"} to barge-in
+    """
+    import asyncio
+    import json as _json
+    import struct
+    import numpy as np
+
+    from app.core import tts_service, v2v as v2v_proto
+    from app.core.asr_backend import ASRCapability
+    from app.core.tts_backend import TTSCapability
+    from app.core import vad as vad_mod
+
+    await ws.accept()
+
+    # ── Stage 1: receive initial config ─────────────────────────────
+    try:
+        first_msg = await ws.receive()
+    except WebSocketDisconnect:
+        return
+    cfg_text = first_msg.get("text", "")
+    if not cfg_text:
+        await ws.close(code=1003); return
+    try:
+        cfg = _json.loads(cfg_text)
+    except (ValueError, TypeError):
+        await ws.close(code=1003); return
+    if cfg.get("type") != v2v_proto.CLIENT_CONFIG:
+        await ws.send_json({"type": v2v_proto.SERVER_ERROR,
+                            "error": "first message must be a config frame"})
+        await ws.close(code=1003); return
+
+    asr_language    = cfg.get("asr_language")  # e.g. "zh" / "Chinese" / "en" / None
+    tts_language    = cfg.get("tts_language")
+    tts_voice       = cfg.get("tts_voice")
+    tts_speed       = cfg.get("tts_speed")
+    sample_rate     = int(cfg.get("sample_rate", 16000))
+    vad_backend     = cfg.get("vad", "silero" if asr_language else "none")
+    vad_silence_ms  = int(cfg.get("vad_silence_ms", 500))
+
+    if not asr_language and not tts_language:
+        await ws.send_json({"type": v2v_proto.SERVER_ERROR,
+                            "error": "config must enable asr_language and/or tts_language"})
+        await ws.close(code=1003); return
+
+    # ── Stage 2: bring up the backends ──────────────────────────────
+    asr_be = None
+    asr_stream = None
+    vad = None
+    if asr_language:
+        asr_be = _get_asr_backend()
+        if asr_be is None or not asr_be.is_ready() or not asr_be.has_capability(ASRCapability.STREAMING):
+            await ws.send_json({"type": v2v_proto.SERVER_ERROR,
+                                "error": "asr_language requested but no streaming ASR backend ready"})
+            await ws.close(code=1011); return
+        try:
+            asr_stream = asr_be.create_stream(language=asr_language)
+        except Exception as e:
+            await ws.send_json({"type": v2v_proto.SERVER_ERROR, "error": f"asr stream init: {e}"})
+            await ws.close(code=1011); return
+        try:
+            vad = vad_mod.create_vad(vad_backend, sample_rate=sample_rate, silence_ms=vad_silence_ms)
+        except Exception as e:
+            logger.warning("v2v VAD init (%s) failed: %s — running without VAD", vad_backend, e)
+            vad = None
+
+    tts_be = None
+    tts_buffer = None
+    if tts_language:
+        if not tts_service.is_ready() or not tts_service.has_capability(TTSCapability.STREAMING):
+            await ws.send_json({"type": v2v_proto.SERVER_ERROR,
+                                "error": "tts_language requested but no streaming TTS backend ready"})
+            await ws.close(code=1011); return
+        tts_be = tts_service.get_backend()
+        tts_buffer = v2v_proto.SentenceBuffer()
+
+    logger.info("v2v stream opened (asr=%s tts=%s vad=%s)",
+                asr_language or "off", tts_language or "off", vad_backend if asr_language else "off")
+
+    # ── Stage 3: per-connection state + write serialization ─────────
+    send_lock = asyncio.Lock()
+    state = {
+        "asr_eos":          False,   # set when VAD endpoint or client asr_eos
+        "tts_flush":        False,   # set when client tts_flush
+        "current_tts_task": None,    # running TTS synth task (cancellable)
+        "tts_started":      False,   # tts_started frame sent for current sentence
+        "client_closed":    False,
+    }
+    tts_q: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    async def send_json(payload):
+        async with send_lock:
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                state["client_closed"] = True
+
+    async def send_bytes(data):
+        async with send_lock:
+            try:
+                await ws.send_bytes(data)
+            except Exception:
+                state["client_closed"] = True
+
+    async def send_error(msg):
+        await send_json({"type": v2v_proto.SERVER_ERROR, "error": msg})
+
+    # ── Stage 4: tasks ──────────────────────────────────────────────
+
+    async def dispatcher():
+        """Receive incoming binary (audio) + text (control) frames."""
+        try:
+            while not state["client_closed"]:
+                msg = await ws.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    state["client_closed"] = True
+                    break
+                # binary → ASR input
+                data = msg.get("bytes")
+                if data:
+                    if not asr_stream:
+                        continue  # ignored in TTS-only mode
+                    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                    if vad is not None:
+                        event = vad.process(samples)
+                        if event == vad_mod.VADSession.SPEECH_START:
+                            # auto barge-in: cancel any in-flight TTS
+                            t = state["current_tts_task"]
+                            if t is not None and not t.done():
+                                t.cancel()
+                        elif event == vad_mod.VADSession.SPEECH_END:
+                            state["asr_eos"] = True
+                    await loop.run_in_executor(
+                        _get_asr_executor(), asr_stream.accept_waveform, sample_rate, samples
+                    )
+                    continue
+                # text → JSON control
+                text = msg.get("text", "")
+                if not text:
+                    continue
+                try:
+                    payload = _json.loads(text)
+                except (ValueError, TypeError):
+                    continue
+                typ = payload.get("type")
+                if typ == v2v_proto.CLIENT_TEXT and tts_buffer is not None:
+                    for sentence in tts_buffer.add(payload.get("text", "")):
+                        await tts_q.put(sentence)
+                elif typ == v2v_proto.CLIENT_TTS_FLUSH:
+                    if tts_buffer is not None:
+                        for sentence in tts_buffer.flush():
+                            await tts_q.put(sentence)
+                    state["tts_flush"] = True
+                elif typ == v2v_proto.CLIENT_ASR_EOS:
+                    state["asr_eos"] = True
+                elif typ == v2v_proto.CLIENT_ABORT:
+                    t = state["current_tts_task"]
+                    if t is not None and not t.done():
+                        t.cancel()
+                    # Drain queue so flush doesn't replay queued sentences
+                    while not tts_q.empty():
+                        try: tts_q.get_nowait()
+                        except asyncio.QueueEmpty: break
+                    if asr_stream is not None and hasattr(asr_stream, "cancel_and_finalize"):
+                        try: asr_stream.cancel_and_finalize()
+                        except Exception: pass
+        except WebSocketDisconnect:
+            state["client_closed"] = True
+
+    async def asr_out_task():
+        """Poll ASR stream for partials, emit endpoint + final."""
+        sent_endpoint = False
+        while not state["asr_eos"] and not state["client_closed"]:
+            try:
+                partial, is_endpoint = await loop.run_in_executor(
+                    _get_asr_executor(), asr_stream.get_partial
+                )
+            except Exception:
+                partial, is_endpoint = "", False
+            if partial:
+                await send_json({"type": v2v_proto.SERVER_ASR_PARTIAL,
+                                 "text": partial, "is_stable": bool(is_endpoint)})
+            if is_endpoint:
+                state["asr_eos"] = True
+                break
+            await asyncio.sleep(0.05)
+        if state["client_closed"]:
+            return
+        if not sent_endpoint:
+            await send_json({"type": v2v_proto.SERVER_ASR_ENDPOINT})
+        try:
+            final_text = await loop.run_in_executor(_get_asr_executor(), asr_stream.finalize)
+        except Exception as e:
+            await send_error(f"asr finalize: {e}")
+            return
+        await send_json({"type": v2v_proto.SERVER_ASR_FINAL, "text": final_text or ""})
+
+    async def tts_out_task():
+        """Drain sentence queue → synthesize → emit audio."""
+        first_sentence = True
+        while not state["client_closed"]:
+            # Exit condition: client requested flush AND no more queued
+            if state["tts_flush"] and tts_q.empty():
+                break
+            try:
+                sentence = await asyncio.wait_for(tts_q.get(), timeout=0.2)
+            except asyncio.TimeoutError:
+                continue
+            # Build a TTS synth task we can cancel for barge-in
+            audio_queue: asyncio.Queue = asyncio.Queue()
+
+            def _run_synth(s):
+                try:
+                    stream_kwargs = {"language": tts_language}
+                    if tts_voice is not None:    stream_kwargs["voice"] = tts_voice
+                    if tts_speed is not None:    stream_kwargs["speed"] = tts_speed
+                    for chunk in tts_be.generate_streaming(s, **stream_kwargs):
+                        loop.call_soon_threadsafe(audio_queue.put_nowait, chunk)
+                except Exception as e:
+                    loop.call_soon_threadsafe(audio_queue.put_nowait, ("__error__", str(e)))
+                finally:
+                    loop.call_soon_threadsafe(audio_queue.put_nowait, None)
+
+            synth_future = loop.run_in_executor(_get_tts_stream_executor(), _run_synth, sentence)
+
+            async def drain():
+                nonlocal first_sentence
+                if first_sentence:
+                    # Send sample-rate header (4 bytes LE uint32), matching /tts/stream
+                    sr = tts_service.get_sample_rate() if hasattr(tts_service, "get_sample_rate") else 16000
+                    await send_bytes(struct.pack("<I", sr))
+                    first_sentence = False
+                await send_json({"type": v2v_proto.SERVER_TTS_STARTED, "sentence": sentence})
+                state["tts_started"] = True
+                while True:
+                    item = await audio_queue.get()
+                    if item is None:
+                        break
+                    if isinstance(item, tuple) and item[0] == "__error__":
+                        await send_error(f"tts: {item[1]}")
+                        break
+                    await send_bytes(item)
+                await send_json({"type": v2v_proto.SERVER_TTS_SENTENCE_DONE, "sentence": sentence})
+
+            task = asyncio.create_task(drain())
+            state["current_tts_task"] = task
+            try:
+                await task
+            except asyncio.CancelledError:
+                # barge-in / abort: drain remaining audio without sending
+                try:
+                    while True:
+                        item = audio_queue.get_nowait()
+                        if item is None: break
+                except asyncio.QueueEmpty:
+                    pass
+                # also abandon the synth thread (it'll finish on its own)
+            finally:
+                state["current_tts_task"] = None
+        if not state["client_closed"]:
+            await send_json({"type": v2v_proto.SERVER_TTS_DONE})
+
+    # ── Stage 5: orchestrate ────────────────────────────────────────
+    tasks = [asyncio.create_task(dispatcher())]
+    if asr_stream is not None:
+        tasks.append(asyncio.create_task(asr_out_task()))
+    if tts_be is not None:
+        tasks.append(asyncio.create_task(tts_out_task()))
+
+    try:
+        await asyncio.gather(*tasks, return_exceptions=False)
+    except Exception as e:
+        logger.error("v2v stream error: %s", e, exc_info=True)
+        try:
+            await send_error(f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        logger.info("v2v stream closed")
