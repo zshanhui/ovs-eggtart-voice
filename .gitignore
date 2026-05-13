@@ -44,9 +44,18 @@ benchmark/cpp/prebuilt/
 # Local archive of process WAV/JSON outputs (not tracked)
 archive/
 
-# Local experiment scratch (calibration, v2v, results)
-bench/
+# Local experiment scratch (calibration, v2v, results) — ignore everything
+# under bench/ EXCEPT the perf harness, which is tracked.
+bench/*
+!bench/perf/
 logs/
+
+# Inside bench/perf/: track code + manifest, ignore generated artifacts.
+bench/perf/__pycache__/
+bench/perf/results/
+bench/perf/corpus/short/*.wav
+bench/perf/corpus/long/*.wav
+bench/perf/corpus/multilingual/**/*.wav
 
 # Internal handover / planning notes (not for repo)
 docs/plans/
