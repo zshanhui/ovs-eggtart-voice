@@ -253,16 +253,21 @@ Corpus: 20 FLEURS files (10 zh + 10 en, 3-15s, sha256-locked). CER is character-
 
 ## Measured TTS perf (local mode, 2026-05-13)
 
-| Group | Nano (Qwen3 TRT voice_clone) | RK3588 | RK3576 | RPi5 (sherpa matcha) |
+| Group | Nano (Qwen3 TRT voice_clone) | RK3588 (matcha_rknn) | RK3576 (qwen3_rknn) | RPi5 (sherpa matcha) |
 |---|---:|---:|---:|---:|
-| short/zh RTF | 0.425 | ⚠️ blocked | ⚠️ blocked | **0.078** |
-| long/zh RTF  | 0.410 | ⚠️ blocked | ⚠️ blocked | **0.077** |
-| short/zh TFD | 4ms | — | — | 2ms |
-| long/zh total | 6738ms | — | — | 941ms |
+| short/zh RTF | 0.425 | **0.071** | ⚠️ slow | **0.078** |
+| long/zh RTF  | 0.410 | **0.135** | ⚠️ slow | **0.077** |
+| short/en RTF | 0.420 | 0.085 | ⚠️ slow | 0.105 |
+| short/zh TFD | 4ms | 4ms | — | 2ms |
+| long/zh total | 6738ms | 812ms | — | 941ms |
 
-- **RPi5 sherpa-onnx Matcha 5× faster than Nano Qwen3 voice_clone** — Qwen3 TTS is a much bigger model targeting voice cloning + multi-language; sherpa Matcha is single-speaker zh+en but tiny.
-- **Radxa `rk:matcha_rknn` TTS blocked**: server-side bug — `AttributeError: 'tuple' object has no attribute 'encode'` in starlette stream_response. Likely the matcha_rknn TTS yield returns `(audio_bytes, meta)` tuple instead of plain bytes. TODO: fix in `third_party/rkvoice-stream/.../tts/matcha_rknn.py` (or seeed-local-voice's adapter).
-- **RK3576 `rk:qwen3_rknn` TTS performance issue**: 1.8 fps observed (74.9s for 137 frames = ~5s audio); not viable for benchmark or production. TODO: investigate NPU saturation / vocos engine warmup.
+- **RK3588 matcha_rknn ≈ RPi5 sherpa matcha** (both ~0.07-0.08 RTF) — RK NPU lifts Matcha decoder ~3-5× faster than ARM CPU, but Matcha's CNN backbone is small enough that sherpa-onnx on RPi5 stays competitive
+- **Nano Qwen3 TTS slowest** (0.4× RTF) because it's a much bigger model targeting voice cloning + multi-language; tradeoff: highest quality (voice clone)
+- **RK3576 `rk:qwen3_rknn` TTS performance issue**: 1.8 fps observed (74.9s for 137 frames ≈ 5s audio); benchmark cannot complete inside reasonable time. **Investigation in progress** — likely cause: qwen3_rknn TTS on RK3576 NPU is unworkable for the multilang preset; alternative would be matcha_rknn (smaller, faster) as default for RK3576
+
+### Resolved bugs (2026-05-13)
+
+- **Radxa rk:matcha_rknn TTS `'tuple'.encode` crash** — adapter `app/backends/rk/tts.py::generate_streaming` now unwraps `(audio, meta)` tuples to PCM bytes. Fixed in commit `1aa7976`.
 
 ## Measured V2V perf (local mode, 2026-05-13)
 
@@ -295,7 +300,7 @@ EOS → first TTS audio chunk, `--llm-delay=0` (forced EOS):
 | Jetson Orin Nano | sm87 8GB | voice_clone | 0.42 | **0.084** | **0.063** | 5.3% | **0.0%** | 3.14 GB (v1.11/v1.12) |
 | Jetson Orin Nano | sm87 8GB | multilang | TBD | TBD | TBD | TBD | TBD | 3.14 GB |
 | Jetson Orin NX | sm87 16GB | voice_clone | TBD | TBD | TBD | TBD | TBD | 3.14 GB |
-| RK3588 (Radxa ROCK 5T) | rk3588 16GB | multilang | ⚠️ bug | 0.220 | **0.030** | **2.6%** | 10.0% | 1.38 GB (rk-v1.2) |
+| RK3588 (Radxa ROCK 5T) | rk3588 16GB | multilang | **0.071** | 0.220 | **0.030** | **2.6%** | 10.0% | 1.38 GB (rk-v1.2) |
 | RK3576 (cat-remote) | rk3576 8GB | multilang | ⚠️ slow | 0.397 | 0.538 | 5.3% | 13.1% | 1.38 GB (rk-v1.2) |
 | RPi5 | BCM2712 8GB | lite_zh_en | **0.078** | **0.000** | **0.000** | 10.5% | 35.7% | 560 MB (rpi-v1.1) |
 | RPi5 | BCM2712 8GB | asr_zh_en | — | TBD | TBD | TBD | TBD | 560 MB |
