@@ -263,7 +263,10 @@ Corpus: 20 FLEURS files (10 zh + 10 en, 3-15s, sha256-locked). CER is character-
 
 - **RK3588 matcha_rknn ≈ RPi5 sherpa matcha** (both ~0.07-0.08 RTF) — RK NPU lifts Matcha decoder ~3-5× faster than ARM CPU, but Matcha's CNN backbone is small enough that sherpa-onnx on RPi5 stays competitive
 - **Nano Qwen3 TTS slowest** (0.4× RTF) because it's a much bigger model targeting voice cloning + multi-language; tradeoff: highest quality (voice clone)
-- **RK3576 `rk:qwen3_rknn` TTS performance issue**: 1.8 fps observed (74.9s for 137 frames ≈ 5s audio); benchmark cannot complete inside reasonable time. **Investigation in progress** — likely cause: qwen3_rknn TTS on RK3576 NPU is unworkable for the multilang preset; alternative would be matcha_rknn (smaller, faster) as default for RK3576
+- **RK3576 TTS: known issue, no working in-tree path right now**:
+  - `qwen3_rknn`: 1.8 fps (74.9s / 137 frames). Benchmark too slow to complete; vocoder reloads NPU per chunk on RK3576 (qwen3_tts.py:_reload_vocoder workaround for an NPU Conv hang bug, project_rk3576_tts_vocoder_bug)
+  - `matcha_rknn`: faster in isolation (memory project_matcha_vocos_rk3576 measured 0.054 RTF) but **crashes when co-loaded with the RKLLM ASR decoder** — vocos `RKNN_ERR_PARAM_INVALID` at set_inputs, `outputs[0][0]` = NoneType. Root cause: NPU memory/IOMMU conflict between RKLLM (ASR decoder) and RKNN (vocos). base_domain_id=1 + ASR_NPU_CORE_MASK=NPU_CORE_1 attempted, did not resolve. Memory entry: project_matcha_rknn_npu_conflict.
+  - **Workaround being considered**: sherpa-onnx matcha CPU TTS on RK3576 (avoids NPU entirely, ARM A72 should hit RTF ~0.2-0.4). Would require switching `TTS_BACKEND=sherpa` for RK3576 multilang preset.
 
 ### Resolved bugs (2026-05-13)
 
