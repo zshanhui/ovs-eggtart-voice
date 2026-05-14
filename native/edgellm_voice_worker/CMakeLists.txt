@@ -136,9 +136,85 @@ target_include_directories(
                           ${COMMON_INCLUDE_DIRS})
 target_link_libraries(voiceWorkerUtils PRIVATE edgellmCore commonLibraryExt)
 
+# ---------------------------------------------------------------------------
+# Worker source canonically lives in the sibling qwen3-edgellm-jetson repo.
+# Defined relative to this CMakeLists; reproducer guarantees sibling layout.
+# ---------------------------------------------------------------------------
+set(WORKER_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../qwen3-edgellm-jetson/native/edgellm_voice_worker"
+    CACHE PATH "Worker C++ source root (canonical home: qwen3-edgellm-jetson)")
+
+if(NOT EXISTS "${WORKER_SRC_DIR}/qwen3_asr_worker.cpp")
+  message(FATAL_ERROR "Canonical worker source missing at ${WORKER_SRC_DIR}. "
+                      "Clone https://github.com/suharvest/qwen3-edgellm-jetson next to jetson-voice.")
+endif()
+
+# -----------------------------------------------------------------------------
+# Verify EdgeLLM tree has streaming-asr APIs the worker depends on.
+# Without this guard, a wrong EDGE_LLM_BUILD_DIR (e.g. older tree built from
+# qwen3-tts-highperf-runtime-w8a16 pre-streaming-asr merge) gets through
+# cmake config and fails at link with unresolved AppendPrefillStatus etc.
+# -----------------------------------------------------------------------------
+if(EXISTS "${EDGE_LLM_SOURCE_DIR}/cpp/runtime/llmInferenceSpecDecodeRuntime.h")
+  file(READ "${EDGE_LLM_SOURCE_DIR}/cpp/runtime/llmInferenceSpecDecodeRuntime.h" _RUNTIME_HEADER_CONTENTS)
+  string(FIND "${_RUNTIME_HEADER_CONTENTS}" "AppendPrefillStatus" _HAS_APPEND_PREFILL_STATUS)
+  string(FIND "${_RUNTIME_HEADER_CONTENTS}" "getMaxKvCacheCapacity" _HAS_GET_MAX_KV)
+  if(_HAS_APPEND_PREFILL_STATUS EQUAL -1 OR _HAS_GET_MAX_KV EQUAL -1)
+    message(FATAL_ERROR
+      "EdgeLLM at ${EDGE_LLM_SOURCE_DIR} is missing streaming-asr APIs "
+      "(AppendPrefillStatus, getMaxKvCacheCapacity). Check out branch "
+      "streaming-asr/m1-append-prefill-embeds (or the post-merge highperf branch "
+      "that includes it) before configuring jetson-voice's worker build.")
+  endif()
+  unset(_RUNTIME_HEADER_CONTENTS)
+else()
+  message(FATAL_ERROR
+    "EDGE_LLM_SOURCE_DIR=${EDGE_LLM_SOURCE_DIR} does not contain "
+    "cpp/runtime/llmInferenceSpecDecodeRuntime.h. Verify the EdgeLLM source tree.")
+endif()
+
+
+# -----------------------------------------------------------------------------
+# kissfft (vendored, fp64 mode) + MelExtractor — C++ port of upstream
+# `WhisperFeatureExtractor` for the streaming ASR worker's PCM→mel path.
+# Validated against golden tensors by test_mel_extractor (≤ 1e-3 tol).
+# -----------------------------------------------------------------------------
+add_library(kissfft_double STATIC
+            "${WORKER_SRC_DIR}/kissfft/kiss_fft.c"
+            "${WORKER_SRC_DIR}/kissfft/kiss_fftr.c")
+target_include_directories(kissfft_double PUBLIC
+                           "${WORKER_SRC_DIR}/kissfft")
+target_compile_definitions(kissfft_double PUBLIC kiss_fft_scalar=double)
+set_target_properties(kissfft_double PROPERTIES
+                      POSITION_INDEPENDENT_CODE ON
+                      C_STANDARD 99)
+
+add_library(melExtractor STATIC
+            "${WORKER_SRC_DIR}/mel_extractor.cpp")
+target_include_directories(melExtractor PUBLIC
+                           "${WORKER_SRC_DIR}"
+                           ${EDGE_LLM_SOURCE_DIR}/3rdParty/nlohmannJson/include)
+target_link_libraries(melExtractor PUBLIC kissfft_double)
+set_target_properties(melExtractor PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# -----------------------------------------------------------------------------
+# AudioVadSplitter (energy-based audio chunk splitter, Phase 2 wiring).
+# C++ port of split_audio_into_chunks from qwen_asr/inference/utils.py:246.
+# No external deps — pure stdlib. Linked into qwen3_asr_worker so the worker
+# auto-segment path can pick a low-energy boundary inside the VAD window.
+# -----------------------------------------------------------------------------
+add_library(audioVadSplit STATIC
+            "${WORKER_SRC_DIR}/audio_vad_split.cpp")
+target_include_directories(audioVadSplit PUBLIC "${WORKER_SRC_DIR}")
+target_compile_features(audioVadSplit PUBLIC cxx_std_17)
+set_target_properties(audioVadSplit PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_executable(test_audio_vad_split
+               "${WORKER_SRC_DIR}/tests/test_audio_vad_split.cpp")
+target_link_libraries(test_audio_vad_split PRIVATE audioVadSplit)
+
+
 set(VOICE_WORKER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/workers")
 
-add_executable(qwen3_tts_worker qwen3_tts_worker.cpp)
+add_executable(qwen3_tts_worker ${WORKER_SRC_DIR}/qwen3_tts_worker.cpp)
 target_include_directories(
   qwen3_tts_worker PRIVATE ${COMMON_INCLUDE_DIRS}
                            ${EDGE_LLM_SOURCE_DIR}/examples/utils)
@@ -150,17 +226,27 @@ set_target_properties(qwen3_tts_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                   LINKER_LANGUAGE CUDA
                                                   CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-add_executable(qwen3_asr_worker qwen3_asr_worker.cpp)
+add_executable(qwen3_asr_worker ${WORKER_SRC_DIR}/qwen3_asr_worker.cpp)
 target_include_directories(
   qwen3_asr_worker PRIVATE ${COMMON_INCLUDE_DIRS}
                            ${EDGE_LLM_SOURCE_DIR}/examples/utils)
-target_link_libraries(qwen3_asr_worker PRIVATE voiceWorkerUtils edgellmCore
+target_link_libraries(qwen3_asr_worker PRIVATE voiceWorkerUtils melExtractor
+                                               audioVadSplit edgellmCore
                                                commonLibraryExt)
 add_cross_build_link_options(qwen3_asr_worker)
 set_target_properties(qwen3_asr_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                   ${VOICE_WORKER_OUTPUT_DIR}
                                                   LINKER_LANGUAGE CUDA
                                                   CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+# Standalone CPU-only test binary for MelExtractor parity vs golden tensors.
+add_executable(test_mel_extractor
+               "${WORKER_SRC_DIR}/tests/test_mel_extractor.cpp")
+target_link_libraries(test_mel_extractor PRIVATE melExtractor)
+target_include_directories(test_mel_extractor PRIVATE
+                           ${EDGE_LLM_SOURCE_DIR}/3rdParty/nlohmannJson/include)
+set_target_properties(test_mel_extractor PROPERTIES
+                      RUNTIME_OUTPUT_DIRECTORY ${VOICE_WORKER_OUTPUT_DIR})
 
 function(link_edgellm_cutedsl_if_enabled target)
   string(TOUPPER "${ENABLE_CUTE_DSL}" _enable_cutedsl)
