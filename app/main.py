@@ -972,7 +972,7 @@ async def v2v_stream(ws: WebSocket):
                     while not tts_q.empty():
                         try: tts_q.get_nowait()
                         except asyncio.QueueEmpty: break
-                    if asr_stream is not None and hasattr(asr_stream, "cancel_and_finalize"):
+                    if asr_stream is not None:
                         try: asr_stream.cancel_and_finalize()
                         except Exception: pass
         except WebSocketDisconnect:

@@ -55,6 +55,15 @@ class ASRStream(ABC):
         """
         pass
 
+    def cancel_and_finalize(self) -> None:
+        """Hard-cancel any in-flight partial decode and skip residual tail encode.
+
+        Used by barge-in / client-initiated stop paths where waiting for the
+        pending decode wastes hundreds of ms. Default: no-op (subclasses that
+        run async final decodes — e.g. RK true-streaming — override).
+        """
+        pass
+
 
 class ASRBackend(ABC):
 

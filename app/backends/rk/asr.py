@@ -254,9 +254,7 @@ class _RKASRStreamAdapter(ASRStream):
         self._inner.prepare_finalize()
 
     def cancel_and_finalize(self) -> None:
-        fn = getattr(self._inner, "cancel_and_finalize", None)
-        if fn is not None:
-            fn()
+        self._inner.cancel_and_finalize()
 
     def get_partial(self) -> tuple[str, bool]:
         return self._inner.get_partial()
