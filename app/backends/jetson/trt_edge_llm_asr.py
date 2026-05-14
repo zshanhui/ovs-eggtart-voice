@@ -529,8 +529,12 @@ class _TRTEdgeLLMAccumulatingASRStream(ASRStream):
         self._backend = backend
         self._language = language
         self._chunks: list[np.ndarray] = []
+        self._cancelled = False
+        self._final_text_cache = ""
 
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
+        if self._cancelled:
+            return
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
         if sample_rate != 16000:
@@ -543,7 +547,17 @@ class _TRTEdgeLLMAccumulatingASRStream(ASRStream):
             ).astype(np.float32)
         self._chunks.append(samples.copy())
 
+    def cancel_and_finalize(self) -> None:
+        if self._cancelled:
+            return
+        # No partials produced by this accumulate path.
+        self._final_text_cache = ""
+        self._cancelled = True
+        self._chunks = []
+
     def finalize(self) -> str:
+        if self._cancelled:
+            return self._final_text_cache
         if not self._chunks:
             return ""
         audio = np.concatenate(self._chunks)

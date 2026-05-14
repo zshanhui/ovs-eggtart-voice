@@ -368,6 +368,10 @@ class ParaformerTRTStream(ASRStream):
         self._total_enc_ms = 0.0
         self._total_dec_ms = 0.0
 
+        # Barge-in cancel state
+        self._cancelled = False
+        self._final_text_cache = ""
+
     def _reset_utterance_state(self) -> None:
         self._audio_buf = np.array([], dtype=np.float32)
         self._processed_chunks = 0
@@ -386,6 +390,8 @@ class ParaformerTRTStream(ASRStream):
         self._cif_processed_lfr = 0
 
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
+        if self._cancelled:
+            return
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
         if sample_rate != SAMPLE_RATE:
@@ -514,11 +520,22 @@ class ParaformerTRTStream(ASRStream):
             self._reset_utterance_state()
         return text, is_endpoint
 
+    def cancel_and_finalize(self) -> None:
+        if self._cancelled:
+            return
+        # Cache whatever streaming already decoded.
+        self._final_text_cache = self._partial_text
+        self._cancelled = True
+        # Drop residual audio so a follow-up finalize() never touches encoder.
+        self._audio_buf = np.array([], dtype=np.float32)
+
     def finalize(self) -> str:
         """Process remaining audio tail + flush CIF -> final text.
 
         Bug G fix: full-utterance CMVN, slice (history+new) for encoder.
         """
+        if self._cancelled:
+            return self._final_text_cache
         residual_audio = self._audio_buf
         if len(residual_audio) > 0:
             self._all_audio = np.concatenate([self._all_audio, residual_audio])

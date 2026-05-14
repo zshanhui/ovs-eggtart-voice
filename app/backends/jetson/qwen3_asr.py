@@ -270,8 +270,12 @@ class Qwen3ASRStream(ASRStream):
         self._language = language
         self._chunks: list[np.ndarray] = []
         self._total_samples = 0
+        self._cancelled = False
+        self._final_text_cache = ""
 
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
+        if self._cancelled:
+            return
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
         # Resample to 16kHz if needed
@@ -287,6 +291,8 @@ class Qwen3ASRStream(ASRStream):
         self._total_samples += len(samples)
 
     def finalize(self) -> str:
+        if self._cancelled:
+            return self._final_text_cache
         if not self._chunks:
             return ""
         audio = np.concatenate(self._chunks)
@@ -300,6 +306,15 @@ class Qwen3ASRStream(ASRStream):
     def get_partial(self) -> tuple[str, bool]:
         # V1: no partial results; could add duration-based hints later
         return "", False
+
+    def cancel_and_finalize(self) -> None:
+        if self._cancelled:
+            return
+        # No partials available in this accumulate-then-transcribe path.
+        self._final_text_cache = ""
+        self._cancelled = True
+        self._chunks = []
+        self._total_samples = 0
 
 
 def _is_cjk(ch: str) -> bool:
@@ -361,9 +376,15 @@ class Qwen3StreamingASRStream(ASRStream):
         self._tail_embd: Optional[np.ndarray] = None
         self._tail_audio_len = 0
 
+        # Barge-in cancel state
+        self._cancelled = False
+        self._final_text_cache = ""
+
     # ── Public API ────────────────────────────────────────────────
 
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
+        if self._cancelled:
+            return
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
         if sample_rate != 16000:
@@ -411,7 +432,27 @@ class Qwen3StreamingASRStream(ASRStream):
         """No-op: offline final decode uses full-audio, not encoder tail."""
         pass
 
+    def cancel_and_finalize(self) -> None:
+        if self._cancelled:
+            return
+        # Mirror get_partial() composition for the cached final text.
+        text = self._archive_text
+        if self._partial_text and not self._episode_final:
+            sep = " " if not (self._archive_text and _is_cjk(self._archive_text[-1])) else ""
+            text = (self._archive_text + sep + self._partial_text).strip()
+        self._final_text_cache = text.strip()
+        self._cancelled = True
+        # Drop heavy Python refs so the next request starts clean.
+        self._audio_buf = np.array([], dtype=np.float32)
+        self._encoder_frames.clear()
+        self._total_encoder_frames = 0
+        self._utterance_audio_buffer.clear()
+        self._tail_embd = None
+        self._tail_audio_len = 0
+
     def finalize(self) -> str:
+        if self._cancelled:
+            return self._final_text_cache
         # Drain remaining unprocessed audio into encoder buffer
         while len(self._audio_buf) - self._processed_samples >= self._chunk_size_samples:
             self._process_streaming_chunk()

@@ -109,8 +109,12 @@ class SherpaASRStream(ASRStream):
         self._stream = recognizer.create_stream()
         self._last_text = ""
         self._is_endpoint = False
+        self._cancelled = False
+        self._final_text_cache = ""
 
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
+        if self._cancelled:
+            return
         recognizer = self._recognizer
 
         if samples.dtype != np.float32:
@@ -137,6 +141,8 @@ class SherpaASRStream(ASRStream):
             self._stream = self._recognizer.create_stream()
 
     def finalize(self) -> str:
+        if self._cancelled:
+            return self._final_text_cache
         recognizer = self._recognizer
         stream = self._stream
 
@@ -162,6 +168,15 @@ class SherpaASRStream(ASRStream):
             self._is_endpoint = False
             self._last_text = ""
         return text, is_endpoint
+
+    def cancel_and_finalize(self) -> None:
+        if self._cancelled:
+            return
+        # Cache current partial as the final text — no extra decode pass,
+        # no silence-pad, no native input_finished() (avoids any decode
+        # loop in libsherpa).
+        self._final_text_cache = self._last_text
+        self._cancelled = True
 
 
 # ---------------------------------------------------------------------------
