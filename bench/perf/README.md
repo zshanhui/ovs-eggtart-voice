@@ -1,4 +1,4 @@
-# Seeed Local Voice — Perf Test Harness
+# OpenVoiceStream — Perf Test Harness
 
 Cross-device, reproducible performance & latency benchmark.
 

@@ -1,4 +1,4 @@
-# Seeed Local Voice — Per-Device Perf Test Runbook
+# OpenVoiceStream — Per-Device Perf Test Runbook
 
 A single source of truth for **how to launch the service on each device**
 and **what to measure**, so you can fill in the performance table without
@@ -198,7 +198,7 @@ grep -i "^x-" /tmp/asr.hdr
 # 5. TTS streaming TTFB
 time curl -s -X POST http://HOST:PORT/tts/stream \
   -H "Content-Type: application/json" \
-  -d '{"text":"你好世界，我是 Seeed Local Voice"}' \
+  -d '{"text":"你好世界，我是 OpenVoiceStream"}' \
   --output /dev/null
 ```
 

@@ -2,7 +2,7 @@
 
 Date: 2026-05-07
 
-This is the executable contract for the Seeed Local Voice Qwen3-TTS product path.
+This is the executable contract for the OpenVoiceStream Qwen3-TTS product path.
 If a path does not satisfy these conditions, it is not a correctness candidate
 even if it can generate a WAV.
 

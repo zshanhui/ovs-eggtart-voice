@@ -1,6 +1,6 @@
 # Performance Comparison — Choosing a Device
 
-Seeed Local Voice runs the same HTTP/WS API across Jetson, Rockchip, and
+OpenVoiceStream runs the same HTTP/WS API across Jetson, Rockchip, and
 Raspberry Pi. This page shows **measured numbers** for each platform so
 you can pick the device that fits your product, not your spec sheet.
 

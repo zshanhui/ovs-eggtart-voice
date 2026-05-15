@@ -15,10 +15,10 @@ tags:
   - rtf
   - jetson
   - edge
-pretty_name: Seeed Local Voice Perf Corpus
+pretty_name: OpenVoiceStream Perf Corpus
 ---
 
-# Seeed Local Voice — Perf Test Corpus
+# OpenVoiceStream — Perf Test Corpus
 
 Fixed 20-file audio corpus used to benchmark
 [`Seeed-Projects/seeed-local-voice`](https://github.com/Seeed-Projects/seeed-local-voice)
@@ -57,7 +57,7 @@ content was altered.
 ## Usage
 
 ```bash
-# From the seeed-local-voice repo
+# From the openvoicestream repo
 python bench/perf/corpus/fetch.py --from hf
 python bench/perf/corpus/fetch.py --verify    # SHA256 must match manifest
 
