@@ -17,8 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from client import ASRClient, TTSClient
 from runners import (load_corpus, load_prompts,
-                     run_asr, run_tts, run_v2v_bench, run_concurrent,
-                     run_asr_noisy)
+                     run_asr, run_tts, run_v2v_bench, run_v2v_stream_bench,
+                     run_concurrent, run_asr_noisy)
 from stats import summarize, save_results
 from memory import MemorySampler
 from cold_start import measure_container_boot
@@ -73,7 +73,8 @@ def cmd_asr(args):
                        mode=args.mode, eos_mode=args.eos)
     summary = summarize(rows, group_by=("category", "lang"),
                         metrics=("rtf", "finalize_rtf", "tfd_ms", "error_rate",
-                                 "eos_to_final_ms", "processing_ms"))
+                                 "eos_to_final_ms", "vad_silence_ms",
+                                 "asr_finalize_compute_ms", "processing_ms"))
     meta = {**_common_meta(args, "asr"), "mode": args.mode, "eos": args.eos,
             "chunk_ms": args.chunk_ms, "vad_backend": args.vad_backend,
             "vad_silence_ms": args.vad_silence_ms}
@@ -114,11 +115,35 @@ def cmd_v2v(args):
                              eos_mode=args.eos, llm_delay_ms=args.llm_delay)
     summary = summarize(rows, group_by=("category", "lang"),
                         metrics=("eos_to_first_audio_ms", "asr_finalize_ms",
+                                 "vad_silence_ms", "asr_finalize_compute_ms",
                                  "tts_tfd_ms", "tts_total_ms"))
     meta = {**_common_meta(args, "v2v"), "eos": args.eos,
             "llm_delay_ms": args.llm_delay, "vad_backend": args.vad_backend,
             "vad_silence_ms": args.vad_silence_ms}
     jp, mp = save_results(RESULTS_DIR, _scenario_tag(args, f"v2v_{args.eos}_llm{int(args.llm_delay)}"),
+                          rows, summary, mem.summary(), meta)
+    print(f"\nSaved: {jp}\n       {mp}")
+
+
+def cmd_v2v_stream(args):
+    """Benchmark ASR-only via the real /v2v/stream protocol."""
+    corpus = load_corpus(category=args.category, lang=args.lang)
+    if not corpus:
+        sys.exit("No corpus files found; run corpus/fetch.py first.")
+    print(f"V2V-Stream ASR: {len(corpus)} files, "
+          f"vad={args.vad_backend}, silence={args.vad_silence_ms}ms")
+    with MemorySampler(args.container) as mem:
+        rows = run_v2v_stream_bench(
+            args.base_url, corpus, warmup=args.warmup, runs=args.runs,
+            chunk_ms=args.chunk_ms, vad_backend=args.vad_backend,
+            vad_silence_ms=args.vad_silence_ms, realtime=args.realtime,
+        )
+    summary = summarize(rows, group_by=("category", "lang"),
+                        metrics=("endpoint_latency_ms", "asr_finalize_ms",
+                                 "total_latency_ms", "tfd_ms"))
+    meta = {**_common_meta(args, "v2v-stream"), "vad_backend": args.vad_backend,
+            "vad_silence_ms": args.vad_silence_ms}
+    jp, mp = save_results(RESULTS_DIR, _scenario_tag(args, "v2v_stream"),
                           rows, summary, mem.summary(), meta)
     print(f"\nSaved: {jp}\n       {mp}")
 
@@ -249,7 +274,7 @@ def cmd_matrix(args):
     print("MATRIX: asr streaming")
     print("=" * 60)
     cmd_asr(argparse.Namespace(**vars(args),
-        mode="streaming", eos="vad", chunk_ms=250, realtime=True,
+        mode="streaming", eos="forced", chunk_ms=250, realtime=True,
         vad_backend="silero", vad_silence_ms=400,
         category=None, lang=None))
     print("\n" + "=" * 60)
@@ -258,17 +283,17 @@ def cmd_matrix(args):
     cmd_tts(argparse.Namespace(**vars(args),
         no_stream=False, voice=None, category=None, lang=None))
     print("\n" + "=" * 60)
-    print("MATRIX: v2v vad, llm=0")
+    print("MATRIX: v2v forced, llm=0")
     print("=" * 60)
     cmd_v2v(argparse.Namespace(**vars(args),
-        eos="vad", llm_delay=0, voice=None, chunk_ms=250, realtime=True,
+        eos="forced", llm_delay=0, voice=None, chunk_ms=250, realtime=True,
         vad_backend="silero", vad_silence_ms=400,
         category=None, lang=None))
     print("\n" + "=" * 60)
-    print("MATRIX: v2v vad, llm=800")
+    print("MATRIX: v2v forced, llm=800")
     print("=" * 60)
     cmd_v2v(argparse.Namespace(**vars(args),
-        eos="vad", llm_delay=800, voice=None, chunk_ms=250, realtime=True,
+        eos="forced", llm_delay=800, voice=None, chunk_ms=250, realtime=True,
         vad_backend="silero", vad_silence_ms=400,
         category=None, lang=None))
     for parallel in (1, 2, 4):
@@ -319,7 +344,7 @@ def main():
 
     sp_asr = sub.add_parser("asr"); add_common(sp_asr)
     sp_asr.add_argument("--mode", choices=["streaming", "offline"], default="streaming")
-    sp_asr.add_argument("--eos", choices=["forced", "vad", "eou"], default="vad")
+    sp_asr.add_argument("--eos", choices=["forced", "vad", "eou"], default="forced")
     sp_asr.add_argument("--chunk-ms", type=int, default=250)
     sp_asr.add_argument("--vad-backend", choices=["silero", "webrtcvad"], default="silero",
                         help="server-side VAD query param for --eos vad on seeed-local-voice")
@@ -334,7 +359,7 @@ def main():
     sp_tts.set_defaults(func=cmd_tts)
 
     sp_v2v = sub.add_parser("v2v"); add_common(sp_v2v)
-    sp_v2v.add_argument("--eos", choices=["forced", "vad", "eou"], default="vad")
+    sp_v2v.add_argument("--eos", choices=["forced", "vad", "eou"], default="forced")
     sp_v2v.add_argument("--llm-delay", type=float, default=0.0,
                         help="LLM placeholder delay in ms (e.g., 800)")
     sp_v2v.add_argument("--voice", default=None)
@@ -345,6 +370,14 @@ def main():
     sp_v2v.add_argument("--realtime", action="store_true", default=True)
     sp_v2v.add_argument("--no-realtime", dest="realtime", action="store_false")
     sp_v2v.set_defaults(func=cmd_v2v)
+
+    sp_v2v_stream = sub.add_parser("v2v-stream"); add_common(sp_v2v_stream)
+    sp_v2v_stream.add_argument("--chunk-ms", type=int, default=250)
+    sp_v2v_stream.add_argument("--vad-backend", choices=["silero", "webrtcvad"], default="silero")
+    sp_v2v_stream.add_argument("--vad-silence-ms", type=int, default=400)
+    sp_v2v_stream.add_argument("--realtime", action="store_true", default=True)
+    sp_v2v_stream.add_argument("--no-realtime", dest="realtime", action="store_false")
+    sp_v2v_stream.set_defaults(func=cmd_v2v_stream)
 
     sp_con = sub.add_parser("concurrent"); add_common(sp_con)
     sp_con.add_argument("--parallel", type=int, default=2, choices=[1, 2, 4])

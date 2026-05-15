@@ -19,6 +19,10 @@ METRIC_LABELS = {
     "eos_to_final_ms": "EOS→Final (ms)",
     "eos_to_first_audio_ms": "EOS→Audio (ms)",
     "asr_finalize_ms": "ASR finalize (ms)",
+    "vad_silence_ms": "VAD silence (ms)",
+    "asr_finalize_compute_ms": "ASR compute (ms)",
+    "endpoint_latency_ms": "Endpoint lat (ms)",
+    "total_latency_ms": "Total lat (ms)",
     "tts_tfd_ms": "TTS TFD (ms)",
     "tts_total_ms": "TTS total (ms)",
     "wall_ms": "Wall (ms)",
@@ -88,8 +92,10 @@ def render_markdown(scenario: str, summary: dict, raw: list[dict],
         lines.append("|--------|-----:|----:|----:|----:|----:|--:|")
         for metric_key in ["rtf", "finalize_rtf", "tfd_ms", "error_rate", "similarity",
                            "eos_to_final_ms", "eos_to_first_audio_ms",
-                           "asr_finalize_ms", "tts_tfd_ms", "tts_total_ms",
-                           "processing_ms", "total_ms", "wall_ms"]:
+                           "vad_silence_ms", "asr_finalize_compute_ms",
+                           "endpoint_latency_ms", "asr_finalize_ms",
+                           "tts_tfd_ms", "tts_total_ms",
+                           "processing_ms", "total_ms", "total_latency_ms", "wall_ms"]:
             m = stats.get(metric_key)
             if not m:
                 continue

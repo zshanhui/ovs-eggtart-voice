@@ -721,15 +721,23 @@ async def _asr_stream_backend(
                 from app.core.vad import VADSession
                 event = vad_session.process(samples)
                 if event == VADSession.SPEECH_END:
+                    # Emit vad_endpoint BEFORE finalize so the client can split
+                    # VAD silence-wait from ASR compute time.
+                    await ws.send_json({"type": "vad_endpoint"})
                     await _loop.run_in_executor(_get_asr_executor(), stream.prepare_finalize)
                     final_text = await _loop.run_in_executor(_get_asr_executor(), stream.finalize)
-                    await ws.send_json({
-                        "type": "final",
-                        "text": final_text,
-                        "is_final": True,
-                        "is_stable": True,
-                        "endpoint": "vad",
-                    })
+                    try:
+                        await ws.send_json({
+                            "type": "final",
+                            "text": final_text,
+                            "is_final": True,
+                            "is_stable": True,
+                            "endpoint": "vad",
+                        })
+                    except Exception:
+                        # Client may have disconnected during a slow finalize
+                        # (e.g. TRT-EdgeLLM on Jetson). Nothing to send to.
+                        pass
                     break
 
             # Check for partial results
@@ -752,21 +760,24 @@ async def _asr_stream_backend(
 
     except WebSocketDisconnect:
         logger.debug("ASR stream client disconnected (backend=%s)", asr_be.name)
+    except WebSocketDisconnect:
+        logger.debug("ASR stream client disconnected (backend=%s)", asr_be.name)
     except Exception as e:
         logger.error("ASR stream error (backend=%s): %s", asr_be.name, e, exc_info=True)
-        # Surface the error to the client as a structured frame instead of a
-        # silent close. Without this the client's next ws.recv() returns "",
-        # json.loads("") raises JSONDecodeError, and the real cause is hidden.
-        try:
-            await ws.send_json({
-                "type": "error",
-                "error": f"{type(e).__name__}: {e}",
-                "backend": asr_be.name,
-                "is_final": True,
-                "is_stable": True,
-            })
-        except Exception:
-            pass
+        # Surface the error to the client as a structured frame if the socket is
+        # still connected. Skip if the peer already disconnected (common with
+        # slow finalize backends like TRT-EdgeLLM on Jetson).
+        if not isinstance(e, (WebSocketDisconnect, RuntimeError)):
+            try:
+                await ws.send_json({
+                    "type": "error",
+                    "error": f"{type(e).__name__}: {e}",
+                    "backend": asr_be.name,
+                    "is_final": True,
+                    "is_stable": True,
+                })
+            except Exception:
+                pass
     finally:
         try:
             await ws.close()

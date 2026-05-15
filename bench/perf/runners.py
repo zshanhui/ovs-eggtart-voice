@@ -12,7 +12,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from client import ASRClient, TTSClient, run_v2v, wav_duration_s
+from client import (ASRClient, TTSClient, run_v2v, run_v2v_stream_asr,
+                     V2VStreamASRResult, wav_duration_s)
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +235,45 @@ def run_v2v_bench(asr: ASRClient, tts: TTSClient, corpus: list[dict],
               f"EOS->Audio={r.eos_to_first_audio_ms:.0f}ms "
               f"(ASR={r.asr_finalize_ms:.0f} +LLM={r.llm_delay_ms:.0f} "
               f"+TTS_TFD={r.tts_tfd_ms:.0f})  text='{r.asr_text[:25]}...'")
+    return records
+
+
+def run_v2v_stream_bench(
+    base_url: str, corpus: list[dict],
+    warmup: int = 3, runs: int = 10,
+    chunk_ms: int = 250, vad_backend: str = "silero",
+    vad_silence_ms: int = 400, realtime: bool = True,
+) -> list[dict]:
+    """Benchmark ASR-only via the real /v2v/stream protocol.
+
+    Unlike run_v2v_bench (composite ASRClient + TTSClient), this drives
+    the actual /v2v/stream WebSocket and naturally captures the server's
+    asr_endpoint → asr_final split timing.
+    """
+    records: list[dict] = []
+    for label, entry, k in _iter_loop(corpus, warmup, runs):
+        lang_map = {"zh": "Chinese", "en": "English"}
+        language = lang_map.get(entry["lang"], "Chinese")
+        try:
+            r = run_v2v_stream_asr(
+                base_url, entry["bytes"],
+                language=language, chunk_ms=chunk_ms,
+                vad_backend=vad_backend, vad_silence_ms=vad_silence_ms,
+                realtime=realtime,
+            )
+        except Exception as e:
+            records.append({"label": label, "id": entry["id"], "error": str(e)})
+            continue
+        records.append({
+            "label": label, "id": entry["id"], "lang": entry["lang"],
+            "category": entry["category"],
+            **r.as_dict,
+        })
+        print(f"  [{label:6s} {k+1:02d}] {entry['id']:14s}  "
+              f"endpoint={r.endpoint_latency_ms:.0f}ms  "
+              f"asr_finalize={r.asr_finalize_ms:.0f}ms  "
+              f"total={r.total_latency_ms:.0f}ms  "
+              f"text='{r.text[:25]}...'")
     return records
 
 

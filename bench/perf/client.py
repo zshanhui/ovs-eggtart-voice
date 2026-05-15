@@ -72,6 +72,8 @@ class ASRResult:
                                        # cross-device-comparable number — independent
                                        # of how the client paces chunks.
     eos_mode: str = "vad"
+    vad_silence_ms: float | None = None           # EOS → VAD endpoint detection
+    asr_finalize_compute_ms: float | None = None  # VAD endpoint → ASR final text
 
     @property
     def as_dict(self) -> dict:
@@ -165,16 +167,24 @@ class ASRClient:
         # eagerly anyway; we just sample TFD by checking right after each
         # send for a backlog message.
         ws.settimeout(0.001)
+        t_vad_endpoint = None
         for c in chunks:
             ws.send_binary(c)
-            if t_first_partial is None:
-                try:
-                    msg = ws.recv()
-                    data = json.loads(msg)
-                    if data.get("text"):
-                        t_first_partial = time.monotonic()
-                except websocket.WebSocketTimeoutException:
-                    pass
+            try:
+                msg = ws.recv()
+                if not msg:
+                    continue
+                data = json.loads(msg)
+                if data.get("type") == "vad_endpoint":
+                    t_vad_endpoint = time.monotonic()
+                elif data.get("type") == "final" or data.get("is_final") is True:
+                    final_text = _coerce_text(data.get("text", "")).strip()
+                    final_received = True
+                    break
+                elif data.get("text") and t_first_partial is None:
+                    t_first_partial = time.monotonic()
+            except (websocket.WebSocketTimeoutException, json.JSONDecodeError):
+                pass
             if self.realtime:
                 time.sleep(chunk_dur)
         ws.settimeout(self.timeout)
@@ -182,6 +192,21 @@ class ASRClient:
         final_text = ""
         final_received = False
         t_eos = time.monotonic()
+        if final_received:
+            # VAD detected end during real audio — server already sent final.
+            # Jump straight to computing result.
+            t_final = time.monotonic()  # already received, approximate
+            ws.close()
+            eos_to_final_ms = 0.0  # final arrived before t_eos
+            return ASRResult(
+                text=final_text, audio_dur_s=dur,
+                processing_ms=(t_final - t_first_send) * 1000,
+                tfd_ms=((t_first_partial - t_first_send) * 1000) if t_first_partial else None,
+                eos_to_final_ms=0.0, rtf=0.0, finalize_rtf=None,
+                eos_mode=eos_mode,
+                vad_silence_ms=None, asr_finalize_compute_ms=None,
+            )
+        vad_timeout_s = (self.vad_silence_ms + 30000) / 1000.0  # silence tail + 30s buffer for slow backends
         if eos_mode == "forced":
             ws.send_binary(b"")
         elif eos_mode == "eou":
@@ -203,6 +228,8 @@ class ASRClient:
                     text_str = _coerce_text(data.get("text", ""))
                     if t_first_partial is None and text_str:
                         t_first_partial = time.monotonic()
+                    if data.get("type") == "vad_endpoint":
+                        t_vad_endpoint = time.monotonic()
                     if data.get("type") == "final" or data.get("is_final") is True:
                         final_text = text_str.strip()
                         final_received = True
@@ -214,14 +241,32 @@ class ASRClient:
             ws.settimeout(self.timeout)
 
         while not final_received:
-            raw = ws.recv()
+            # Timeout guard: if VAD/silence mode and no final within deadline
+            if eos_mode == "vad" and (time.monotonic() - t_eos) > vad_timeout_s:
+                ws.close()
+                return ASRResult(
+                    text="<timeout>",
+                    audio_dur_s=dur,
+                    processing_ms=(time.monotonic() - t_first_send) * 1000,
+                    eos_to_final_ms=None,
+                    rtf=0.0,
+                    finalize_rtf=None,
+                    eos_mode=eos_mode,
+                    vad_silence_ms=None,
+                    asr_finalize_compute_ms=None,
+                )
+            try:
+                raw = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
             if not raw:
-                # Server closed without a frame. Older servers do this on
-                # backend errors; newer ones send {"type":"error",...} first.
                 raise RuntimeError("server closed WebSocket without a final frame (likely backend error)")
             data = json.loads(raw)
             if data.get("type") == "error":
                 raise RuntimeError(f"server error: {data.get('error', '(no detail)')}")
+            if data.get("type") == "vad_endpoint":
+                t_vad_endpoint = time.monotonic()
+                continue
             text_field = data.get("text", final_text)
             text_str = _coerce_text(text_field)
             if t_first_partial is None and text_str:
@@ -235,6 +280,8 @@ class ASRClient:
         ws.close()
 
         eos_to_final_ms = (t_final - t_eos) * 1000
+        vad_silence = ((t_vad_endpoint - t_eos) * 1000) if t_vad_endpoint else None
+        asr_finalize_compute = ((t_final - t_vad_endpoint) * 1000) if t_vad_endpoint else None
         return ASRResult(
             text=final_text,
             audio_dur_s=dur,
@@ -244,6 +291,8 @@ class ASRClient:
             rtf=((t_final - t_first_send) * 1000) / (dur * 1000) if dur else 0.0,
             finalize_rtf=eos_to_final_ms / (dur * 1000) if dur else None,
             eos_mode=eos_mode,
+            vad_silence_ms=vad_silence,
+            asr_finalize_compute_ms=asr_finalize_compute,
         )
 
 
@@ -311,10 +360,12 @@ class V2VResult:
     asr_text: str
     tts_audio_dur_s: float
     eos_to_first_audio_ms: float
-    asr_finalize_ms: float
-    llm_delay_ms: float
-    tts_tfd_ms: float
-    tts_total_ms: float
+    asr_finalize_ms: float          # EOS → ASR final (total, for backwards compat)
+    vad_silence_ms: float = 0.0     # EOS → VAD endpoint
+    asr_finalize_compute_ms: float = 0.0  # VAD endpoint → ASR final
+    llm_delay_ms: float = 0.0
+    tts_tfd_ms: float = 0.0
+    tts_total_ms: float = 0.0
 
     @property
     def as_dict(self) -> dict:
@@ -337,7 +388,166 @@ def run_v2v(asr: ASRClient, tts: TTSClient, wav_bytes: bytes,
         # client-side EOS-to-first-audio: ASR finalize + LLM delay + TTS TFD
         eos_to_first_audio_ms=(asr_res.eos_to_final_ms or 0) + llm_delay_ms + tts_res.tfd_ms,
         asr_finalize_ms=asr_res.eos_to_final_ms or 0,
+        vad_silence_ms=asr_res.vad_silence_ms or 0,
+        asr_finalize_compute_ms=asr_res.asr_finalize_compute_ms or 0,
         llm_delay_ms=llm_delay_ms,
         tts_tfd_ms=tts_res.tfd_ms,
         tts_total_ms=tts_res.total_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# V2V stream protocol benchmark (ASR-only mode)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class V2VStreamASRResult:
+    """Timings from a /v2v/stream ASR-only session.
+
+    Unlike the composite run_v2v() which chains ASRClient + TTSClient
+    through separate connections, this drives the actual /v2v/stream
+    protocol end-to-end: config frame → audio chunks → asr_endpoint →
+    asr_final. The server naturally emits two messages (endpoint then
+    final), giving us the VAD-front-end / ASR-compute split for free.
+    """
+    text: str
+    audio_dur_s: float
+    tfd_ms: float | None = None               # first send → first partial
+    endpoint_latency_ms: float = 0.0           # EOS → asr_endpoint (VAD front-end)
+    asr_finalize_ms: float = 0.0               # asr_endpoint → asr_final (ASR compute)
+    total_latency_ms: float = 0.0              # EOS → asr_final (sum of above)
+    error: str | None = None
+
+    @property
+    def as_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items() if k != "error"}
+
+
+def run_v2v_stream_asr(
+    base_url: str,
+    wav_bytes: bytes,
+    language: str = "Chinese",
+    chunk_ms: int = 250,
+    vad_backend: str = "silero",
+    vad_silence_ms: int = 400,
+    realtime: bool = True,
+    timeout: int = 120,
+) -> V2VStreamASRResult:
+    """Drive /v2v/stream in ASR-only mode and measure split timings.
+
+    Protocol:
+      1. Open WS → send config frame
+      2. Pump audio chunks (with realtime pacing)
+      3. Send trailing silence for VAD
+      4. Record t_endpoint on asr_endpoint message
+      5. Record t_final on asr_final message
+    """
+    ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://").rstrip("/")
+    chunks, sr = wav_to_pcm_chunks(wav_bytes, chunk_ms)
+    dur = wav_duration_s(wav_bytes)
+    chunk_dur = chunk_ms / 1000.0
+
+    ws = websocket.create_connection(
+        f"{ws_url}/v2v/stream", timeout=timeout,
+    )
+    # Stage 1: config frame
+    config = {
+        "type": "config",
+        "asr_language": language,
+        "vad": vad_backend,
+        "vad_silence_ms": vad_silence_ms,
+        "sample_rate": sr,
+    }
+    ws.send(json.dumps(config))
+
+    t_first_send = time.monotonic()
+    t_first_partial: float | None = None
+
+    # Stage 2: pump audio chunks
+    ws.settimeout(0.001)
+    for c in chunks:
+        ws.send_binary(c)
+        if t_first_partial is None:
+            try:
+                msg = ws.recv()
+                data = json.loads(msg)
+                if data.get("type") == "asr_partial" and data.get("text"):
+                    t_first_partial = time.monotonic()
+            except websocket.WebSocketTimeoutException:
+                pass
+        if realtime:
+            time.sleep(chunk_dur)
+
+    t_eos = time.monotonic()
+
+    # Stage 3: trailing silence for VAD
+    silence_ms = max(vad_silence_ms + chunk_ms, chunk_ms)
+    silence_chunks = int(np.ceil(silence_ms / chunk_ms))
+    frames_per_chunk = int(sr * chunk_ms / 1000)
+    silence = np.zeros(frames_per_chunk, dtype=np.int16).tobytes()
+
+    t_endpoint: float | None = None
+    t_final: float | None = None
+    final_text = ""
+    done = False
+
+    for _ in range(silence_chunks):
+        ws.send_binary(silence)
+        try:
+            msg = ws.recv()
+            data = json.loads(msg)
+            if data.get("type") == "asr_endpoint":
+                t_endpoint = time.monotonic()
+            elif data.get("type") == "asr_final":
+                t_final = time.monotonic()
+                final_text = _coerce_text(data.get("text", ""))
+                done = True
+                break
+        except websocket.WebSocketTimeoutException:
+            pass
+        if realtime:
+            time.sleep(chunk_dur)
+
+    # Stage 4: drain remaining messages
+    ws.settimeout(timeout)
+    deadline = t_eos + (vad_silence_ms + 30000) / 1000.0
+    while not done:
+        if time.monotonic() > deadline:
+            ws.close()
+            return V2VStreamASRResult(
+                text="<timeout>", audio_dur_s=dur,
+                tfd_ms=((t_first_partial - t_first_send) * 1000) if t_first_partial else None,
+                endpoint_latency_ms=(t_endpoint - t_eos) * 1000 if t_endpoint else 0,
+                error="timeout waiting for asr_final",
+            )
+        try:
+            raw = ws.recv()
+        except websocket.WebSocketTimeoutException:
+            continue
+        if not raw:
+            ws.close()
+            return V2VStreamASRResult(
+                text="<closed>", audio_dur_s=dur,
+                error="server closed without asr_final",
+            )
+        data = json.loads(raw)
+        if data.get("type") == "asr_endpoint":
+            t_endpoint = time.monotonic()
+        elif data.get("type") == "asr_final":
+            t_final = time.monotonic()
+            final_text = _coerce_text(data.get("text", ""))
+            done = True
+            break
+
+    ws.close()
+
+    endpoint_latency = (t_endpoint - t_eos) * 1000 if t_endpoint else 0.0
+    asr_finalize = (t_final - t_endpoint) * 1000 if (t_final and t_endpoint) else 0.0
+    return V2VStreamASRResult(
+        text=final_text,
+        audio_dur_s=dur,
+        tfd_ms=((t_first_partial - t_first_send) * 1000) if t_first_partial else None,
+        endpoint_latency_ms=endpoint_latency,
+        asr_finalize_ms=asr_finalize,
+        total_latency_ms=(t_final - t_eos) * 1000 if t_final else 0.0,
     )
