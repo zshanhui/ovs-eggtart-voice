@@ -220,7 +220,7 @@ async def test_llm_down_before_request_fails_fast() -> None:
 
     async with run_mock_agent(base) as (app, probe):
         # Wait for probe state machine to reach DOWN (needs 3 fails).
-        await _wait_state_value(app, "down", timeout=6.0)
+        await _wait_state_value(app, "unknown", timeout=6.0)
 
         t0 = time.monotonic()
         await app._run_user_utterance("hello")
@@ -332,6 +332,9 @@ async def test_models_endpoint_green_but_chat_red() -> None:
             server.enqueue_500()
 
         async with run_mock_agent(base) as (app, probe):
+            # probes return concrete HTTP 500 (not connection errors) so
+            # the state machine advances HEALTHY → DEGRADED → DOWN, not
+            # the UNKNOWN path.
             await _wait_state_value(app, "down", timeout=6.0)
 
             # Sanity: /v1/models endpoint really is green.
@@ -383,7 +386,7 @@ async def test_late_dashboard_client_sees_current_down_state() -> None:
     await app.modes.start("chat")
 
     try:
-        await _wait_state_value(app, "down", timeout=6.0)
+        await _wait_state_value(app, "unknown", timeout=6.0)
 
         # Now connect the dashboard ws.
         probe = AgentProbe(port=port)
@@ -396,7 +399,7 @@ async def test_late_dashboard_client_sees_current_down_state() -> None:
         data = snap.get("data") or {}
         avail = data.get("llm_availability")
         assert avail is not None, snap
-        assert avail.get("state") == "down", avail
+        assert avail.get("state") == "unknown", avail
     finally:
         for p in reversed(started):
             try:

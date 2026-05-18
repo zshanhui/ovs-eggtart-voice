@@ -86,10 +86,16 @@ class ModeContext:
         if avail is not None:
             # Local import to avoid a cycle at module load.
             from .plugins.llm_availability import AvailabilityState, LLMUnavailable
-            if avail.state == AvailabilityState.DOWN:
+            # Fail-fast on both DOWN (confirmed failures) and UNKNOWN
+            # (probe can't reach the LLM — connection refused, DNS gone,
+            # etc.). Either way the next user-facing call would burn the
+            # full first_token_timeout for nothing. UNKNOWN may recover
+            # any second; the user will retry, but they should not wait
+            # the full LLM timeout to find out.
+            if avail.state in (AvailabilityState.DOWN, AvailabilityState.UNKNOWN):
                 raise LLMUnavailable(
-                    f"LLM is DOWN (consecutive failures: "
-                    f"{avail.consecutive_failures})"
+                    f"LLM is {avail.state.value.upper()} "
+                    f"(consecutive failures: {avail.consecutive_failures})"
                 )
 
         system_prompt = self._resolve_system_prompt(system_prompt_override)
