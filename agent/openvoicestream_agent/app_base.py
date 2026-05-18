@@ -167,6 +167,13 @@ class BaseApp:
         # send asr_eos. Send at most one per turn. Cleared on every
         # ASRFinal, on PTT/start (next turn), and on reconnect.
         self._eos_sent_this_turn: bool = False
+        # Watchdog: SLV in `always_on` pipeline mode does NOT emit
+        # asr_final when ASR yields empty text (it filters server-side
+        # to avoid noise turns). Without this watchdog the state machine
+        # would stay THINKING forever after the very first VAD trigger
+        # on mic noise. Started in send_asr_eos_once, cancelled in the
+        # ASRFinal / SLVError / reconnect paths.
+        self._asr_watchdog_task: asyncio.Task | None = None
         # Rate-limited stop-word matcher cache (compiled per Config update).
         self._stop_words_cache: tuple[list[str], list[str]] | None = None
 
@@ -496,6 +503,11 @@ class BaseApp:
         Returns True if this call actually sent the EOS, False if it
         was a duplicate (already sent this turn). The flag is reset on
         ASRFinal / PTT-start / SLV reconnect.
+
+        Arms an `_asr_final_watchdog` so the state machine self-recovers
+        if SLV doesn't echo an ASR final back (always_on pipeline mode
+        silently drops empty finals — without this, the FSM stays
+        THINKING forever after a noise-triggered turn).
         """
         if getattr(self, "_eos_sent_this_turn", False):
             return False
@@ -507,7 +519,47 @@ class BaseApp:
             # Don't clear the flag — even on failure we don't want to
             # retry a second time within the same turn and risk the SLV
             # state machine getting into an inconsistent state.
+        # Arm watchdog (cancels any stale one from a prior failed turn).
+        self._cancel_asr_watchdog()
+        self._asr_watchdog_task = asyncio.create_task(
+            self._asr_final_watchdog(),
+            name="asr-final-watchdog",
+        )
         return True
+
+    def _cancel_asr_watchdog(self) -> None:
+        """Cancel any pending asr_final watchdog (idempotent)."""
+        task = getattr(self, "_asr_watchdog_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._asr_watchdog_task = None
+
+    async def _asr_final_watchdog(self) -> None:
+        """Force state back to IDLE if asr_final never arrives after asr_eos.
+
+        SLV's always_on pipeline filters empty-text finals server-side, so
+        an EOS triggered by mic noise produces no client-visible final and
+        the FSM would stay in THINKING forever. Real finals cancel this
+        task before it fires.
+        """
+        timeout = float(getattr(self.config, "asr_final_timeout_s", 3.0))
+        try:
+            await asyncio.sleep(timeout)
+        except asyncio.CancelledError:
+            return
+        # Only act if (a) we still believe an EOS is outstanding and
+        # (b) the FSM hasn't moved on (e.g. via SLVError, a late final
+        # that arrived just before us, or a barge-in).
+        if not getattr(self, "_eos_sent_this_turn", False):
+            return
+        if getattr(self, "_state", ConvState.IDLE) != ConvState.THINKING:
+            return
+        logger.warning(
+            "asr_final not received within %.1fs after asr_eos; "
+            "assuming empty/dropped final — resetting to IDLE", timeout,
+        )
+        self._eos_sent_this_turn = False
+        self._set_state(ConvState.IDLE)
 
     async def _update_vad(self, chunk: bytes, chunk_ms: int) -> None:
         """Client-side speech-end detector. Sends asr_eos to SLV after a
@@ -675,6 +727,10 @@ class BaseApp:
             return
 
         if isinstance(evt, ASRFinal):
+            # A real final arrived — disarm the watchdog so it doesn't
+            # later reset state out from under whatever dispatch we're
+            # about to run.
+            self._cancel_asr_watchdog()
             if evt.duplicate_of_streamed:
                 return
             # SLV closes the WS after every asr_eos-triggered final
@@ -801,6 +857,9 @@ class BaseApp:
             return
 
         if isinstance(evt, SLVError):
+            # Transport died — any pending asr_final watchdog is moot;
+            # SLVError handling below already drives state back to IDLE.
+            self._cancel_asr_watchdog()
             old_state = getattr(self, "_state", ConvState.IDLE)
             await self._broadcast(
                 "on_error",

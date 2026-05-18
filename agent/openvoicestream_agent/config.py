@@ -95,6 +95,9 @@ class Config:
     # llm_stream_idle_timeout_s: 流式过程中两 token 间最长间隔
     llm_first_token_timeout_s: float = 15.0
     llm_stream_idle_timeout_s: float = 30.0
+    # ASR 防卡死超时（秒）— SLV 在 always_on pipeline 下不发空 final，
+    # 没这个 watchdog 第一次 mic 噪声触发 EOS 后 FSM 永远卡 THINKING。
+    asr_final_timeout_s: float = 3.0
     # Transparent retry for transient upstream LLM failures (network
     # resets, 5xx, connect timeouts) that happen *before any token has
     # been yielded*. Once the model has started speaking we never retry
