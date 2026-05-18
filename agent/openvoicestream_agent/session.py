@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 _TOKENIZER_CACHE: dict[str, Any] = {}
 
 
-# Sentinel used to cache "tokenizer load failed; use char/4 fallback".
+# Sentinel used to cache "tokenizer load failed; use conservative
+# char-based fallback" (see _fallback_estimate for the actual formula).
 _FALLBACK = object()
 
 
@@ -37,9 +38,9 @@ def _get_tokenizer(model_name: str) -> Any:
 
     Returns ``_FALLBACK`` (and warns once) when transformers isn't
     installed or the model can't be loaded — callers must handle this
-    by falling back to the char/4 estimator. We deliberately don't
-    raise: a missing tokenizer should degrade gracefully, not crash
-    the voice loop.
+    by falling back to ``_fallback_estimate`` (``ceil(chars * 1.5)``).
+    We deliberately don't raise: a missing tokenizer should degrade
+    gracefully, not crash the voice loop.
     """
     if model_name not in _TOKENIZER_CACHE:
         try:
@@ -49,7 +50,7 @@ def _get_tokenizer(model_name: str) -> Any:
             )
         except Exception as e:
             logger.warning(
-                "tokenizer load failed for %r (%s); using char/4 estimate",
+                "tokenizer load failed for %r (%s); using char*1.5 fallback",
                 model_name, e,
             )
             _TOKENIZER_CACHE[model_name] = _FALLBACK

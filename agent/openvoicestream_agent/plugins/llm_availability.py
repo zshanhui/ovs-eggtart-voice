@@ -174,10 +174,20 @@ class LLMAvailabilityPlugin(Plugin):
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        # llm_base_url already includes /v1 per OpenAI convention; the
+        # mock server's enqueue_* helpers and the real edge-llm both serve
+        # /v1/chat/completions, but we strip trailing /v1 to be defensive
+        # in case someone configures the base without it. Without this
+        # care, appending /v1 again yields /v1/v1/chat/completions → 404
+        # and a one-shot healthy → degraded → healthy flap on startup.
+        chat_url = self.base_url
+        if not chat_url.endswith("/v1") and "/v1/" not in chat_url + "/":
+            chat_url = chat_url.rstrip("/") + "/v1"
+        chat_url = chat_url + "/chat/completions"
         try:
             async with httpx.AsyncClient(timeout=self.probe_timeout_s) as client:
                 r = await client.post(
-                    f"{self.base_url}/v1/chat/completions",
+                    chat_url,
                     json={
                         "model": self.model_name,
                         "messages": [{"role": "user", "content": "."}],
