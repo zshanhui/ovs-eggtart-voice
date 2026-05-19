@@ -61,6 +61,33 @@ services:
         limits:
           memory: ${OVS_MEMORY_LIMIT:-6G}
 
+  translator:
+    build:
+      context: ..
+      dockerfile: services/translator/Dockerfile
+    image: seeed-local-voice:translator-latest
+    runtime: nvidia
+    ports:
+      - "9001:9001"
+    environment:
+      - TRANSLATOR_DEVICE=${TRANSLATOR_DEVICE:-cuda}
+      - TRANSLATOR_DEVICE_INDEX=${TRANSLATOR_DEVICE_INDEX:-0}
+      - TRANSLATOR_MODEL_PATH=${TRANSLATOR_MODEL_PATH:-/models/nllb-200-distilled-600m-ct2-int8}
+    volumes:
+      - translator-models:/models:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: ${TRANSLATOR_MEMORY_LIMIT:-4G}
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
 volumes:
   speech-models:
     name: speech-models
+  translator-models:
+    name: translator-models

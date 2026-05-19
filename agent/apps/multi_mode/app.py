@@ -71,6 +71,7 @@ class MultiModeApp(BaseApp):
             config=self.config,
             slv=self.slv,
             llm=self.llm,
+            translator=self.translator,
             session=self.session,
             audio=self.audio,
             events=self.events,

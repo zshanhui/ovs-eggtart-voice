@@ -44,10 +44,8 @@ class ModeContext:
     audio: Any
     events: Any
     broadcast: Callable[..., Awaitable[None]]
-    # Optional handle to the owning ModeManager so modes can introspect /
-    # request a switch (e.g. a "switch to chat" voice command). Set by
-    # ModeManager when the context is created.
-    mode_manager: "ModeManager | None" = None
+    translator: Any = None  # TranslatorBackend; optional (defaults to None for backward compat)
+    mode_manager: "ModeManager | None" = None  # Optional ModeManager handle
 
     async def run_default_dialogue_turn(
         self,

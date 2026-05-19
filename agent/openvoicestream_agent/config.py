@@ -129,6 +129,18 @@ class Config:
     # common edge-llm engine; override per-deployment if your engine
     # ships a different vocabulary.
     session_tokenizer_model: str = "Qwen/Qwen3-4B-AWQ"
+    # Translator backend: "noop" (pass-through) or "ctranslate2" (HTTP client).
+    # Used by TranslatorApp for sentence-level translation (wait for ASRFinal,
+    # translate, stream to TTS). Default "noop" means translation is disabled.
+    translator_backend: str = "noop"
+    # Base URL of the translator service (when translator_backend="ctranslate2").
+    translator_url: str = "http://localhost:9001"
+    # NLLB-200 language codes for source and target languages.
+    # Examples: "zho_Hans" (Chinese), "eng_Latn" (English), "fra_Latn" (French).
+    translator_src_lang: str = "zho_Hans"
+    translator_tgt_lang: str = "eng_Latn"
+    # Request timeout for translator service (seconds).
+    translator_timeout_s: float = 5.0
     # Path the config was loaded from (set by `load_config`); used by
     # the dashboard's per-mode override editor to persist changes back
     # to disk. None when the Config was constructed in code.
@@ -164,6 +176,47 @@ class Config:
                 f"llm_retry_backoff_s must be a non-negative number; "
                 f"got {self.llm_retry_backoff_s!r}"
             )
+        # Validate translator backend
+        translator_allowed = {"noop", "ctranslate2"}
+        if self.translator_backend not in translator_allowed:
+            raise ValueError(
+                f"translator_backend must be one of {sorted(translator_allowed)}; "
+                f"got {self.translator_backend!r}"
+            )
+        if not (isinstance(self.translator_timeout_s, (int, float))
+                and self.translator_timeout_s > 0):
+            raise ValueError(
+                f"translator_timeout_s must be a positive number; "
+                f"got {self.translator_timeout_s!r}"
+            )
+        # Validate NLLB language codes (format: xxx_Xxxx per FLORES-200)
+        if not re.match(r"^[a-z]{3}_[A-Z][a-z]{3}$", self.translator_src_lang):
+            raise ValueError(
+                f"translator_src_lang must match NLLB format (e.g. 'zho_Hans'); "
+                f"got {self.translator_src_lang!r}"
+            )
+        if not re.match(r"^[a-z]{3}_[A-Z][a-z]{3}$", self.translator_tgt_lang):
+            raise ValueError(
+                f"translator_tgt_lang must match NLLB format (e.g. 'eng_Latn'); "
+                f"got {self.translator_tgt_lang!r}"
+            )
+
+    @property
+    def slv_http_base(self) -> str:
+        """HTTP base derived from slv_url (ws://host:port/path → http://host:port).
+
+        Used by the dashboard plugin to proxy TTS speaker/clone calls to the
+        SLV service. wss:// → https://, ws:// → http://. If slv_url cannot be
+        parsed, falls back to http://localhost:8621.
+        """
+        from urllib.parse import urlparse
+        try:
+            u = urlparse(self.slv_url)
+            scheme = "https" if u.scheme in ("wss", "https") else "http"
+            netloc = u.netloc or "localhost:8621"
+            return f"{scheme}://{netloc}"
+        except Exception:
+            return "http://localhost:8621"
 
 
 def _expand_env(value: Any) -> Any:

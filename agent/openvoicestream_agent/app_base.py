@@ -50,10 +50,11 @@ from .app_mode import LLMTimeoutError
 from .audio_io import AudioIO
 from .config import Config
 from .event_bus import EventBus
-from .llm import EdgeLLMBackend, LLMBackend, LLMStreamError, OpenAICompatBackend
+from .llm import EdgeLLMBackend, LLMBackend, LLMStreamError, OpenAICompatBackend, NoopLLM
 from .plugins.llm_availability import LLMUnavailable
 from .session import Session
 from .state import ConvState
+from .translator import CTranslate2Translator, NoopTranslator, TranslatorBackend
 from .vad import create_vad
 from .slv_client import (
     ASREndpoint,
@@ -110,6 +111,8 @@ def _strip_for_signal(text: str) -> str:
 
 def _build_llm(config: Config) -> LLMBackend:
     backend = config.llm_backend.lower()
+    if backend == "noop":
+        return NoopLLM()
     if backend == "edge_llm":
         return EdgeLLMBackend(
             base_url=config.llm_base_url,
@@ -129,6 +132,18 @@ def _build_llm(config: Config) -> LLMBackend:
     raise ValueError(f"Unknown llm_backend: {config.llm_backend!r}")
 
 
+def _build_translator(config: Config) -> TranslatorBackend:
+    backend = config.translator_backend.lower()
+    if backend == "noop":
+        return NoopTranslator()
+    if backend == "ctranslate2":
+        return CTranslate2Translator(
+            base_url=config.translator_url,
+            timeout=config.translator_timeout_s,
+        )
+    raise ValueError(f"Unknown translator_backend: {config.translator_backend!r}")
+
+
 class BaseApp:
     """Subclass and implement `on_user_utterance` to define an App."""
 
@@ -143,6 +158,7 @@ class BaseApp:
             output_sr=config.audio_output_sample_rate,
         )
         self.llm: LLMBackend = _build_llm(config)
+        self.translator: TranslatorBackend = _build_translator(config)
         self.session = Session(
             locale=str(config.slv_config.get("asr_language", "zh")).lower()[:2],
             max_input_tokens=getattr(config, "session_max_input_tokens", None),
@@ -482,6 +498,11 @@ class BaseApp:
         # 7. release LLM client resources (HTTP connection pool, etc.)
         try:
             await self.llm.aclose()
+        except Exception:  # pragma: no cover
+            pass
+        # 8. release translator client resources
+        try:
+            await self.translator.aclose()
         except Exception:  # pragma: no cover
             pass
 
@@ -1239,6 +1260,9 @@ class BaseApp:
             await self.on_user_utterance(text)
             # Success path: tell the availability plugin so a transient
             # failure that earlier flipped us to DEGRADED gets cleared.
+            # Skip if LLM is disabled (noop backend).
+            if isinstance(self.llm, NoopLLM):
+                return
             avail = getattr(self, "llm_availability", None)
             if avail is not None:
                 try:
