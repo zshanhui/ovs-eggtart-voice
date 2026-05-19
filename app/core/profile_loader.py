@@ -35,10 +35,16 @@ def _snapshot_operator_keys() -> frozenset[str]:
     These keys are considered owned by the operator (or the surrounding
     container/CI environment) and will NEVER be overwritten or cleared by
     ``apply_profile``.
+
+    Empty values are excluded: docker-compose passes declared-but-unset
+    variables (e.g. ``QWEN3_ARTIFACT_MANIFEST:`` with no value) into the
+    container as empty strings, not unset, and treating those as
+    operator-owned would suppress the profile defaults they were meant to
+    inherit from.
     """
     return frozenset(
-        k for k in os.environ.keys()
-        if k.startswith(_OPERATOR_KEY_PREFIXES)
+        k for k, v in os.environ.items()
+        if k.startswith(_OPERATOR_KEY_PREFIXES) and v != ""
     )
 
 

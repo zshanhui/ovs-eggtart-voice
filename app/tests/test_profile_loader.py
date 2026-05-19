@@ -94,6 +94,22 @@ def test_operator_env_never_overwritten(tmp_path, monkeypatch):
     assert "OVS_OPERATOR_TEST" not in profile_loader.get_applied_keys()
 
 
+def test_snapshot_operator_keys_excludes_empty_values(monkeypatch):
+    """docker-compose passes declared-but-unset vars as empty strings,
+    not unset; these must not be treated as operator-owned (otherwise
+    profile defaults silently fail to apply — orin-nx regression
+    2026-05-20 with QWEN3_ARTIFACT_MANIFEST="")."""
+    monkeypatch.setenv("QWEN3_ARTIFACT_MANIFEST", "")
+    monkeypatch.setenv("QWEN3_ARTIFACT_SET", "")
+    monkeypatch.setenv("QWEN3_ARTIFACT_ROOT", "/opt/models/qwen3-edgellm")
+
+    snapshot = profile_loader._snapshot_operator_keys()
+
+    assert "QWEN3_ARTIFACT_MANIFEST" not in snapshot
+    assert "QWEN3_ARTIFACT_SET" not in snapshot
+    assert "QWEN3_ARTIFACT_ROOT" in snapshot
+
+
 def test_operator_env_not_cleared_on_reapply(tmp_path, monkeypatch):
     import os
 
