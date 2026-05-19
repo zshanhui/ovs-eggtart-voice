@@ -46,8 +46,20 @@ jobs:
             app/backends/rk/tts.py \
             deploy/roundtrip_verify.py
 
+      - name: app.main import smoke (catches Python-version regressions)
+        run: uv run python -c "from app.main import app; print('routes:', len(app.routes))"
+
       - name: Service unit tests
-        run: uv run pytest app/tests/test_tts_language.py
+        run: |
+          uv run pytest \
+            app/tests/test_tts_language.py \
+            app/tests/test_profile_loader.py \
+            app/tests/test_admin_auth.py \
+            app/tests/test_tts_runtime.py \
+            app/tests/test_admin_routes.py \
+            app/tests/test_backend_manager.py \
+            app/tests/test_backend_unload.py \
+            app/tests/test_main_hot_swap.py
 
       - name: Agent unit tests
         working-directory: agent
