@@ -1010,6 +1010,13 @@ async def v2v_stream(ws: WebSocket):
                     if vad is not None:
                         event = vad.process(samples)
                         if event == vad_mod.VADSession.SPEECH_START:
+                            # Notify client FIRST so it can stop buffering /
+                            # playing TTS audio, then perform the server-side
+                            # barge-in (cancel in-flight TTS, open fresh ASR).
+                            await send_json({
+                                "type": v2v_proto.SERVER_VAD_EVENT,
+                                "event": v2v_proto.VAD_EVENT_SPEECH_START,
+                            })
                             # Auto barge-in: cancel any in-flight TTS, then
                             # open a fresh ASR utterance (pre-empts any
                             # still-active session per spec).
@@ -1048,6 +1055,15 @@ async def v2v_stream(ws: WebSocket):
                         state["endpoint_pending"] = "vad"
                         if not multi_utterance:
                             state["asr_session_closed"] = True
+                        # Notify client of VAD speech_end so it can update
+                        # its state machine (e.g. show "thinking" indicator,
+                        # await asr_final). Sent AFTER endpoint_pending is
+                        # latched to keep ordering deterministic w.r.t. the
+                        # asr_final that follows from asr_out_task.
+                        await send_json({
+                            "type": v2v_proto.SERVER_VAD_EVENT,
+                            "event": v2v_proto.VAD_EVENT_SPEECH_END,
+                        })
                     continue
                 # text → JSON control
                 text = msg.get("text", "")

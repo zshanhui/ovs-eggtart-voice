@@ -44,7 +44,12 @@ SERVER_ASR_FINAL          = "asr_final"
 SERVER_TTS_STARTED        = "tts_started"        # first audio frame about to ship
 SERVER_TTS_SENTENCE_DONE  = "tts_sentence_done"  # one sentence finished
 SERVER_TTS_DONE           = "tts_done"           # flush complete, no more audio
+SERVER_VAD_EVENT          = "vad_event"          # server-side VAD speech_start/speech_end
 SERVER_ERROR              = "error"
+
+# vad_event "event" field values
+VAD_EVENT_SPEECH_START    = "speech_start"
+VAD_EVENT_SPEECH_END      = "speech_end"
 
 
 # ────────────────────────────────────────────────────────────────────────

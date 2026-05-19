@@ -63,8 +63,18 @@ Plus: **binary frames** = int16 PCM at `sample_rate` (mono), feeding ASR.
 {"type":"tts_started",       "sentence":"..."}       // about to ship audio
 {"type":"tts_sentence_done", "sentence":"..."}       // one sentence finished
 {"type":"tts_done"}                                  // tts_flush honored, no more audio
+{"type":"vad_event",         "event":"speech_start"} // server-side VAD: user started speaking
+{"type":"vad_event",         "event":"speech_end"}   // server-side VAD: user stopped speaking
 {"type":"error",             "error":"..."}
 ```
+
+`vad_event` lets the client update its UI / playback state machine in
+sync with server-side VAD. `speech_start` is emitted **before** the
+server cancels any in-flight TTS for barge-in, so a client buffering
+playback can drop pending audio immediately. `speech_end` is emitted
+right after the endpoint is latched and precedes the resulting
+`asr_final`. Clients that don't care about these events can ignore
+unknown frame types — emission is unconditional whenever VAD is active.
 
 Plus: **binary frames** = int16 PCM TTS output. The first binary frame is
 a 4-byte little-endian uint32 = sample rate (matches `/tts/stream`).
