@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import sys, os
+import time
 from typing import Any, List
 
 import numpy as np
@@ -293,3 +294,111 @@ async def test_cancel_idle_is_noop():
     await mgr.cancel("ws_close")
     assert mgr.state == SessionState.IDLE
     assert be.restart_worker_calls == 0
+
+
+# ── T1: concurrent restart_worker idempotency ─────────────────────────
+
+
+@asynctest
+async def test_concurrent_mark_error_collapses_to_single_restart():
+    """5 concurrent mark_error calls must not fan out into 5 restart_worker
+    invocations — recovery is serialized & coalesced per error window."""
+    good = FakeStream("ok")
+    # Each create_stream call will fail enough times to exhaust retries
+    # and trigger restart_worker. If coalescing fails, we'd see >1
+    # restart for the same error window.
+    be = RaisingCreateBackend(
+        streams=[good, good, good, good, good],
+        errors_seq=[_WorkerExitError(f"e{i}") for i in range(20)],
+    )
+    mgr = ASRSessionManager(be)
+    # Drive 5 concurrent error notifications.
+    errs = [_WorkerExitError(f"caller-{i}") for i in range(5)]
+    await asyncio.gather(*[mgr._async_mark_error(e) for e in errs])
+    # Allow any in-flight restart to land.
+    await asyncio.sleep(0.05)
+    assert be.restart_worker_calls <= 1, (
+        f"expected ≤1 restart_worker call, got {be.restart_worker_calls}"
+    )
+
+
+# ── T2: cancel during ERROR_REBUILD is bounded ────────────────────────
+
+
+@asynctest
+async def test_cancel_during_error_rebuild_is_bounded():
+    """WS-close cancel must return promptly even when ERROR_REBUILD is
+    burning through its retry/backoff schedule. No hang past 1s."""
+    good = FakeStream("ok")
+    # Enough errors to keep _do_rebuild_locked busy through all 3 backoffs
+    # then a restart, so cancel definitely races with recovery.
+    be = RaisingCreateBackend(
+        streams=[good],
+        errors_seq=[
+            _WorkerExitError("1"), _WorkerExitError("2"),
+            _WorkerExitError("3"), _WorkerExitError("4"),
+        ],
+    )
+    mgr = ASRSessionManager(be)
+    # Kick off recovery in the background.
+    rebuild_task = asyncio.create_task(
+        mgr._async_mark_error(_WorkerExitError("trigger"))
+    )
+    await asyncio.sleep(0.01)  # let it enter ERROR_REBUILD
+    t0 = time.monotonic()
+    await mgr.cancel("ws_close")
+    elapsed = time.monotonic() - t0
+    # 3 backoffs sum to ~0.6s; add tolerance for restart_worker hop.
+    # The hard ceiling is 1.0s as specified.
+    assert elapsed < 1.0, f"cancel during ERROR_REBUILD took {elapsed:.3f}s"
+    # Let the background recovery finish so the loop closes cleanly.
+    try:
+        await asyncio.wait_for(rebuild_task, timeout=1.5)
+    except asyncio.TimeoutError:
+        rebuild_task.cancel()
+
+
+# ── T3: slow finalize racing new speech_start does not drop new utterance ─
+
+
+@asynctest
+async def test_slow_finalize_does_not_silence_new_utterance():
+    """utt1 finalize is slow; while it's in flight, utt2 speech_start fires.
+    When utt1's finalize completes, the new (utt2) generation/active flag
+    must NOT be cleared. accept_audio on utt2 must still succeed."""
+    s1 = FakeStream("utt1-final", finalize_delay=0.2)
+    s2 = FakeStream("utt2-final")
+    be = FakeBackend([s1, s2])
+    mgr = ASRSessionManager(be)
+
+    g1 = await mgr.on_speech_start()
+    assert g1 == 1
+
+    # Kick off the slow finalize on utt1.
+    finalize_task = asyncio.create_task(mgr.finalize_with_generation("vad_end"))
+    await asyncio.sleep(0.02)  # let it enter FINALIZING
+
+    # While utt1 finalize is in flight, the user starts speaking again.
+    g2 = await mgr.on_speech_start()
+    assert g2 == 2
+    assert mgr.current_generation == g2
+    assert mgr.state == SessionState.ACTIVE
+
+    # Audio for the NEW utterance must flow.
+    await mgr.accept_audio(np.zeros(160, dtype=np.float32))
+    assert s2.accept_calls, "utt2 stream must receive audio after preempting utt1"
+
+    # Now let utt1's finalize complete. Whatever it returns, the manager's
+    # current generation must remain g2 (not be clobbered back).
+    ran_gen, _text = await finalize_task
+    # Caller uses ran_gen != current_generation to know NOT to clear
+    # asr_active flags — exact same guard documented in main.py.
+    assert ran_gen == g1
+    assert mgr.current_generation == g2
+    assert mgr.state == SessionState.ACTIVE, (
+        f"utt2 must remain ACTIVE after stale utt1 finalize, got {mgr.state}"
+    )
+
+    # And subsequent accept_audio on the new utterance still works.
+    await mgr.accept_audio(np.zeros(160, dtype=np.float32))
+    assert len(s2.accept_calls) == 2
