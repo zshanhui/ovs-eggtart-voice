@@ -1068,7 +1068,8 @@ async def v2v_stream(ws: WebSocket):
                     state["tts_flush"] = True
                 elif typ == v2v_proto.CLIENT_ASR_EOS:
                     state["endpoint_pending"] = "client_eos"
-                    state["asr_session_closed"] = True
+                    if not multi_utterance:
+                        state["asr_session_closed"] = True
                 elif typ == v2v_proto.CLIENT_ABORT:
                     t = state["current_tts_task"]
                     if t is not None and not t.done():
