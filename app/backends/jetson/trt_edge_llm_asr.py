@@ -109,6 +109,12 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         self._ready = False
         self._worker: Optional[subprocess.Popen] = None
         self._worker_lock = threading.Lock()
+        # Separate lock so restart_worker() can preempt a request thread
+        # that is blocked on stdout.readline() while holding _worker_lock.
+        # restart_worker() snapshots self._worker WITHOUT acquiring
+        # _worker_lock, then calls proc.kill() so the blocked readline
+        # returns and the request thread can release _worker_lock.
+        self._restart_lock = threading.Lock()
         self._worker_ready_meta: dict = {}
         self._worker_stderr_tail: deque[str] = deque(maxlen=80)
 
@@ -410,36 +416,54 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         return output_data
 
     def restart_worker(self) -> None:
-        """Kill the worker subprocess so the next request rebuilds it.
+        """Forcibly kill the worker subprocess so the next request rebuilds it.
 
-        Safe to call concurrently — guarded by the same lock that protects
-        request/response framing. Used by ASRSessionManager when bounded
-        recovery fails or a cancel ack times out.
+        Crucially, this method MUST NOT acquire ``_worker_lock``. A request
+        thread may be blocked on ``stdout.readline()`` while holding
+        ``_worker_lock`` (typical "stuck cancel" scenario where the worker
+        is wedged and not emitting an ack). Acquiring the same lock here
+        would deadlock — the only way to release the readline is to kill
+        the subprocess so its stdout pipe EOFs.
+
+        Concurrent callers collapse to a single restart via
+        ``_restart_lock`` (cheap, doesn't block on IO).
         """
-        with self._worker_lock:
+        # Snapshot WITHOUT _worker_lock — the lock holder is what we're
+        # trying to unstick. _restart_lock only serializes restarts.
+        with self._restart_lock:
             worker = self._worker
-            self._worker = None
-            self._worker_ready_meta = {}
             if worker is None:
                 return
+            # Clear our reference first so other threads that finish their
+            # blocked readline (now EOF) see _worker = None and don't try
+            # to talk to a dead pipe.
+            self._worker = None
+            self._worker_ready_meta = {}
             try:
                 if worker.poll() is None:
+                    # Use kill() directly (SIGKILL on POSIX) so a wedged
+                    # worker can't ignore SIGTERM. This force-closes its
+                    # stdout pipe, unblocking any readline holder of
+                    # _worker_lock so they release it on next op.
                     try:
-                        if worker.stdin and not worker.stdin.closed:
-                            worker.stdin.close()
+                        worker.kill()
                     except Exception:
                         pass
-                    worker.terminate()
                     try:
                         worker.wait(timeout=1.0)
                     except subprocess.TimeoutExpired:
-                        worker.kill()
-                        try:
-                            worker.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            pass
+                        pass
+                # Close pipes after kill so the readline-blocked thread
+                # definitely unblocks. close() on a stdout already EOF'd
+                # is a no-op.
+                for fh in (worker.stdin, worker.stdout, worker.stderr):
+                    try:
+                        if fh is not None and not fh.closed:
+                            fh.close()
+                    except Exception:
+                        pass
             except Exception as exc:
-                logger.warning("restart_worker: terminate failed: %s", exc)
+                logger.warning("restart_worker: kill failed: %s", exc)
         logger.info("ASR worker restarted (will respawn on next request)")
 
     @staticmethod
@@ -894,9 +918,13 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         self._cancelled = True
         # Send the `end` event but bound the wait to 500ms; if the worker
         # is unresponsive raise WorkerExitError so the session manager
-        # can trigger restart_worker().
+        # can trigger restart_worker(). We must NOT use a
+        # ``with ThreadPoolExecutor`` context manager here — its __exit__
+        # waits for outstanding futures, so a wedged worker_request would
+        # hold the cancel path forever, defeating the timeout.
         import concurrent.futures as _cf
-        with _cf.ThreadPoolExecutor(max_workers=1) as pool:
+        pool = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr-cancel")
+        try:
             fut = pool.submit(
                 self._backend._worker_request,
                 {"event": "end", "id": self._session_id},
@@ -905,6 +933,10 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
                 fut.result(timeout=0.5)
             except _cf.TimeoutError:
                 self._closed = True
+                # Fire-and-forget shutdown; the leaked worker thread will
+                # die once restart_worker() kills the subprocess (its
+                # stdout will EOF and _worker_request returns/raises).
+                pool.shutdown(wait=False)
                 raise WorkerExitError(
                     f"ASR worker did not ack 'end' for session {self._session_id} within 500ms"
                 )
@@ -915,7 +947,14 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
             except Exception:
                 # Other errors are swallowed (legacy behavior).
                 pass
-        self._closed = True
+            self._closed = True
+        finally:
+            # Best-effort: don't block — if the future is still running,
+            # restart_worker() will unblock it shortly.
+            try:
+                pool.shutdown(wait=False)
+            except Exception:
+                pass
 
     def get_partial(self) -> tuple[str, bool]:
         if self._closed:
