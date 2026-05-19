@@ -202,9 +202,9 @@ class ASRSessionManager:
         """Transition ACTIVE→FINALIZING→IDLE; return final text.
 
         Returns "" if not in a finalizable state (defensive — caller may
-        race with cancel). For callers that need to guard shared state
-        against stale finalize completions (e.g. ``asr_active`` flags),
-        prefer :meth:`finalize_with_generation`.
+        race with cancel). For callers that emit protocol frames, prefer
+        :meth:`finalize_with_status` so discarded finalize completions can
+        be distinguished from accepted empty transcripts.
         """
         _gen, text = await self.finalize_with_generation(reason)
         return text
@@ -213,37 +213,48 @@ class ASRSessionManager:
         """Like :meth:`finalize` but returns ``(generation_id, text)``.
 
         ``generation_id`` is the generation the finalize ran against.
-        Callers should compare against :attr:`current_generation` BEFORE
-        mutating shared state (e.g. clearing ``asr_active``): if a new
-        speech_start preempted us while finalize was in flight, the
-        current generation will already have advanced and the caller
-        must not clobber it.
+        Callers that only need to avoid clobbering shared state can compare
+        the returned generation against their own active-generation snapshot.
+        Callers that emit protocol frames should use
+        :meth:`finalize_with_status` instead.
 
         Returns ``(gen, "")`` on no-op / discarded paths.
         """
+        gen, text, _accepted = await self.finalize_with_status(reason)
+        return gen, text
+
+    async def finalize_with_status(self, reason: str = "vad_end") -> tuple[int, str, bool]:
+        """Like :meth:`finalize_with_generation`, plus an accepted flag.
+
+        ``accepted`` is False when the manager discarded the finalize
+        result because the stream was cancelled, no longer finalizable, or
+        superseded by another generation. Callers that emit protocol frames
+        should use this flag instead of comparing against mutable outer
+        connection state.
+        """
         async with self._lock:
             if self._state not in (SessionState.ACTIVE,):
-                return self._generation, ""
+                return self._generation, "", False
             gen = self._generation
             self._state = SessionState.FINALIZING
             stream = self._stream
         if stream is None:
             async with self._lock:
                 self._state = SessionState.IDLE
-            return gen, ""
+            return gen, "", False
         try:
             final_text = await self._run_sync(stream.finalize)
         except Exception as exc:  # noqa: BLE001
             async with self._lock:
                 await self._handle_error_locked(exc)
-            return gen, ""
+            return gen, "", False
         async with self._lock:
             # If a cancel raced past us (e.g. abort-during-FINALIZING),
             # the cancel routine will have moved us into CANCELLING and
             # already discarded the result. Honor that.
             if self._state != SessionState.FINALIZING:
                 logger.info("ASRSessionManager: finalize result discarded (state=%s)", self._state)
-                return gen, ""
+                return gen, "", False
             # Also drop if the generation advanced (a new speech_start
             # raced past us via _inner_cancel/preempt).
             if self._generation != gen:
@@ -251,10 +262,10 @@ class ASRSessionManager:
                     "ASRSessionManager: finalize result discarded (stale gen %d != current %d)",
                     gen, self._generation,
                 )
-                return gen, ""
+                return gen, "", False
             self._stream = None
             self._state = SessionState.IDLE
-            return gen, final_text or ""
+            return gen, final_text or "", True
 
     async def get_partial_for_generation(self) -> tuple[int, str, bool]:
         """Snapshot ``(generation, partial_text, is_endpoint)`` atomically.

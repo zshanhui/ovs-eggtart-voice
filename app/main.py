@@ -1191,21 +1191,31 @@ async def v2v_stream(ws: WebSocket):
                 if state["asr_active"]:
                     finalize_gen = state["asr_active_gen"]
                     async with coord.acquire("asr"):
-                        ran_gen, final_text = await asr_manager.finalize_with_generation(
-                            endpoint_reason or "backend_endpoint"
+                        ran_gen, final_text, finalize_accepted = (
+                            await asr_manager.finalize_with_status(
+                                endpoint_reason or "backend_endpoint"
+                            )
                         )
                     # Only clear asr_active if the generation we finalized
                     # is still the active one. If a new speech_start
                     # bumped the generation while finalize was in flight,
                     # leaving asr_active=True is correct — audio for the
                     # new utterance must continue to flow (BUG 2).
-                    if (
-                        ran_gen == finalize_gen
-                        and state["asr_active_gen"] == finalize_gen
-                    ):
+                    if finalize_accepted and state["asr_active_gen"] == finalize_gen:
                         state["asr_active"] = False
                 else:
                     final_text = ""
+                    ran_gen = state["asr_active_gen"]
+                    finalize_accepted = True
+
+                if not finalize_accepted:
+                    logger.info(
+                        "suppressing discarded asr_final from gen=%s current_gen=%s reason=%s",
+                        ran_gen,
+                        state["asr_active_gen"],
+                        endpoint_reason or "backend_endpoint",
+                    )
+                    continue
 
                 # Multi-utterance: mid-session finals carry
                 # session_complete=False; close-out final on

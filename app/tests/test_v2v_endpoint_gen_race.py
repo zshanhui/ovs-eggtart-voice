@@ -228,6 +228,17 @@ def _decide_finalize_POST_FIX(state: dict) -> Tuple[bool, str | None]:
     return endpoint_fired, endpoint_reason
 
 
+def _should_emit_final_POST_FIX(
+    state: dict,
+    finalize_gen: int,
+    accepted: bool,
+) -> bool:
+    """Mirror the post-finalize accepted-result guard in app/main.py."""
+    if accepted and state["asr_active_gen"] == finalize_gen:
+        state["asr_active"] = False
+    return accepted
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Tests
 # ──────────────────────────────────────────────────────────────────────
@@ -331,6 +342,71 @@ async def test_stale_endpoint_against_new_generation_is_gated():
     # INFO and doesn't change the return shape — either way, no second
     # finalize was issued against U2's stream.)
     _ = u1_text
+
+
+@_asynctest
+async def test_preempted_finalize_does_not_emit_empty_asr_final():
+    """If U2 starts while U1 finalize is still running, U1's discarded
+    finalize must not leak downstream as an empty asr_final.
+
+    This is the "empty final after 2 turns" failure mode: the generation
+    guard kept U2 active, but the old code still sent final_text="" to the
+    client after the discarded U1 finalize returned.
+    """
+    u1_stream = _SlowFinalizeStream(text="utterance one text", finalize_delay_s=0.10)
+    u2_stream = _SlowFinalizeStream(text="utterance two text", finalize_delay_s=0.05)
+    manager = ASRSessionManager(_SequencedASRBackend([u1_stream, u2_stream]), language="en")
+    state = {
+        "asr_active": True,
+        "asr_active_gen": await manager.on_speech_start(),
+        "endpoint_pending": None,
+        "endpoint_pending_gen": None,
+    }
+    finalize_gen = state["asr_active_gen"]
+    finalize_task = asyncio.create_task(manager.finalize_with_status("vad"))
+
+    await asyncio.sleep(0.03)
+    state["asr_active_gen"] = await manager.on_speech_start()
+    state["asr_active"] = True
+
+    ran_gen, final_text, accepted = await finalize_task
+
+    assert ran_gen == finalize_gen
+    assert final_text == ""
+    assert accepted is False
+    assert _should_emit_final_POST_FIX(state, finalize_gen, accepted) is False
+    assert state["asr_active"] is True
+
+
+@_asynctest
+async def test_accepted_finalize_emits_even_if_outer_gen_changed_after_return():
+    """The outer connection generation is mutable and can advance after a
+    valid finalize result returns but before the frame is emitted.
+
+    The suppress decision must trust the manager's accepted flag, not the
+    current outer asr_active_gen alone.
+    """
+    manager = ASRSessionManager(
+        _SequencedASRBackend([_SlowFinalizeStream(text="你好。", finalize_delay_s=0.0)]),
+        language="zh",
+    )
+    state = {
+        "asr_active": True,
+        "asr_active_gen": await manager.on_speech_start(),
+        "endpoint_pending": None,
+        "endpoint_pending_gen": None,
+    }
+    finalize_gen = state["asr_active_gen"]
+    ran_gen, final_text, accepted = await manager.finalize_with_status("vad")
+
+    state["asr_active_gen"] = finalize_gen + 1
+    state["asr_active"] = True
+
+    assert ran_gen == finalize_gen
+    assert final_text == "你好。"
+    assert accepted is True
+    assert _should_emit_final_POST_FIX(state, finalize_gen, accepted) is True
+    assert state["asr_active"] is True
 
 
 @_asynctest
