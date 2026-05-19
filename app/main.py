@@ -956,6 +956,14 @@ async def v2v_stream(ws: WebSocket):
         "client_closed":    False,
         "asr_active":       False,   # tracks whether manager.on_speech_start
                                      # has been called for the current utterance
+        "asr_active_gen":   0,       # generation tagged onto asr_active so a
+                                     # stale finalize doesn't clear a fresh
+                                     # utterance's asr_active flag (BUG 2)
+        "endpoint_finalize_pending": False,  # set when dispatcher already
+                                     # accepted the speech-end chunk and the
+                                     # asr_out_task should finalize next tick
+                                     # (BUG 3: avoids the flag-set/audio-accept
+                                     # race that lost the tail of utterances)
     }
     tts_q: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
@@ -998,6 +1006,7 @@ async def v2v_stream(ws: WebSocket):
                         continue
                     samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                     speech_started_now = False
+                    speech_ended_now = False
                     if vad is not None:
                         event = vad.process(samples)
                         if event == vad_mod.VADSession.SPEECH_START:
@@ -1011,23 +1020,34 @@ async def v2v_stream(ws: WebSocket):
                             if stop is not None:
                                 stop.set()
                             async with coord.acquire("asr"):
-                                await asr_manager.on_speech_start()
+                                new_gen = await asr_manager.on_speech_start()
                             state["asr_active"] = True
+                            state["asr_active_gen"] = new_gen
                             speech_started_now = True
                         elif event == vad_mod.VADSession.SPEECH_END:
-                            # Signal the asr_out_task to finalize via the
-                            # manager. Caller flag is consumed below.
-                            state["endpoint_pending"] = "vad"
-                            if not multi_utterance:
-                                state["asr_session_closed"] = True
+                            # Defer setting endpoint_pending until AFTER we
+                            # accept this final chunk below — otherwise the
+                            # asr_out_task observes the flag and calls
+                            # finalize() while the tail audio is still
+                            # in-flight, silently dropping it (BUG 3).
+                            speech_ended_now = True
                     # No-VAD mode: open the session lazily on first audio.
                     if vad is None and not state["asr_active"]:
                         async with coord.acquire("asr"):
-                            await asr_manager.on_speech_start()
+                            new_gen = await asr_manager.on_speech_start()
                         state["asr_active"] = True
+                        state["asr_active_gen"] = new_gen
                     if state["asr_active"]:
                         async with coord.acquire("asr"):
                             await asr_manager.accept_audio(samples)
+                    # Now safe to flag the endpoint — audio chunk that
+                    # carried the speech-end has been delivered to the
+                    # stream. asr_out_task will pick this up on the next
+                    # poll and call finalize().
+                    if speech_ended_now:
+                        state["endpoint_pending"] = "vad"
+                        if not multi_utterance:
+                            state["asr_session_closed"] = True
                     continue
                 # text → JSON control
                 text = msg.get("text", "")
@@ -1080,19 +1100,22 @@ async def v2v_stream(ws: WebSocket):
         """
         last_streamed_final = None
         while not state["client_closed"]:
-            # Pull a stream reference snapshot. May be None between
-            # utterances or while ERROR_REBUILD is recovering.
-            stream = asr_manager.stream
-            partial, is_endpoint = "", False
-            if stream is not None and state["asr_active"]:
+            # Pull a stream snapshot under the manager's lock so we can
+            # tag any partial with the generation it came from. If the
+            # generation has advanced by emit-time, drop the partial —
+            # it belongs to an utterance that's already been replaced
+            # (BUG 4: stale-stream partial leak).
+            partial, is_endpoint, partial_gen = "", False, 0
+            if state["asr_active"]:
                 try:
                     async with coord.acquire("asr"):
-                        partial, is_endpoint = await loop.run_in_executor(
-                            _get_asr_executor(), stream.get_partial
+                        partial_gen, partial, is_endpoint = (
+                            await asr_manager.get_partial_for_generation()
                         )
                 except Exception:
-                    partial, is_endpoint = "", False
-                if partial:
+                    partial, is_endpoint, partial_gen = "", False, 0
+                if partial and partial_gen == asr_manager.current_generation \
+                        and partial_gen == state["asr_active_gen"]:
                     await send_json({"type": v2v_proto.SERVER_ASR_PARTIAL,
                                      "text": partial, "is_stable": bool(is_endpoint)})
 
@@ -1111,11 +1134,21 @@ async def v2v_stream(ws: WebSocket):
                     await send_json({"type": v2v_proto.SERVER_ASR_ENDPOINT})
 
                 if state["asr_active"]:
+                    finalize_gen = state["asr_active_gen"]
                     async with coord.acquire("asr"):
-                        final_text = await asr_manager.finalize(
+                        ran_gen, final_text = await asr_manager.finalize_with_generation(
                             endpoint_reason or "backend_endpoint"
                         )
-                    state["asr_active"] = False
+                    # Only clear asr_active if the generation we finalized
+                    # is still the active one. If a new speech_start
+                    # bumped the generation while finalize was in flight,
+                    # leaving asr_active=True is correct — audio for the
+                    # new utterance must continue to flow (BUG 2).
+                    if (
+                        ran_gen == finalize_gen
+                        and state["asr_active_gen"] == finalize_gen
+                    ):
+                        state["asr_active"] = False
                 else:
                     final_text = ""
 
