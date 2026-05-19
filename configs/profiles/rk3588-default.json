@@ -32,5 +32,6 @@
     "MATCHA_MODEL_SEQ_LEN": "80",
     "VOCOS_MODEL": "vocos-16khz-600.rknn",
     "VOCOS_FRAMES": "256"
-  }
+  },
+  "tts_model_id": "matcha-icefall-zh-en.rknn"
 }

@@ -7,6 +7,8 @@ is a `config` that decides which features light up:
 |---|---|
 | `asr_language` set | ASR is enabled. Client may send PCM binary frames; server emits `asr_partial` / `asr_endpoint` / `asr_final` JSON. |
 | `tts_language` set | TTS is enabled. Client may send `text` JSON frames; server emits PCM binary chunks + `tts_started` / `tts_sentence_done` / `tts_done` JSON. Use `"auto"` to enable TTS while delegating language selection to the backend (qwen3 inspects the text; backends without auto-detect fall back to their default). |
+| `tts_speaker_id` | Numeric speaker ID from `/tts/speakers`. Resolved through the model-scoped speaker registry. Prefer over `tts_voice`. Omit/`null` to use the model default. |
+| `tts_voice` | (Deprecated) Backend-specific opaque speaker string. Replaced by `tts_speaker_id`. Accepted only when `tts_speaker_id` is absent. |
 | Both set | Full V2V duplex. Binary in both directions: client → ASR input, server → TTS output. |
 | `vad` | Server-side VAD backend (default `silero` if ASR enabled, `none` otherwise). |
 | `vad_silence_ms` | How long silence to trigger auto `asr_endpoint`. Default is `OVS_VAD_SILENCE_MS` or 400 ms. |
@@ -33,7 +35,8 @@ Clients can still override per connection with `vad` and `vad_silence_ms`.
 {"type":"config",
  "asr_language":"zh",          // omit to disable ASR
  "tts_language":"zh",          // omit to disable TTS
- "tts_voice":"default",        // optional; backend-specific
+ "tts_speaker_id":2301,        // speaker ID from /tts/speakers (preferred)
+ "tts_voice":"default",        // deprecated; prefer tts_speaker_id
  "tts_speed":1.0,              // optional; some backends only
  "sample_rate":16000,          // PCM sample rate
  "vad":"silero",               // "silero" | "webrtcvad" | "none"

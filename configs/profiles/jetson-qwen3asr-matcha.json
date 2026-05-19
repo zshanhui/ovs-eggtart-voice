@@ -44,7 +44,9 @@
       "env_var": "VOCOS_ENGINE",
       "onnx_input": "vocos_m600_trt.onnx",
       "build_script": "scripts/build_matcha_engines.sh",
-      "build_env": {"VOCOS_NAME": "vocos_fp16.engine"},
+      "build_env": {
+        "VOCOS_NAME": "vocos_fp16.engine"
+      },
       "hf_only": false,
       "required": true
     },
@@ -62,5 +64,6 @@
       "hf_only": false,
       "required": true
     }
-  ]
+  ],
+  "tts_model_id": "matcha-icefall-zh-en"
 }

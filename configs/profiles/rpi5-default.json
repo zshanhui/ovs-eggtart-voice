@@ -6,5 +6,6 @@
   "execution_policy": {
     "mode": "concurrent"
   },
-  "env": {}
+  "env": {},
+  "tts_model_id": "sherpa"
 }

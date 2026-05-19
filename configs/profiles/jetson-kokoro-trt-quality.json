@@ -139,5 +139,6 @@
       "hf_only": false,
       "required": true
     }
-  ]
+  ],
+  "tts_model_id": "kokoro-multi-lang-v1_0"
 }

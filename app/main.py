@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, File, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import Optional
+from types import SimpleNamespace
+from typing import Literal, Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,9 +65,25 @@ _tts_stream_executor: ThreadPoolExecutor | None = None
 _asr_executor: ThreadPoolExecutor | None = None
 
 
-def _request_voice_kwargs(req: TTSRequest) -> dict:
-    import base64
+def _request_voice_kwargs(req: TTSRequest, *, backend=None) -> dict:
+    """Resolve TTS kwargs for one synth call.
+
+    Mixes (in priority order):
+      request payload > runtime overrides > speaker-table default
+
+    Returns a dict combining the backend-specific speaker kwargs (from
+    :func:`speaker_kwargs_for_id`) plus ``speed`` / ``pitch_shift`` when the
+    merge (request payload + runtime overrides) yields a value. Callers
+    should ``**``-spread the result into ``synthesize`` / ``generate_streaming``
+    and must NOT additionally pass ``speed`` / ``pitch_shift`` from the raw
+    request, or runtime overrides will be silently discarded (FIX_2).
+
+    ``backend`` is the live TTS backend (from BackendManager.acquire()); when
+    omitted we fall back to ``tts_service`` / env so the helper still works
+    if called outside an acquire() scope.
+    """
     from app.core.tts_speakers import speaker_kwargs_for_id
+    from app.core.tts_runtime import merge_tts_request_kwargs
 
     speaker_id = req.speaker_id if req.speaker_id is not None else req.sid
     if speaker_id is not None and req.speaker_embedding_b64:
@@ -75,11 +93,146 @@ def _request_voice_kwargs(req: TTSRequest) -> dict:
             return {"speaker_embedding": base64.b64decode(req.speaker_embedding_b64)}
         except Exception as exc:
             raise ValueError("Invalid base64 speaker_embedding_b64") from exc
-    return speaker_kwargs_for_id(speaker_id)
+
+    if backend is not None:
+        model_id = backend.model_id
+    else:
+        from app.core import tts_service
+        if tts_service.is_ready():
+            model_id = tts_service.get_backend().model_id
+        else:
+            model_id = os.environ.get("OVS_TTS_MODEL_ID") or "qwen3-tts"
+
+    merged = merge_tts_request_kwargs(
+        request_speaker_id=speaker_id,
+        request_speed=req.speed,
+        request_pitch_shift=getattr(req, "pitch", None),
+        model_id=model_id,
+    )
+    # Translate merged speaker_id into backend-specific kwargs (speaker_id
+    # for preset, speaker_embedding for an embedding-typed entry, etc.).
+    out: dict = speaker_kwargs_for_id(merged["speaker_id"], model_id)
+    # FIX_2: thread merged speed / pitch_shift through so PATCH /admin/tts/runtime
+    # actually takes effect. Only include keys that resolved to a non-None value
+    # so backends keep using their intrinsic defaults when nothing was set.
+    if merged.get("speed") is not None:
+        out["speed"] = merged["speed"]
+    if merged.get("pitch_shift") is not None:
+        out["pitch_shift"] = merged["pitch_shift"]
+    return out
 
 
 def _get_asr_backend():
     return _asr_backend
+
+
+_tts_lazy_start_lock = None  # asyncio.Lock; created on first use
+
+
+def _try_tts_manager():
+    """Return the TTS BackendManager if it is initialised+ready, else None.
+
+    Kept for ASR-only profiles where TTS isn't wired at all. For LAZY_TTS the
+    ``_ensure_tts_manager_started`` coroutine should be awaited first so the
+    manager is in READY state before this is consulted.
+    """
+    try:
+        from app.core.backend_manager import tts_manager  # local import; PR3 module
+        mgr = tts_manager()
+    except RuntimeError:
+        return None
+    return mgr if mgr.is_ready() else None
+
+
+async def _ensure_tts_manager_started():
+    """FIX_3 / FIX_3_completion: drive the TTS BackendManager to READY.
+
+    Return values:
+      * ``mgr`` — manager exists and is READY (caller must use ``acquire``).
+      * ``None`` — manager was never installed (ASR-only profile, or
+        ``init_backend_managers`` wasn't called). Caller may fall back to the
+        legacy ``tts_service.synthesize`` path.
+
+    Raises ``HTTPException(503)`` when the manager exists but is *not*
+    serviceable — FAILED, DRAINING, RELOADING, or when ``start()`` fails to
+    bring an INIT-state manager to READY. This is intentional: a FAILED
+    manager indicates a configuration / resource problem and silently
+    falling back to legacy ``tts_service`` would bypass the drain contract
+    and mask the failure from operators.
+    """
+    import asyncio as _asyncio
+    global _tts_lazy_start_lock
+    try:
+        from app.core.backend_manager import tts_manager, BackendState
+        mgr = tts_manager()
+    except RuntimeError:
+        # Manager singleton never installed → legacy fallback is OK.
+        return None
+
+    if mgr.is_ready():
+        return mgr
+
+    # FAILED is non-recoverable here — surface as 503, never fall through to
+    # legacy tts_service (which would skip drain / hide the failure).
+    if mgr.state == BackendState.FAILED:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "tts_manager_failed", "state": "failed"},
+        )
+
+    # DRAINING / RELOADING are transient — surface 503 so the client retries.
+    if mgr.state != BackendState.INIT:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "tts_manager_unavailable", "state": mgr.state.value},
+        )
+
+    if _tts_lazy_start_lock is None:
+        _tts_lazy_start_lock = _asyncio.Lock()
+    async with _tts_lazy_start_lock:
+        if mgr.is_ready():
+            return mgr
+        if mgr.state == BackendState.FAILED:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "tts_manager_failed", "state": "failed"},
+            )
+        if mgr.state != BackendState.INIT:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "tts_manager_unavailable", "state": mgr.state.value},
+            )
+        try:
+            await mgr.start()
+        except Exception as exc:
+            logger.exception("lazy TTS manager.start() failed")
+            # start() failure flips state to FAILED. Surface 503 instead of
+            # silently falling back to legacy tts_service.
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "tts_manager_start_failed",
+                    "state": mgr.state.value,
+                    "message": str(exc),
+                },
+            ) from exc
+    if mgr.is_ready():
+        return mgr
+    # Defensive: start() returned without exception but state isn't READY.
+    raise HTTPException(
+        status_code=503,
+        detail={"error": "tts_manager_unavailable", "state": mgr.state.value},
+    )
+
+
+def _try_asr_manager():
+    """Return the ASR BackendManager if it is initialised+ready, else None."""
+    try:
+        from app.core.backend_manager import asr_manager
+        mgr = asr_manager()
+    except RuntimeError:
+        return None
+    return mgr if mgr.is_ready() else None
 
 
 def _get_tts_stream_executor() -> ThreadPoolExecutor:
@@ -274,6 +427,88 @@ async def startup():
     except Exception as exc:  # pragma: no cover
         logger.warning("Coordinator backend registration skipped: %s", exc)
 
+    # ── BackendManager wiring (PR4) ─────────────────────────────────────
+    # Wrap the already-preloaded ASR/TTS instances in lifecycle managers so
+    # /admin/backend/reload + acquire()-based request gating can drain
+    # inflight work and hot-swap backends. The factories below return the
+    # *current* singleton; on a reload the manager will call them again
+    # after unloading the previous one, by which point tts_service /
+    # _asr_backend have been re-bound to fresh instances. preloader is a
+    # no-op on initial start (already loaded above); on reload the factory
+    # invokes the real backend factory which performs its own preload.
+    try:
+        from app.core import backend_manager as _bm
+        from app.core import tts_service as _tts_service_mod
+        from app.core.asr_backend import create_asr_backend as _create_asr
+        from app.core.tts_backend import create_tts_backend as _create_tts
+
+        # On reload, build a fresh instance and rebind the legacy module
+        # globals so downstream code (which still reads tts_service /
+        # _asr_backend directly) sees the new backend.
+        def _asr_factory():
+            global _asr_backend
+            if _asr_backend is None:
+                _asr_backend = _create_asr()
+            return _asr_backend
+
+        def _asr_preloader(b):
+            # Initial start: already preloaded above. On reload, the
+            # factory returns a freshly constructed (un-preloaded)
+            # instance, so we call preload() here.
+            if not b.is_ready():
+                b.preload()
+
+        def _asr_unloader(b):
+            global _asr_backend
+            try:
+                b.unload()
+            finally:
+                _asr_backend = None
+
+        def _tts_factory():
+            if _tts_service_mod._backend is None:
+                _tts_service_mod._backend = _create_tts()
+            return _tts_service_mod._backend
+
+        def _tts_preloader(b):
+            if not b.is_ready():
+                b.preload()
+
+        def _tts_unloader(b):
+            try:
+                b.unload()
+            finally:
+                _tts_service_mod._backend = None
+
+        # FIX_4_completion: seed both managers with the profile ref used at
+        # startup (OVS_PROFILE_JSON / OVS_PROFILE / OVS_PROFILE_DEFAULT). Same
+        # precedence as profile_loader.apply_profile_from_env so rollback
+        # re-applies via the identical source.
+        _initial_profile_ref = (
+            os.environ.get("OVS_PROFILE_JSON")
+            or os.environ.get("OVS_PROFILE")
+            or os.environ.get("OVS_PROFILE_DEFAULT")
+        )
+        _bm.init_backend_managers(
+            tts_factory=_tts_factory,
+            tts_preloader=_tts_preloader,
+            tts_unloader=_tts_unloader,
+            asr_factory=_asr_factory,
+            asr_preloader=_asr_preloader,
+            asr_unloader=_asr_unloader,
+            initial_profile_ref=_initial_profile_ref,
+        )
+
+        # Bring up managers. ASR is always started if a backend exists;
+        # TTS respects ASR-only profiles and LAZY_TTS env (matches the
+        # legacy preload skip above).
+        if _asr_backend is not None:
+            await _bm.asr_manager().start()
+        if tts_service.is_configured() and tts_service.is_ready():
+            await _bm.tts_manager().start()
+    except Exception as exc:  # pragma: no cover
+        logger.warning("BackendManager wiring skipped: %s", exc)
+
     logger.info("Speech service ready.")
 
 
@@ -329,12 +564,102 @@ async def tts_capabilities():
     from app.core.tts_speakers import available_speakers
     if not tts_service.is_ready():
         return JSONResponse({"error": "TTS not ready"}, status_code=503)
+    backend = tts_service.get_backend()
     return {
         "backend": tts_service.backend_name(),
+        "model_id": backend.model_id,
         "capabilities": [c.value for c in tts_service.capabilities()],
         "sample_rate": tts_service.get_sample_rate(),
-        "speakers": available_speakers(),
+        "speakers": available_speakers(backend.model_id),
     }
+
+
+# ── Speaker Management ─────────────────────────────────────────────
+
+
+class RegisterSpeakerRequest(BaseModel):
+    speaker_embedding_b64: str
+    label: str | None = None
+    speaker_id: int | None = None
+
+
+@app.get("/tts/speakers")
+async def tts_speakers_list():
+    """List all speakers registered for the active TTS model."""
+    from app.core import tts_service
+    from app.core.tts_speakers import available_speakers, default_speaker_id
+    if not tts_service.is_ready():
+        return JSONResponse({"error": "TTS not ready"}, status_code=503)
+    backend = tts_service.get_backend()
+    return {
+        "model_id": backend.model_id,
+        "default_speaker_id": default_speaker_id(backend.model_id),
+        "speakers": available_speakers(backend.model_id),
+    }
+
+
+@app.post("/tts/speakers/register")
+async def tts_speakers_register(req: RegisterSpeakerRequest):
+    """Register a voice-clone embedding as a persistent speaker.
+
+    Accepts a base64-encoded speaker embedding (from /tts/clone/embedding)
+    and assigns it a permanent speaker_id for subsequent /tts calls.
+    """
+    import base64
+    from app.core import tts_service
+    from app.core.tts_backend import TTSCapability
+    from app.core.tts_speakers import register_speaker
+
+    if not tts_service.is_ready():
+        return JSONResponse({"error": "TTS not ready"}, status_code=503)
+    if not tts_service.has_capability(TTSCapability.VOICE_CLONE):
+        return JSONResponse(
+            {"error": "Voice cloning not supported by current backend",
+             "required_capability": "voice_clone"},
+            status_code=501,
+        )
+
+    try:
+        emb = base64.b64decode(req.speaker_embedding_b64)
+    except Exception:
+        return JSONResponse({"error": "Invalid base64 speaker_embedding_b64"}, status_code=400)
+
+    backend = tts_service.get_backend()
+    try:
+        spec = register_speaker(
+            model_id=backend.model_id,
+            payload=req.speaker_embedding_b64,
+            label=req.label or "",
+            meta={"dim": len(emb) // 4, "dtype": "float32"},
+            speaker_id=req.speaker_id,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return {
+        "speaker_id": spec.id,
+        "type": spec.type,
+        "label": spec.label,
+        "model_id": backend.model_id,
+    }
+
+
+@app.delete("/tts/speakers/{speaker_id}")
+async def tts_speakers_delete(speaker_id: int):
+    """Delete a registered embedding speaker. Preset speakers cannot be deleted."""
+    from app.core import tts_service
+    from app.core.tts_speakers import unregister_speaker
+    if not tts_service.is_ready():
+        return JSONResponse({"error": "TTS not ready"}, status_code=503)
+
+    backend = tts_service.get_backend()
+    try:
+        ok = unregister_speaker(backend.model_id, speaker_id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    if not ok:
+        return JSONResponse({"error": f"Speaker {speaker_id} not found"}, status_code=404)
+    return {"deleted": True, "speaker_id": speaker_id}
 
 
 # ── TTS ──────────────────────────────────────────────────────────
@@ -344,19 +669,36 @@ async def tts(req: TTSRequest):
     from app.core import tts_service
     from app.core.coordinator import get_coordinator
 
-    try:
-        voice_kwargs = _request_voice_kwargs(req)
-    except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-
-    async with get_coordinator().acquire("tts"):
-        wav_bytes, meta = tts_service.synthesize(
-            text=req.text,
-            speed=req.speed,
-            pitch_shift=req.pitch,
-            language=req.language,
-            **voice_kwargs,
-        )
+    mgr = await _ensure_tts_manager_started()
+    if mgr is not None:
+        async with mgr.acquire() as backend:
+            try:
+                voice_kwargs = _request_voice_kwargs(req, backend=backend)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            async with get_coordinator().acquire("tts"):
+                # FIX_2: speed/pitch_shift come from voice_kwargs (merged with
+                # runtime overrides). Do NOT pass req.speed/req.pitch directly.
+                wav_bytes, meta = backend.synthesize(
+                    text=req.text,
+                    language=req.language,
+                    **voice_kwargs,
+                )
+    else:
+        # Manager not initialised (ASR-only or wiring failed at startup) —
+        # legacy tts_service path. Kept for ASR-only profiles where the
+        # TTS manager is intentionally never started; LAZY_TTS is now handled
+        # by _ensure_tts_manager_started above.
+        try:
+            voice_kwargs = _request_voice_kwargs(req)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        async with get_coordinator().acquire("tts"):
+            wav_bytes, meta = tts_service.synthesize(
+                text=req.text,
+                language=req.language,
+                **voice_kwargs,
+            )
     return Response(
         content=wav_bytes,
         media_type="audio/wav",
@@ -380,7 +722,15 @@ async def tts_stream(req: TTSRequest):
     import struct
     from app.core import tts_service
     from app.core.tts_backend import TTSCapability
+    from app.core.coordinator import get_coordinator
 
+    # FIX_1+FIX_3: prefer the BackendManager path so /admin/backend/reload's
+    # drain logic sees streaming requests in flight. Fall back to the legacy
+    # tts_service path only when the manager isn't initialised (ASR-only).
+    mgr = await _ensure_tts_manager_started()
+
+    # Capability gate uses tts_service so the response shape stays consistent
+    # — both paths read the same underlying backend.
     if not tts_service.has_capability(TTSCapability.STREAMING):
         return JSONResponse(
             {"error": "Streaming not supported by current backend",
@@ -388,34 +738,79 @@ async def tts_stream(req: TTSRequest):
             status_code=501,
         )
 
-    sr = tts_service.get_sample_rate()
-    backend = tts_service.get_backend()
-    from app.core.coordinator import get_coordinator
-    try:
-        voice_kwargs = _request_voice_kwargs(req)
-    except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-
     # Sentence-level streaming: split the request text into sentences (via
     # pysbd when the language is supported, regex fallback otherwise) and
-    # call the TTS backend per sentence. The first audio chunk of the
-    # first sentence reaches the client as soon as the first sentence's
-    # model warmup + KV prep is done — for big TTS models (Qwen3 voice
-    # clone, ~6700ms total for a 16s clip on Nano) this halves the
-    # perceived first-audio latency on long inputs. Single-sentence
-    # inputs (the common case) see zero change in behavior.
+    # call the TTS backend per sentence.
     from app.core.v2v import SentenceBuffer
     sbuf = SentenceBuffer(language=req.language)
     sentences = list(sbuf.add(req.text or "")) + list(sbuf.flush())
+
+    if mgr is not None:
+        # Acquire OUTSIDE the generator so inflight_http is bumped synchronously
+        # at endpoint entry — otherwise it would only increment when the client
+        # starts iterating the StreamingResponse, and reload drain could miss it.
+        acquire_cm = mgr.acquire()
+        backend = await acquire_cm.__aenter__()
+        try:
+            try:
+                voice_kwargs = _request_voice_kwargs(req, backend=backend)
+            except ValueError as exc:
+                await acquire_cm.__aexit__(None, None, None)
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            sr = backend.sample_rate
+
+            async def stream():
+                try:
+                    async with get_coordinator().acquire("tts"):
+                        yield struct.pack("<I", sr)
+                        if not sentences:
+                            return
+                        loop = asyncio.get_event_loop()
+                        for sentence in sentences:
+                            queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+                            def _run(text=sentence):
+                                try:
+                                    for chunk in backend.generate_streaming(
+                                        text,
+                                        language=req.language,
+                                        **voice_kwargs,
+                                    ):
+                                        loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                                except Exception:
+                                    logger.exception("tts/stream synthesis failed for sentence=%r", text)
+                                finally:
+                                    loop.call_soon_threadsafe(queue.put_nowait, None)
+
+                            loop.run_in_executor(_get_tts_stream_executor(), _run)
+                            while True:
+                                chunk = await queue.get()
+                                if chunk is None:
+                                    break
+                                yield chunk
+                finally:
+                    await acquire_cm.__aexit__(None, None, None)
+
+            return StreamingResponse(stream(), media_type="application/octet-stream")
+        except Exception:
+            await acquire_cm.__aexit__(None, None, None)
+            raise
+
+    # Manager not initialised — legacy direct-backend path.
+    backend = tts_service.get_backend()
+    sr = tts_service.get_sample_rate()
+    try:
+        voice_kwargs = _request_voice_kwargs(req, backend=backend)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
     if not sentences:
-        # Empty text — preserve original behavior: send SR header then
-        # close with no audio chunks.
         async def empty():
             async with get_coordinator().acquire("tts"):
                 yield struct.pack("<I", sr)
         return StreamingResponse(empty(), media_type="application/octet-stream")
 
-    async def stream():
+    async def stream_legacy():
         async with get_coordinator().acquire("tts"):
             yield struct.pack("<I", sr)
             loop = asyncio.get_event_loop()
@@ -426,8 +821,6 @@ async def tts_stream(req: TTSRequest):
                     try:
                         for chunk in backend.generate_streaming(
                             text,
-                            speed=req.speed,
-                            pitch_shift=req.pitch,
                             language=req.language,
                             **voice_kwargs,
                         ):
@@ -445,7 +838,7 @@ async def tts_stream(req: TTSRequest):
                         break
                     yield chunk
 
-    return StreamingResponse(stream(), media_type="application/octet-stream")
+    return StreamingResponse(stream_legacy(), media_type="application/octet-stream")
 
 
 # ── Voice Clone ───��──────────────────────────────────────────────
@@ -456,6 +849,7 @@ async def tts_clone(req: CloneRequest):
     import base64
     from app.core import tts_service
     from app.core.tts_backend import TTSCapability
+    from app.core.coordinator import get_coordinator
 
     if not tts_service.has_capability(TTSCapability.VOICE_CLONE):
         return JSONResponse(
@@ -470,13 +864,23 @@ async def tts_clone(req: CloneRequest):
     except Exception:
         return JSONResponse({"error": "Invalid base64 speaker_embedding_b64"}, status_code=400)
 
-    from app.core.coordinator import get_coordinator
-    async with get_coordinator().acquire("tts"):
-        wav_bytes, meta = tts_service.clone_voice(
-            text=req.text,
-            speaker_embedding=speaker_embedding,
-            language=req.language,
-        )
+    # FIX_1: route through manager.acquire() so reload drain sees this request.
+    mgr = await _ensure_tts_manager_started()
+    if mgr is not None:
+        async with mgr.acquire() as backend:
+            async with get_coordinator().acquire("tts"):
+                wav_bytes, meta = backend.clone_voice(
+                    text=req.text,
+                    speaker_embedding=speaker_embedding,
+                    language=req.language,
+                )
+    else:
+        async with get_coordinator().acquire("tts"):
+            wav_bytes, meta = tts_service.clone_voice(
+                text=req.text,
+                speaker_embedding=speaker_embedding,
+                language=req.language,
+            )
     return Response(
         content=wav_bytes,
         media_type="audio/wav",
@@ -550,25 +954,67 @@ async def tts_clone_stream(req: CloneStreamRequest):
     except Exception:
         return JSONResponse({"error": "Invalid base64 speaker_embedding_b64"}, status_code=400)
 
-    sr = tts_service.get_sample_rate()
-    backend = tts_service.get_backend()
     from app.core.coordinator import get_coordinator
 
-    async def stream():
+    stream_kwargs: dict = {
+        "speaker_embedding": speaker_embedding,
+        "language": req.language,
+    }
+    if req.first_chunk_frames is not None:
+        stream_kwargs["first_chunk_frames"] = req.first_chunk_frames
+    if req.chunk_frames is not None:
+        stream_kwargs["chunk_frames"] = req.chunk_frames
+    if req.streaming_profile is not None:
+        stream_kwargs["streaming_profile"] = req.streaming_profile
+
+    # FIX_1: enter manager.acquire() at endpoint scope so reload drain
+    # observes the inflight streaming request immediately.
+    mgr = await _ensure_tts_manager_started()
+    if mgr is not None:
+        acquire_cm = mgr.acquire()
+        backend = await acquire_cm.__aenter__()
+        try:
+            sr = backend.sample_rate
+
+            async def stream():
+                try:
+                    async with get_coordinator().acquire("tts"):
+                        yield struct.pack("<I", sr)
+                        loop = asyncio.get_event_loop()
+                        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+                        def _run():
+                            try:
+                                for chunk in backend.generate_streaming(req.text, **stream_kwargs):
+                                    loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                            except Exception:
+                                logger.exception("tts/clone/stream synthesis failed")
+                            finally:
+                                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+                        loop.run_in_executor(_get_tts_stream_executor(), _run)
+                        while True:
+                            chunk = await queue.get()
+                            if chunk is None:
+                                break
+                            yield chunk
+                finally:
+                    await acquire_cm.__aexit__(None, None, None)
+
+            return StreamingResponse(stream(), media_type="application/octet-stream")
+        except Exception:
+            await acquire_cm.__aexit__(None, None, None)
+            raise
+
+    # Legacy fallback (manager not initialised).
+    sr = tts_service.get_sample_rate()
+    backend = tts_service.get_backend()
+
+    async def stream_legacy():
         async with get_coordinator().acquire("tts"):
             yield struct.pack("<I", sr)
             loop = asyncio.get_event_loop()
             queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-            stream_kwargs = {
-                "speaker_embedding": speaker_embedding,
-                "language": req.language,
-            }
-            if req.first_chunk_frames is not None:
-                stream_kwargs["first_chunk_frames"] = req.first_chunk_frames
-            if req.chunk_frames is not None:
-                stream_kwargs["chunk_frames"] = req.chunk_frames
-            if req.streaming_profile is not None:
-                stream_kwargs["streaming_profile"] = req.streaming_profile
 
             def _run():
                 try:
@@ -587,7 +1033,7 @@ async def tts_clone_stream(req: CloneStreamRequest):
                     break
                 yield chunk
 
-    return StreamingResponse(stream(), media_type="application/octet-stream")
+    return StreamingResponse(stream_legacy(), media_type="application/octet-stream")
 
 
 # ── ASR ──────────────────────────────────────────────────────────
@@ -600,6 +1046,17 @@ async def asr(
     audio_bytes = await file.read()
 
     from app.core.coordinator import get_coordinator
+    mgr = _try_asr_manager()
+    if mgr is not None:
+        async with mgr.acquire() as asr_be:
+            async with get_coordinator().acquire("asr"):
+                result = asr_be.transcribe(audio_bytes, language=language)
+            return {
+                "text": result.text,
+                "language": result.language,
+                "backend": asr_be.name,
+                **result.meta,
+            }
     asr_be = _get_asr_backend()
     if asr_be and asr_be.is_ready():
         async with get_coordinator().acquire("asr"):
@@ -643,6 +1100,14 @@ async def asr_stream(
     from app.core.asr_backend import ASRCapability
 
     await ws.accept()
+
+    # Register this WS session with the BackendManager (if available) so a
+    # subsequent /admin/backend/reload can force-close it (code 1012) and
+    # cancel the handler task instead of waiting forever for drain.
+    _asr_mgr = _try_asr_manager()
+    _ws_handle = SimpleNamespace(websocket=ws, task=asyncio.current_task())
+    if _asr_mgr is not None:
+        _asr_mgr.register_ws(_ws_handle)
     vad_backend = vad if vad is not None else _default_vad_backend()
     vad_silence = _default_vad_silence_ms() if vad_silence_ms is None else max(0, int(vad_silence_ms))
 
@@ -668,13 +1133,17 @@ async def asr_stream(
             logger.warning("VAD '%s' init failed (%s); falling back to forced-EOS", vad_backend, e)
             vad_session = None
 
-    if use_backend_stream:
-        from app.core.coordinator import get_coordinator
-        async with get_coordinator().acquire("asr"):
-            await _asr_stream_backend(ws, asr_be, language, sample_rate, vad_session)
-    else:
-        await ws.send_json({"error": "no streaming ASR available"})
-        await ws.close()
+    try:
+        if use_backend_stream:
+            from app.core.coordinator import get_coordinator
+            async with get_coordinator().acquire("asr"):
+                await _asr_stream_backend(ws, asr_be, language, sample_rate, vad_session)
+        else:
+            await ws.send_json({"error": "no streaming ASR available"})
+            await ws.close()
+    finally:
+        if _asr_mgr is not None:
+            _asr_mgr.unregister_ws(_ws_handle)
 
 
 async def _asr_stream_backend(
@@ -867,6 +1336,17 @@ async def v2v_stream(ws: WebSocket):
 
     await ws.accept()
 
+    # Register this v2v session with whichever BackendManager(s) are
+    # available so /admin/backend/reload of either kind can hard-close
+    # the WS (code 1012) instead of letting the connection linger.
+    _v2v_asr_mgr = _try_asr_manager()
+    _v2v_tts_mgr = _try_tts_manager()
+    _v2v_handle = SimpleNamespace(websocket=ws, task=asyncio.current_task())
+    if _v2v_asr_mgr is not None:
+        _v2v_asr_mgr.register_ws(_v2v_handle)
+    if _v2v_tts_mgr is not None:
+        _v2v_tts_mgr.register_ws(_v2v_handle)
+
     # ── Stage 1: receive initial config ─────────────────────────────
     try:
         first_msg = await ws.receive()
@@ -903,7 +1383,17 @@ async def v2v_stream(ws: WebSocket):
         key = tts_language_norm.strip().lower()
         tts_language_norm = _TTS_LANG_ALIAS.get(key, key)
     tts_voice       = cfg.get("tts_voice")
+    tts_speaker_id = cfg.get("tts_speaker_id")
     tts_speed       = cfg.get("tts_speed")
+    # Resolve speaker once at config time — avoids mid-session changes
+    # (e.g. unregister) affecting later sentences in the same session.
+    tts_speaker_kwargs: dict = {}
+    if tts_speaker_id is not None and tts_language:
+        from app.core.tts_speakers import speaker_kwargs_for_id
+        if tts_service.is_ready():
+            tts_speaker_kwargs = speaker_kwargs_for_id(
+                int(tts_speaker_id), tts_service.get_backend().model_id
+            )
     sample_rate     = int(cfg.get("sample_rate", 16000))
     vad_backend     = cfg.get("vad", _default_vad_backend() if asr_language else "none")
     vad_silence_ms  = int(cfg.get("vad_silence_ms", _default_vad_silence_ms()))
@@ -1306,7 +1796,10 @@ async def v2v_stream(ws: WebSocket):
             def _run_synth(s):
                 try:
                     stream_kwargs = {"language": tts_language_norm}
-                    if tts_voice is not None:    stream_kwargs["voice"] = tts_voice
+                    if tts_speaker_kwargs:
+                        stream_kwargs.update(tts_speaker_kwargs)
+                    elif tts_voice is not None:
+                        stream_kwargs["voice"] = tts_voice  # deprecated
                     if tts_speed is not None:    stream_kwargs["speed"] = tts_speed
                     for chunk in tts_be.generate_streaming(s, **stream_kwargs):
                         if stop_event.is_set():
@@ -1412,4 +1905,149 @@ async def v2v_stream(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
+        if _v2v_asr_mgr is not None:
+            _v2v_asr_mgr.unregister_ws(_v2v_handle)
+        if _v2v_tts_mgr is not None:
+            _v2v_tts_mgr.unregister_ws(_v2v_handle)
         logger.info("v2v stream closed")
+
+
+# ── Admin: TTS runtime overrides ────────────────────────────────────────────
+
+class TTSRuntimePatch(BaseModel):
+    speaker_id: Optional[int] = None
+    speed: Optional[float] = None
+    pitch_shift: Optional[float] = None
+
+
+def _current_tts_model_id() -> Optional[str]:
+    from app.core import tts_service
+    if not tts_service.is_ready():
+        return None
+    try:
+        return tts_service.get_backend().model_id
+    except Exception:
+        return None
+
+
+def _effective_tts_values(model_id: Optional[str]) -> dict:
+    from app.core import tts_runtime
+    from app.core.tts_speakers import default_speaker_id
+    snap = tts_runtime.get_overrides()
+    if snap.default_speaker_id is not None:
+        eff_speaker = snap.default_speaker_id
+    elif model_id is not None:
+        try:
+            eff_speaker = default_speaker_id(model_id)
+        except Exception:
+            eff_speaker = None
+    else:
+        eff_speaker = None
+    return {
+        "speaker_id": eff_speaker,
+        "speed": snap.default_speed,
+        "pitch_shift": snap.default_pitch_shift,
+    }
+
+
+def _admin_dep():
+    from app.core.admin_auth import require_admin
+    return require_admin
+
+
+@app.get("/admin/tts/runtime")
+async def admin_tts_runtime_get(_: None = Depends(_admin_dep())):
+    from app.core import tts_runtime
+    snap = tts_runtime.get_overrides()
+    model_id = _current_tts_model_id()
+    return {
+        "model_id": model_id,
+        "overrides": {
+            "speaker_id": snap.default_speaker_id,
+            "speed": snap.default_speed,
+            "pitch_shift": snap.default_pitch_shift,
+            "updated_at": snap.updated_at,
+        },
+        "effective": _effective_tts_values(model_id),
+    }
+
+
+@app.patch("/admin/tts/runtime")
+async def admin_tts_runtime_patch(
+    req: TTSRuntimePatch,
+    _: None = Depends(_admin_dep()),
+):
+    from app.core import tts_runtime
+    fields = req.model_fields_set
+    kwargs: dict = {}
+    if "speaker_id" in fields:
+        kwargs["speaker_id"] = req.speaker_id
+    if "speed" in fields:
+        kwargs["speed"] = req.speed
+    if "pitch_shift" in fields:
+        kwargs["pitch_shift"] = req.pitch_shift
+    model_id = _current_tts_model_id()
+    if model_id is not None:
+        kwargs["model_id"] = model_id
+    try:
+        snap = tts_runtime.update_overrides(**kwargs)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    return {
+        "model_id": model_id,
+        "overrides": {
+            "speaker_id": snap.default_speaker_id,
+            "speed": snap.default_speed,
+            "pitch_shift": snap.default_pitch_shift,
+            "updated_at": snap.updated_at,
+        },
+        "effective": _effective_tts_values(model_id),
+    }
+
+
+@app.post("/admin/tts/speakers/reload")
+async def admin_tts_speakers_reload(
+    _: None = Depends(_admin_dep()),
+):
+    from app.core.tts_speakers import reload_speakers, available_speakers
+    reload_speakers()
+    model_id = _current_tts_model_id()
+    count = 0
+    if model_id is not None:
+        try:
+            count = len(available_speakers(model_id))
+        except Exception:
+            count = 0
+    return {"reloaded": True, "model_id": model_id, "count": count}
+
+
+# ── Admin: Backend hot-reload ───────────────────────────────────────────────
+
+class BackendReloadRequest(BaseModel):
+    kind: Literal["tts", "asr"]
+    profile: str
+    drain_timeout_s: Optional[float] = None
+
+
+@app.post("/admin/backend/reload")
+async def admin_backend_reload(
+    payload: BackendReloadRequest,
+    _: None = Depends(_admin_dep()),
+):
+    from app.core.backend_manager import tts_manager, asr_manager
+
+    if payload.kind == "tts":
+        mgr = tts_manager()
+    else:  # "asr"  (Literal already constrains the values)
+        mgr = asr_manager()
+    # drain_timeout_s override is plumbed into the request schema for
+    # forward compatibility; the manager does not yet expose a setter,
+    # so we ignore it for now (TODO: surface a per-call drain timeout
+    # on BackendManager.reload).
+    return await mgr.reload(payload.profile, reason="admin")
+
+
+@app.get("/admin/backend/status")
+async def admin_backend_status(_: None = Depends(_admin_dep())):
+    from app.core.backend_manager import tts_manager, asr_manager
+    return {"tts": tts_manager().status(), "asr": asr_manager().status()}

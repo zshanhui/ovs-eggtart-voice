@@ -16,6 +16,7 @@ import numpy as np
 
 from app.core.language import detect_zh_en
 from app.core.tts_backend import TTSBackend, TTSCapability
+from app.core.tts_speakers import resolve_speaker_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -159,8 +160,8 @@ class SherpaBackend(TTSBackend):
         language: Optional[str] = None,
         **kwargs,
     ) -> tuple[bytes, dict]:
-        if speaker_id is None:
-            speaker_id = DEFAULT_SPEAKER_ID
+        voice = resolve_speaker_kwargs(self.model_id, allow_embedding=False, speaker_id=speaker_id, **kwargs)
+        speaker_id = voice.get("speaker_id", DEFAULT_SPEAKER_ID)
         if speed is None:
             speed = DEFAULT_SPEED
         if pitch_shift is None:
@@ -192,9 +193,8 @@ class SherpaBackend(TTSBackend):
         import queue
         import threading
 
-        sid = kwargs.get("speaker_id")
-        if sid is None:
-            sid = DEFAULT_SPEAKER_ID
+        voice = resolve_speaker_kwargs(self.model_id, allow_embedding=False, **kwargs)
+        sid = voice.get("speaker_id", DEFAULT_SPEAKER_ID)
         speed = kwargs.get("speed")
         if speed is None:
             speed = DEFAULT_SPEED

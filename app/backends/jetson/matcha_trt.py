@@ -19,6 +19,7 @@ from typing import Optional
 
 from app.core.language import detect_zh_en
 from app.core.tts_backend import TTSBackend, TTSCapability
+from app.core.tts_speakers import resolve_speaker_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -435,6 +436,7 @@ class MatchaTRTBackend(TTSBackend):
         language: Optional[str] = None,
         **kwargs,
     ) -> tuple[bytes, dict]:
+        voice = resolve_speaker_kwargs(self.model_id, allow_embedding=False, speaker_id=speaker_id, **kwargs)
         if speed is None:
             speed = 1.0
         detected_language = detect_zh_en(text, language)

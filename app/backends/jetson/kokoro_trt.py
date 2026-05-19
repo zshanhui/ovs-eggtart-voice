@@ -24,6 +24,7 @@ import numpy as np
 
 from app.backends.jetson.matcha_trt import CudaMemoryPool
 from app.core.tts_backend import TTSBackend, TTSCapability
+from app.core.tts_speakers import resolve_speaker_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -419,14 +420,16 @@ class KokoroTRTBackend(TTSBackend):
         language: Optional[str] = None,
         **kwargs,
     ) -> tuple[bytes, dict]:
-        del pitch_shift, language, kwargs
+        del pitch_shift, language
+        voice = resolve_speaker_kwargs(self.model_id, allow_embedding=False, speaker_id=speaker_id, **kwargs)
+        sid = voice.get("speaker_id", DEFAULT_SPEAKER_ID)
         if SYNTH_SEGMENT_TEXT and self._runtime_mode in ("hybrid", "split_generator"):
             max_tokens = max(1, (self._hybrid_max_seq_len or 128) - 2)
             token_count = len(self._text_to_token_ids(text))
             if token_count > max_tokens:
                 segment_limit = int(os.environ.get("KOKORO_SYNTH_MAX_SEGMENT_TOKENS", str(STREAM_SEGMENT_TOKENS)))
-                return self._synthesize_segments(text, segment_limit, speaker_id=speaker_id, speed=speed)
-        return self._synthesize_one(text, speaker_id=speaker_id, speed=speed)
+                return self._synthesize_segments(text, segment_limit, speaker_id=sid, speed=speed)
+        return self._synthesize_one(text, speaker_id=sid, speed=speed)
 
     def _synthesize_segments(
         self,
@@ -529,6 +532,8 @@ class KokoroTRTBackend(TTSBackend):
         }
 
     def generate_streaming(self, text: str, **kwargs):
+        voice = resolve_speaker_kwargs(self.model_id, allow_embedding=False, **kwargs)
+        sid = voice.get("speaker_id", DEFAULT_SPEAKER_ID)
         segments = [text]
         if STREAM_SEGMENT_TEXT and kwargs.get("segment_text", True):
             segments = self._split_stream_text(text, kwargs.get("segment_max_tokens"))
@@ -541,7 +546,7 @@ class KokoroTRTBackend(TTSBackend):
         for segment in segments:
             wav, _meta = self.synthesize(
                 segment,
-                speaker_id=kwargs.get("speaker_id", kwargs.get("sid")),
+                speaker_id=sid,
                 speed=kwargs.get("speed"),
             )
             if len(wav) <= 44:

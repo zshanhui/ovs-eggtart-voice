@@ -16,6 +16,7 @@ from typing import Optional
 import numpy as np
 
 from app.core.tts_backend import TTSBackend, TTSCapability
+from app.core.tts_speakers import resolve_speaker_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -331,6 +332,9 @@ class Qwen3TRTBackend(TTSBackend):
         language: Optional[str] = None,
         **kwargs,
     ) -> tuple[bytes, dict]:
+        voice = resolve_speaker_kwargs(self.model_id, speaker_id=speaker_id, **kwargs)
+        if voice.get("speaker_embedding"):
+            kwargs.setdefault("speaker_embedding", voice["speaker_embedding"])
         if language is None:
             language = _detect_language(text)
 
@@ -396,16 +400,17 @@ class Qwen3TRTBackend(TTSBackend):
 
         if collect_streaming:
             start = time.time()
-            pcm = b"".join(
-                self.generate_streaming(
-                    text,
-                    language=language,
-                    max_frames=requested_max_frames,
-                    seed=seed,
-                    first_chunk_frames=int(kwargs.get("first_chunk_frames", 25)),
-                    chunk_frames=int(kwargs.get("chunk_frames", 25)),
-                )
-            )
+            stream_kwargs: dict[str, Any] = {
+                "language": language,
+                "max_frames": requested_max_frames,
+                "seed": seed,
+                "first_chunk_frames": int(kwargs.get("first_chunk_frames", 25)),
+                "chunk_frames": int(kwargs.get("chunk_frames", 25)),
+            }
+            # Carry voice-clone embedding through the streaming path.
+            if kwargs.get("speaker_embedding"):
+                stream_kwargs["speaker_embedding"] = kwargs["speaker_embedding"]
+            pcm = b"".join(self.generate_streaming(text, **stream_kwargs))
             elapsed = time.time() - start
             duration = len(pcm) / 2 / self.sample_rate if pcm else 0.0
             return _pcm16_to_wav(pcm, self.sample_rate), {
@@ -497,8 +502,9 @@ class Qwen3TRTBackend(TTSBackend):
         import queue as queue_mod
         import threading
 
+        voice = resolve_speaker_kwargs(self.model_id, **kwargs)
         language = kwargs.get("language") or _detect_language(text)
-        speaker_embedding = kwargs.get("speaker_embedding")
+        speaker_embedding = voice.get("speaker_embedding") or kwargs.get("speaker_embedding")
         first_chunk_frames = kwargs.get("first_chunk_frames", 5)
         chunk_frames = kwargs.get("chunk_frames", 25)
         max_frames = kwargs.get("max_frames", 200)

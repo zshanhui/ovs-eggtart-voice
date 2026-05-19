@@ -24,7 +24,7 @@ import importlib
 import uuid
 
 from app.core.tts_backend import TTSBackend, TTSCapability
-from app.core.tts_speakers import speaker_kwargs_for_id
+from app.core.tts_speakers import resolve_speaker_kwargs
 
 from app.backends.jetson.trt_edge_llm_ipc import (
     TTS_BINARY,
@@ -1116,13 +1116,12 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
             return wav_bytes, meta
 
-    @staticmethod
-    @staticmethod
-    def _resolve_voice_kwargs(kwargs: dict) -> dict:
-        if kwargs.get("speaker_embedding"):
-            return {"speaker_embedding": kwargs["speaker_embedding"]}
-        speaker_id = kwargs.get("speaker_id")
-        return speaker_kwargs_for_id(speaker_id)
+    def _resolve_voice_kwargs(self, kwargs: dict) -> dict:
+        sid = kwargs.get("speaker_id", kwargs.get("sid"))
+        # Pop speaker_id/sid from a copy to avoid passing them twice
+        # (resolve_speaker_kwargs also accepts them via **forward).
+        forward = {k: v for k, v in kwargs.items() if k not in ("speaker_id", "sid")}
+        return resolve_speaker_kwargs(self.model_id, speaker_id=sid, **forward)
 
     @staticmethod
     def _add_speaker_request_fields(request: dict, voice_kwargs: dict) -> None:

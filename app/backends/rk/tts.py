@@ -13,6 +13,7 @@ import numpy as np
 
 from app.core.language import detect_zh_en
 from app.core.tts_backend import TTSBackend, TTSCapability
+from app.core.tts_speakers import resolve_speaker_kwargs
 
 
 # rkvoice-stream's TTSBackend doesn't expose a capability set. The shipped
@@ -62,6 +63,8 @@ class RKTTSBackend(TTSBackend):
         language: Optional[str] = None,
         **kwargs,
     ) -> tuple[bytes, dict]:
+        voice = resolve_speaker_kwargs(self.model_id, allow_embedding=False, speaker_id=speaker_id, **kwargs)
+        sid = voice.get("speaker_id", 0)
         # rkvoice-stream's synthesize() doesn't take `language`; pass it
         # through kwargs only when explicitly set so backends that ignore it
         # are unaffected.
@@ -69,7 +72,7 @@ class RKTTSBackend(TTSBackend):
         kwargs.setdefault("language", language)
         return self._inner.synthesize(
             text=text,
-            speaker_id=speaker_id if speaker_id is not None else 0,
+            speaker_id=sid,
             speed=speed,
             pitch_shift=pitch_shift,
             **kwargs,
@@ -86,7 +89,8 @@ class RKTTSBackend(TTSBackend):
         items and explodes on tuples (`'tuple' object has no attribute
         'encode'`).
         """
-        speaker_id = kwargs.pop("speaker_id", 0) or 0
+        voice = resolve_speaker_kwargs(self.model_id, allow_embedding=False, **kwargs)
+        speaker_id = voice.get("speaker_id", 0)
         speed = kwargs.pop("speed", None)
         pitch_shift = kwargs.pop("pitch_shift", None)
         language = detect_zh_en(text, kwargs.pop("language", None))

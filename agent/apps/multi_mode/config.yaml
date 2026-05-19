@@ -9,7 +9,8 @@ slv_url: "${OVS_SLV_URL:-ws://localhost:8621/v2v/stream}"
 slv_config:
   asr_language: "auto"
   tts_language: "zh"
-  tts_voice: "default"
+  tts_speaker_id: null     # null = use model-default speaker
+  tts_voice: "default"    # deprecated, prefer tts_speaker_id
   tts_speed: 1.0
   sample_rate: 16000
   vad: "none"             # server VAD off; client-side VAD drives asr_eos

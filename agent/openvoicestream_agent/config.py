@@ -20,7 +20,8 @@ def _default_slv_config() -> dict[str, Any]:
     return {
         "asr_language": "zh",
         "tts_language": "zh",
-        "tts_voice": "default",
+        "tts_speaker_id": None,   # None = use model default speaker
+        "tts_voice": "default",   # deprecated, prefer tts_speaker_id
         "tts_speed": 1.0,
         "sample_rate": 16000,
         "vad": "silero",

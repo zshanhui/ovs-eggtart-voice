@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Dict, Optional, Tuple
@@ -33,6 +34,24 @@ class TTSBackend(ABC):
     def name(self) -> str:
         """Backend identifier (e.g. 'sherpa', 'qwen3_trt')."""
         ...
+
+    @property
+    def model_id(self) -> str:
+        """Model-scope key for speaker tables.
+
+        Reads ``OVS_TTS_MODEL_ID`` from the environment. Falls back to
+        ``self.name`` (the backend identifier) with a warning so that
+        production profiles always set this explicitly.
+        """
+        mid = os.environ.get("OVS_TTS_MODEL_ID")
+        if mid:
+            return mid
+        logger.warning(
+            "OVS_TTS_MODEL_ID not set; falling back to backend name %r. "
+            "Speaker tables may be incorrect. Add tts_model_id to your profile.",
+            self.name,
+        )
+        return self.name
 
     @property
     @abstractmethod

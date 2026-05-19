@@ -73,5 +73,6 @@
       "hf_only": false,
       "required": true
     }
-  ]
+  ],
+  "tts_model_id": "matcha-icefall-zh-en"
 }
