@@ -96,6 +96,7 @@ class DebugDashboardPlugin(Plugin):
 
         # Control endpoints (POST).
         web_app.router.add_post("/api/control/reconnect", self._api_reconnect)
+        web_app.router.add_post("/api/control/restart_mic", self._api_restart_mic)
         web_app.router.add_post("/api/control/abort", self._api_abort)
         web_app.router.add_post("/api/control/send_text", self._api_send_text)
         web_app.router.add_get("/api/session/history", self._api_session_history)
@@ -307,6 +308,20 @@ class DebugDashboardPlugin(Plugin):
         if errs:
             return web.json_response({"ok": False, "errors": errs}, status=500)
         return web.json_response({"ok": True})
+
+    async def _api_restart_mic(self, request):  # noqa: ANN001
+        from aiohttp import web
+        try:
+            restart = getattr(self.app, "restart_mic_capture", None)
+            if not callable(restart):
+                return web.json_response(
+                    {"ok": False, "error": "restart_mic_capture unavailable"},
+                    status=501,
+                )
+            await restart("dashboard")
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
 
     async def _api_send_text(self, request):  # noqa: ANN001
         from aiohttp import web

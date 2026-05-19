@@ -22,12 +22,16 @@ class FakeSLV:
     def __init__(self) -> None:
         self.text_frames: list[str] = []
         self.flushed: int = 0
+        self.aborted: int = 0
 
     async def send_text(self, text: str) -> None:
         self.text_frames.append(text)
 
     async def flush_tts(self) -> None:
         self.flushed += 1
+
+    async def abort(self) -> None:
+        self.aborted += 1
 
 
 class _LLMBase:
@@ -115,8 +119,9 @@ async def test_stream_idle_timeout():
     assert ei.value.partial_text == "first"
     # The first token did reach SLV before the hang.
     assert slv.text_frames == ["first"]
-    # finally-block still flushes TTS so SLV isn't left buffering.
-    assert slv.flushed == 1
+    # A partial timeout should not flush a half-sentence into TTS.
+    assert slv.flushed == 0
+    assert slv.aborted == 1
 
 
 @pytest.mark.asyncio

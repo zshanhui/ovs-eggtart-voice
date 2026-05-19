@@ -29,7 +29,9 @@ def _mk_app(port):
         reconnect=AsyncMock(),
         abort=AsyncMock(),
         send_text=AsyncMock(),
+        flush_tts=AsyncMock(),
     )
+    app_mock.restart_mic_capture = AsyncMock()
     app_mock.session = SimpleNamespace(
         history=[
             {"role": "user", "content": "你好"},
@@ -64,6 +66,11 @@ async def test_control_endpoints(unused_tcp_port):
             )
             assert r.status == 200
             app_mock.slv.send_text.assert_awaited_with("hi")
+            app_mock.slv.flush_tts.assert_awaited()
+
+            r = await s.post(base + "/api/control/restart_mic")
+            assert r.status == 200
+            app_mock.restart_mic_capture.assert_awaited_with("dashboard")
 
             # missing text → 400
             r = await s.post(base + "/api/control/send_text", json={})

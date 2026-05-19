@@ -14,6 +14,7 @@ from openvoicestream_agent import Config, Session
 from openvoicestream_agent.app_mode import ModeContext, ModeManager
 from openvoicestream_agent.apps_dialogue_shim import DialogueApp  # back-compat alias
 from openvoicestream_agent.llm.base import LLMBackend
+from openvoicestream_agent.llm import LLMStreamError
 from openvoicestream_agent.modes import ChatMode
 
 
@@ -44,6 +45,14 @@ class FakeLLM(LLMBackend):
         self.last_session = kw.get("session")
         for t in self.tokens:
             yield t
+
+
+class FakeAudio:
+    def __init__(self) -> None:
+        self.stopped = 0
+
+    async def stop_playback(self) -> None:
+        self.stopped += 1
 
 
 async def _noop_broadcast(*args, **kwargs):
@@ -120,6 +129,35 @@ async def test_cancelled_dialogue_turn_closes_llm_stream_without_tts_flush():
     assert stream_closed.is_set()
     assert slv.text_frames == ["old"]
     assert slv.flushed == 0
+    assert session.history == [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.asyncio
+async def test_midstream_llm_error_aborts_partial_tts_without_history_pollution():
+    cfg = Config(system_prompt="SYS")
+    slv = FakeSLV()
+    audio = FakeAudio()
+    session = Session()
+    events = type("E", (), {"emit": lambda *a, **k: None})()
+
+    class PartialThenErrorLLM(LLMBackend):
+        async def stream(self, messages, **kw):  # type: ignore[override]
+            yield "你"
+            yield "可能"
+            raise LLMStreamError("finish_reason=error")
+
+    ctx = ModeContext(
+        config=cfg, slv=slv, llm=PartialThenErrorLLM(), session=session,
+        audio=audio, events=events, broadcast=_noop_broadcast,
+    )
+
+    with pytest.raises(LLMStreamError):
+        await ctx.run_default_dialogue_turn("hi")
+
+    assert slv.text_frames == ["你", "可能"]
+    assert slv.flushed == 0
+    assert slv.aborted == 1
+    assert audio.stopped == 1
     assert session.history == [{"role": "user", "content": "hi"}]
 
 

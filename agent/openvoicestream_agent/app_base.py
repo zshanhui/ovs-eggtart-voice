@@ -157,6 +157,9 @@ class BaseApp:
         self.llm_availability = None
         self._shutdown_evt: asyncio.Event | None = None
         self._mic_task: asyncio.Task | None = None
+        self._mic_watchdog_task: asyncio.Task | None = None
+        self._mic_restart_lock: asyncio.Lock | None = None
+        self._last_mic_chunk_ts: float | None = None
         self._dispatch_task: asyncio.Task | None = None
         self._llm_turn_task: asyncio.Task | None = None
         self._first_tts_seen = False
@@ -395,7 +398,11 @@ class BaseApp:
                 pass
 
         await self.slv.connect()
+        self._mic_restart_lock = asyncio.Lock()
         self._mic_task = asyncio.create_task(self._mic_pump(), name="mic-pump")
+        self._mic_watchdog_task = asyncio.create_task(
+            self._mic_watchdog(), name="mic-watchdog"
+        )
         self._dispatch_task = asyncio.create_task(self._slv_dispatch(), name="slv-dispatch")
 
         for p in self.plugins:
@@ -428,6 +435,14 @@ class BaseApp:
             except (asyncio.CancelledError, Exception):
                 pass
         self._sleep_task = None
+        mic_watchdog_task = getattr(self, "_mic_watchdog_task", None)
+        if mic_watchdog_task is not None and not mic_watchdog_task.done():
+            mic_watchdog_task.cancel()
+            try:
+                await mic_watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._mic_watchdog_task = None
         # 1. stop mic capture
         if self._mic_task is not None:
             self._mic_task.cancel()
@@ -475,6 +490,72 @@ class BaseApp:
             self._shutdown_evt.set()
 
     # ── internal pumps ──────────────────────────────────────────────
+
+    async def restart_mic_capture(self, reason: str = "manual") -> None:
+        """Restart only the local sounddevice input stream + mic pump.
+
+        This is cheaper than restarting the whole agent and is useful after
+        CoreAudio device changes / PaMacCore errors leave the input stream
+        alive but no longer delivering useful chunks.
+        """
+        lock = getattr(self, "_mic_restart_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._mic_restart_lock = lock
+        async with lock:
+            logger.warning("restarting mic capture (%s)", reason)
+            task = getattr(self, "_mic_task", None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            try:
+                stop_input = getattr(self.audio, "_stop_input_stream", None)
+                if callable(stop_input):
+                    stop_input()
+            except Exception:
+                logger.debug("stop input stream failed during mic restart", exc_info=True)
+            self._vad_state = "idle"
+            self._vad_speech_ms = 0
+            self._vad_silence_ms = 0
+            self._vad_eos_sent = False
+            try:
+                reset = getattr(self._client_vad, "reset", None)
+                if callable(reset):
+                    reset()
+            except Exception:
+                logger.debug("client VAD reset failed during mic restart", exc_info=True)
+            self._last_mic_chunk_ts = time.monotonic()
+            self._mic_task = asyncio.create_task(self._mic_pump(), name="mic-pump")
+
+    async def _mic_watchdog(self) -> None:
+        """Recover from dead CoreAudio/sounddevice capture streams."""
+        stale_s = 5.0
+        try:
+            while True:
+                await asyncio.sleep(2.0)
+                if getattr(self, "_shutdown_evt", None) is not None and self._shutdown_evt.is_set():
+                    return
+                task = getattr(self, "_mic_task", None)
+                if task is None:
+                    await self.restart_mic_capture("watchdog:no-task")
+                    continue
+                if task.done():
+                    exc = None
+                    try:
+                        exc = task.exception()
+                    except (asyncio.CancelledError, Exception):
+                        exc = None
+                    logger.warning("mic pump stopped; restarting (exc=%r)", exc)
+                    await self.restart_mic_capture("watchdog:task-done")
+                    continue
+                last = getattr(self, "_last_mic_chunk_ts", None)
+                if last is not None and (time.monotonic() - last) > stale_s:
+                    await self.restart_mic_capture("watchdog:stale")
+        except asyncio.CancelledError:
+            raise
 
     async def _send_audio_nonblocking(self, pcm: bytes) -> None:
         """Send a mic chunk to SLV with a short ceiling on how long the
@@ -550,6 +631,7 @@ class BaseApp:
             rms_broadcast_every = max(1, 200 // max(chunk_ms, 1))
             rms_chunk_counter = 0
             async for chunk in self.audio.start_capture():
+                self._last_mic_chunk_ts = time.monotonic()
                 # pipeline_mode gating: drop audio entirely while SLEEPING.
                 # WS stays connected so wake-time reconnect cost is zero.
                 if getattr(self, "_state", ConvState.IDLE) == ConvState.SLEEPING:

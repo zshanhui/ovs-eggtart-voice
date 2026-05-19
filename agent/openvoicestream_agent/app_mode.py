@@ -111,6 +111,7 @@ class ModeContext:
         first_token_received = False
         stream = None
         cancelled = False
+        completed = False
         try:
             llm_kwargs = {"session": self.session}
             if temperature is not None:
@@ -132,6 +133,7 @@ class ModeContext:
                 try:
                     token = await asyncio.wait_for(it.__anext__(), timeout=wait_timeout)
                 except StopAsyncIteration:
+                    completed = True
                     break
                 except asyncio.TimeoutError:
                     kind = "first_token" if not first_token_received else "stream_idle"
@@ -153,13 +155,36 @@ class ModeContext:
                 except Exception:  # pragma: no cover - best effort
                     logger.debug("LLM stream aclose failed during cancel", exc_info=True)
             raise
+        except Exception:
+            # If upstream fails after yielding partial tokens, those tokens may
+            # already be queued in SLV's TTS buffer. Do not flush them into an
+            # audible half-sentence or persist them as an assistant reply.
+            if chunks:
+                logger.info(
+                    "LLM stream failed after %d partial token(s); aborting partial TTS",
+                    len(chunks),
+                )
+                try:
+                    await self.slv.abort()
+                except Exception:  # pragma: no cover - best effort
+                    logger.debug("SLV abort failed after partial LLM error", exc_info=True)
+                stop = getattr(self.audio, "stop_playback", None)
+                if callable(stop):
+                    try:
+                        await stop()
+                    except Exception:  # pragma: no cover - best effort
+                        logger.debug(
+                            "stop_playback failed after partial LLM error",
+                            exc_info=True,
+                        )
+            raise
         finally:
-            if not cancelled:
+            if completed and not cancelled:
                 try:
                     await self.slv.flush_tts()
                 except Exception:  # pragma: no cover - best effort
                     pass
-            if chunks and not cancelled:
+            if chunks and completed and not cancelled:
                 self.session.add_assistant("".join(chunks))
             cm = getattr(self.llm, "last_cache_metrics", None)
             if cm:

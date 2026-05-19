@@ -423,6 +423,10 @@
     await post("/api/control/reconnect");
     showToast("Reconnect requested", "success");
   });
+  $("btnRestartMic").addEventListener("click", async () => {
+    await post("/api/control/restart_mic");
+    showToast("Mic capture restarted", "success");
+  });
   $("btnAbort").addEventListener("click", async () => {
     await post("/api/control/abort");
     showToast("TTS aborted", "success");
