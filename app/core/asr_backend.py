@@ -64,6 +64,15 @@ class ASRStream(ABC):
         """
         pass
 
+    def cancel(self) -> None:
+        """Symmetric alias for cancel_and_finalize().
+
+        Lets callers (e.g. ASRSessionManager) treat cancel as a first-class
+        operation without forcing every backend to implement both methods.
+        Default: delegate to cancel_and_finalize().
+        """
+        self.cancel_and_finalize()
+
 
 class ASRBackend(ABC):
 

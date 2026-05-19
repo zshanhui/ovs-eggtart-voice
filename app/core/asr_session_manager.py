@@ -1,0 +1,329 @@
+"""Per-utterance ASR session manager.
+
+Owns the lifecycle of streaming ASR sessions for a single WebSocket connection:
+fresh ``ASRStream`` per utterance, generation tokens guarding against stale
+finals, bounded cancellation with worker-restart fallback, and ERROR_REBUILD
+recovery on worker protocol errors.
+
+State machine
+-------------
+
+    IDLE ──speech_start──► ACTIVE ──speech_end / asr_eos──► FINALIZING ──ack──► IDLE
+                              │                                  │
+                              └────────── cancel ────────────────┴─► CANCELLING ──► IDLE
+                                                                          │
+                                                                          ▼
+                                                              (waits ≤500ms for end-ack;
+                                                               on timeout calls restart_worker())
+
+    Any ──worker error──► ERROR_REBUILD ──(retry ≤3 / backoff 50,150,400ms)──► IDLE
+                                       └─ exhausted ──► restart_worker() ──► IDLE
+
+Each transition into ``ACTIVE`` issues a fresh ``generation_id``; finals tagged
+with a stale generation are silently dropped.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from enum import Enum
+from typing import Any, Awaitable, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class SessionState(str, Enum):
+    IDLE = "idle"
+    ACTIVE = "active"
+    FINALIZING = "finalizing"
+    CANCELLING = "cancelling"
+    ERROR_REBUILD = "error_rebuild"
+
+
+# Worker-protocol error types (mirrored on trt_edge_llm_asr backend);
+# duck-typed via class name so tests / non-jetson backends don't need to
+# import the jetson module.
+_WORKER_ERROR_NAMES = {
+    "NoActiveSessionError",
+    "SessionAlreadyActiveError",
+    "WorkerExitError",
+    "WorkerProtocolError",
+}
+
+
+def _is_worker_protocol_error(exc: BaseException) -> bool:
+    if exc is None:
+        return False
+    for cls in type(exc).__mro__:
+        if cls.__name__ in _WORKER_ERROR_NAMES:
+            return True
+    return False
+
+
+class ASRSessionManager:
+    """Async-safe per-utterance ASR session orchestrator.
+
+    Backends are synchronous; all calls into them are hopped through
+    ``loop.run_in_executor`` to avoid blocking the event loop. A single
+    instance-level ``asyncio.Lock`` serializes state transitions.
+    """
+
+    # Retry/backoff schedule for ERROR_REBUILD (≤3 attempts before
+    # falling back to a full worker restart).
+    _REBUILD_BACKOFF_S = (0.05, 0.15, 0.40)
+    _CANCEL_ACK_TIMEOUT_S = 0.5
+
+    def __init__(
+        self,
+        backend: Any,
+        language: str = "auto",
+        coord: Any = None,
+        *,
+        executor: Any = None,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
+        self._backend = backend
+        self._language = language
+        self._coord = coord  # BackendCoordinator (optional)
+        self._executor = executor  # asr executor (optional)
+        self._loop = loop  # late-bound if None
+        self._lock = asyncio.Lock()
+        self._state: SessionState = SessionState.IDLE
+        self._stream: Any = None
+        self._generation: int = 0
+        self._last_error: Optional[BaseException] = None
+
+    # ── public introspection ───────────────────────────────────────────
+    @property
+    def state(self) -> SessionState:
+        return self._state
+
+    @property
+    def current_generation(self) -> int:
+        return self._generation
+
+    @property
+    def stream(self) -> Any:
+        return self._stream
+
+    # ── helpers ────────────────────────────────────────────────────────
+    def _get_loop(self) -> asyncio.AbstractEventLoop:
+        if self._loop is not None:
+            return self._loop
+        return asyncio.get_event_loop()
+
+    async def _run_sync(self, fn: Callable[..., Any], *args, **kwargs) -> Any:
+        loop = self._get_loop()
+        if kwargs:
+            def _bound():
+                return fn(*args, **kwargs)
+            return await loop.run_in_executor(self._executor, _bound)
+        return await loop.run_in_executor(self._executor, fn, *args)
+
+    def _new_stream_sync(self) -> Any:
+        return self._backend.create_stream(language=self._language)
+
+    async def _create_stream(self) -> Any:
+        return await self._run_sync(self._new_stream_sync)
+
+    # ── public API ─────────────────────────────────────────────────────
+    async def on_speech_start(self) -> int:
+        """Transition IDLE→ACTIVE (cancelling any prior session first).
+
+        Returns the new generation id. Stale finals from a previous
+        generation must be ignored by the caller.
+        """
+        async with self._lock:
+            # If we are still mid-session (typically because TTS was
+            # playing and the user started speaking again), end the old
+            # session before issuing a new generation. Discarded final.
+            if self._state in (SessionState.ACTIVE, SessionState.FINALIZING):
+                await self._inner_cancel(reason="speech_start_preempt")
+            elif self._state == SessionState.CANCELLING:
+                # Another cancel is in flight; wait for it to settle
+                # (cheap: cancel runs under our own lock already).
+                pass
+
+            # Now (re)create stream with bounded retry on worker errors.
+            self._generation += 1
+            try:
+                self._stream = await self._create_stream()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ASRSessionManager: create_stream failed: %s", exc)
+                await self._handle_error_locked(exc)
+                # After recovery the stream is created lazily on next
+                # accept; for now flag ACTIVE so callers can proceed.
+            self._state = SessionState.ACTIVE
+            return self._generation
+
+    async def accept_audio(self, samples) -> None:
+        """Push a chunk of audio at the current stream.
+
+        No-op outside ACTIVE. Failures route to ERROR_REBUILD.
+        """
+        # Take the snapshot under the lock, then release before the long
+        # IO call so other transitions (cancel/finalize) aren't blocked.
+        async with self._lock:
+            if self._state != SessionState.ACTIVE:
+                return
+            stream = self._stream
+            if stream is None:
+                # ERROR_REBUILD recovery — try to (re)create lazily.
+                try:
+                    stream = await self._create_stream()
+                    self._stream = stream
+                except Exception as exc:  # noqa: BLE001
+                    await self._handle_error_locked(exc)
+                    return
+        try:
+            await self._run_sync(stream.accept_waveform, 16000, samples)
+        except Exception as exc:  # noqa: BLE001
+            async with self._lock:
+                await self._handle_error_locked(exc)
+
+    async def finalize(self, reason: str = "vad_end") -> str:
+        """Transition ACTIVE→FINALIZING→IDLE; return final text.
+
+        Returns "" if not in a finalizable state (defensive — caller may
+        race with cancel).
+        """
+        async with self._lock:
+            if self._state not in (SessionState.ACTIVE,):
+                return ""
+            self._state = SessionState.FINALIZING
+            stream = self._stream
+        if stream is None:
+            async with self._lock:
+                self._state = SessionState.IDLE
+            return ""
+        try:
+            final_text = await self._run_sync(stream.finalize)
+        except Exception as exc:  # noqa: BLE001
+            async with self._lock:
+                await self._handle_error_locked(exc)
+            return ""
+        async with self._lock:
+            # If a cancel raced past us (e.g. abort-during-FINALIZING),
+            # the cancel routine will have moved us into CANCELLING and
+            # already discarded the result. Honor that.
+            if self._state != SessionState.FINALIZING:
+                logger.info("ASRSessionManager: finalize result discarded (state=%s)", self._state)
+                return ""
+            self._stream = None
+            self._state = SessionState.IDLE
+            return final_text or ""
+
+    async def cancel(self, reason: str = "bargein") -> None:
+        async with self._lock:
+            await self._inner_cancel(reason=reason)
+
+    async def _inner_cancel(self, *, reason: str) -> None:
+        """Lock must be held by caller."""
+        if self._state in (SessionState.IDLE,):
+            return
+        prev_state = self._state
+        self._state = SessionState.CANCELLING
+        stream = self._stream
+        self._stream = None
+        if stream is None:
+            self._state = SessionState.IDLE
+            return
+
+        # Run cancel_and_finalize() in executor with a hard timeout. If
+        # the worker doesn't ack the end event within the budget, fall
+        # back to a worker restart.
+        def _cancel_call():
+            try:
+                # Prefer explicit cancel() if provided, else fall back to
+                # cancel_and_finalize() (always present on the base class).
+                if hasattr(stream, "cancel"):
+                    stream.cancel()
+                else:
+                    stream.cancel_and_finalize()
+            except Exception as exc:  # noqa: BLE001
+                # Bubble up to async layer so we can decide restart vs swallow.
+                raise exc
+
+        loop = self._get_loop()
+        fut = loop.run_in_executor(self._executor, _cancel_call)
+        try:
+            await asyncio.wait_for(fut, timeout=self._CANCEL_ACK_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "ASRSessionManager: cancel(%s) timed out from state=%s; restarting worker",
+                reason, prev_state,
+            )
+            await self._maybe_restart_worker()
+        except Exception as exc:  # noqa: BLE001
+            if _is_worker_protocol_error(exc):
+                logger.warning(
+                    "ASRSessionManager: cancel(%s) raised worker error %s; restarting",
+                    reason, type(exc).__name__,
+                )
+                await self._maybe_restart_worker()
+            else:
+                logger.info("ASRSessionManager: cancel(%s) swallowed exc=%s", reason, exc)
+        self._state = SessionState.IDLE
+
+    def mark_error(self, exc: BaseException) -> None:
+        """Synchronous shim so accept_waveform threads / partial pollers
+        can flag the manager. Defers to the next async tick to actually
+        run the recovery."""
+        self._last_error = exc
+        # Schedule async handler if possible.
+        try:
+            loop = self._get_loop()
+        except Exception:
+            return
+        if loop.is_running():
+            asyncio.ensure_future(self._async_mark_error(exc), loop=loop)
+
+    async def _async_mark_error(self, exc: BaseException) -> None:
+        async with self._lock:
+            await self._handle_error_locked(exc)
+
+    async def _handle_error_locked(self, exc: BaseException) -> None:
+        self._last_error = exc
+        self._stream = None
+        self._state = SessionState.ERROR_REBUILD
+        if not _is_worker_protocol_error(exc):
+            logger.info("ASRSessionManager: non-protocol error during ASR: %s", exc)
+        for attempt, delay in enumerate(self._REBUILD_BACKOFF_S):
+            await asyncio.sleep(delay)
+            try:
+                self._stream = await self._create_stream()
+                self._state = SessionState.ACTIVE
+                logger.info(
+                    "ASRSessionManager: ERROR_REBUILD recovered on attempt %d",
+                    attempt + 1,
+                )
+                return
+            except Exception as inner:
+                logger.warning(
+                    "ASRSessionManager: ERROR_REBUILD attempt %d failed: %s",
+                    attempt + 1, inner,
+                )
+                self._last_error = inner
+        # Exhausted retries → fall back to a full worker restart.
+        await self._maybe_restart_worker()
+        # One last attempt after restart; if it also fails, give up to IDLE.
+        try:
+            self._stream = await self._create_stream()
+            self._state = SessionState.ACTIVE
+        except Exception as inner:
+            logger.warning("ASRSessionManager: post-restart create_stream failed: %s", inner)
+            self._stream = None
+            self._state = SessionState.IDLE
+
+    async def _maybe_restart_worker(self) -> None:
+        backend = self._backend
+        fn = getattr(backend, "restart_worker", None)
+        if fn is None:
+            return
+        try:
+            await self._run_sync(fn)
+            logger.info("ASRSessionManager: backend.restart_worker() completed")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ASRSessionManager: restart_worker failed: %s", exc)
