@@ -56,6 +56,51 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.lower() not in ("0", "false", "no")
 
 
+class WorkerProtocolError(RuntimeError):
+    """Base class for ASR worker protocol-level errors.
+
+    Distinct from generic RuntimeError so the ASRSessionManager can route
+    these into its ERROR_REBUILD recovery path while leaving unrelated
+    failures unhandled.
+    """
+
+
+class NoActiveSessionError(WorkerProtocolError):
+    """Worker reported there is no active session (stale id / double-end)."""
+
+
+class SessionAlreadyActiveError(WorkerProtocolError):
+    """Worker reported a session is already active for the given id."""
+
+
+class WorkerExitError(WorkerProtocolError):
+    """Worker subprocess exited or didn't respond before the ack deadline."""
+
+
+def _classify_worker_response(output_data: dict, *, request_event: str | None = None) -> WorkerProtocolError | None:
+    """Map a worker error JSON payload to a typed exception (or None)."""
+    if not isinstance(output_data, dict):
+        return None
+    if output_data.get("event") != "error" and output_data.get("ok") is not False:
+        return None
+    msg = ""
+    for key in ("error", "message", "reason", "detail"):
+        v = output_data.get(key)
+        if isinstance(v, str) and v:
+            msg = v
+            break
+    if not msg:
+        msg = str(output_data)
+    low = msg.lower()
+    if "no active session" in low or "no_active_session" in low or "unknown session" in low:
+        return NoActiveSessionError(msg)
+    if "already active" in low or "session_already_active" in low or "already exists" in low:
+        return SessionAlreadyActiveError(msg)
+    if "exit" in low or "terminated" in low or "worker dead" in low:
+        return WorkerExitError(msg)
+    return None
+
+
 class TRTEdgeLLMASRBackend(ASRBackend):
     """ASR via TRT-Edge-LLM llm_inference subprocess."""
 
@@ -345,6 +390,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         self._worker_ready_meta = ready
 
     def _worker_request(self, input_data: dict) -> dict:
+        req_event = input_data.get("event") if isinstance(input_data, dict) else None
         with self._worker_lock:
             self._ensure_worker()
             assert self._worker is not None and self._worker.stdin is not None and self._worker.stdout is not None
@@ -354,11 +400,47 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         if not line:
             stderr = self._stderr_tail_text()
             self._worker = None
-            raise RuntimeError(f"ASR worker exited before response: {stderr}")
+            raise WorkerExitError(f"ASR worker exited before response: {stderr}")
         output_data = json.loads(line)
+        typed = _classify_worker_response(output_data, request_event=req_event)
+        if typed is not None:
+            raise typed
         if output_data.get("event") == "error" or output_data.get("ok") is False:
-            raise RuntimeError(f"ASR worker error: {output_data}")
+            raise WorkerProtocolError(f"ASR worker error: {output_data}")
         return output_data
+
+    def restart_worker(self) -> None:
+        """Kill the worker subprocess so the next request rebuilds it.
+
+        Safe to call concurrently — guarded by the same lock that protects
+        request/response framing. Used by ASRSessionManager when bounded
+        recovery fails or a cancel ack times out.
+        """
+        with self._worker_lock:
+            worker = self._worker
+            self._worker = None
+            self._worker_ready_meta = {}
+            if worker is None:
+                return
+            try:
+                if worker.poll() is None:
+                    try:
+                        if worker.stdin and not worker.stdin.closed:
+                            worker.stdin.close()
+                    except Exception:
+                        pass
+                    worker.terminate()
+                    try:
+                        worker.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        worker.kill()
+                        try:
+                            worker.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            pass
+            except Exception as exc:
+                logger.warning("restart_worker: terminate failed: %s", exc)
+        logger.info("ASR worker restarted (will respawn on next request)")
 
     @staticmethod
     def _strip_language_prefix(text: str) -> tuple[str, Optional[str]]:
@@ -810,10 +892,29 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
     def cancel_and_finalize(self) -> None:
         self._final_text = self._partial_text
         self._cancelled = True
-        try:
-            self._backend._worker_request({"event": "end", "id": self._session_id})
-        except Exception:
-            pass
+        # Send the `end` event but bound the wait to 500ms; if the worker
+        # is unresponsive raise WorkerExitError so the session manager
+        # can trigger restart_worker().
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(
+                self._backend._worker_request,
+                {"event": "end", "id": self._session_id},
+            )
+            try:
+                fut.result(timeout=0.5)
+            except _cf.TimeoutError:
+                self._closed = True
+                raise WorkerExitError(
+                    f"ASR worker did not ack 'end' for session {self._session_id} within 500ms"
+                )
+            except WorkerProtocolError:
+                # NoActiveSession etc. is already informative — propagate.
+                self._closed = True
+                raise
+            except Exception:
+                # Other errors are swallowed (legacy behavior).
+                pass
         self._closed = True
 
     def get_partial(self) -> tuple[str, bool]:
