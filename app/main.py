@@ -889,7 +889,8 @@ async def v2v_stream(ws: WebSocket):
 
     # ── Stage 2: bring up the backends ──────────────────────────────
     asr_be = None
-    asr_stream = None
+    asr_manager = None  # ASRSessionManager — owns per-utterance lifecycle.
+    asr_enabled = False
     vad = None
     if asr_language:
         asr_be = _get_asr_backend()
@@ -897,11 +898,16 @@ async def v2v_stream(ws: WebSocket):
             await ws.send_json({"type": v2v_proto.SERVER_ERROR,
                                 "error": "asr_language requested but no streaming ASR backend ready"})
             await ws.close(code=1011); return
-        try:
-            asr_stream = asr_be.create_stream(language=asr_language)
-        except Exception as e:
-            await ws.send_json({"type": v2v_proto.SERVER_ERROR, "error": f"asr stream init: {e}"})
-            await ws.close(code=1011); return
+        # Defer stream creation until first speech-start (or first audio
+        # without VAD) — the manager creates a fresh stream per utterance.
+        from app.core.asr_session_manager import ASRSessionManager
+        asr_manager = ASRSessionManager(
+            backend=asr_be,
+            language=asr_language,
+            coord=coord,
+            executor=_get_asr_executor(),
+        )
+        asr_enabled = True
         # VAD init runs in executor: silero ONNX first-load takes ~500ms and
         # would otherwise stall the event loop. ValueError (e.g. unsupported
         # sample rate) is a hard config error → reject and close. Other init
@@ -935,13 +941,12 @@ async def v2v_stream(ws: WebSocket):
     # ── Stage 3: per-connection state + write serialization ─────────
     send_lock = asyncio.Lock()
     state = {
-        "asr_eos":          False,   # set when VAD endpoint or client asr_eos
-        "vad_endpoint":     False,   # set ONLY when VAD detected speech-end
-                                     # (so we emit asr_endpoint frame in the
-                                     # VAD case but not on client-driven eos)
-        "vad_endpoint_pending": False,  # multi_utterance: VAD speech-end fired;
-                                        # asr_out_task should emit endpoint+final
-                                        # but keep listening for the next utterance
+        # Per-utterance ASR endpoint signalling. Replaces the old
+        # asr_eos / vad_endpoint / vad_endpoint_pending flags now that
+        # ASRSessionManager owns the stream lifecycle.
+        "asr_session_closed": False,   # client explicitly ended ASR (asr_eos or ws close)
+        "endpoint_pending":   None,    # ("vad" | "client_eos"), set by dispatcher,
+                                       # consumed by asr_out_task
         "tts_flush":        False,   # set when client tts_flush
         "current_tts_task": None,    # running TTS synth task (cancellable)
         "current_tts_stop": None,    # threading.Event to signal synth thread
@@ -949,6 +954,16 @@ async def v2v_stream(ws: WebSocket):
                                      # synth blocking the TTS executor)
         "tts_started":      False,   # tts_started frame sent for current sentence
         "client_closed":    False,
+        "asr_active":       False,   # tracks whether manager.on_speech_start
+                                     # has been called for the current utterance
+        "asr_active_gen":   0,       # generation tagged onto asr_active so a
+                                     # stale finalize doesn't clear a fresh
+                                     # utterance's asr_active flag (BUG 2)
+        "endpoint_finalize_pending": False,  # set when dispatcher already
+                                     # accepted the speech-end chunk and the
+                                     # asr_out_task should finalize next tick
+                                     # (BUG 3: avoids the flag-set/audio-accept
+                                     # race that lost the tail of utterances)
     }
     tts_q: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
@@ -983,38 +998,56 @@ async def v2v_stream(ws: WebSocket):
                 # binary → ASR input
                 data = msg.get("bytes")
                 if data:
-                    if not asr_stream:
+                    if not asr_enabled:
                         continue  # ignored in TTS-only mode
-                    # Bug #2 fix: after asr_eos, ignore further audio so we
-                    # don't race finalize. The protocol doc explicitly says
-                    # "further binary frames are ignored until the client
-                    # opens a new WebSocket".
-                    if state["asr_eos"]:
+                    # After session close, drop further audio. Spec: client
+                    # must open a new WebSocket to start another session.
+                    if state["asr_session_closed"]:
                         continue
                     samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                    speech_started_now = False
+                    speech_ended_now = False
                     if vad is not None:
                         event = vad.process(samples)
                         if event == vad_mod.VADSession.SPEECH_START:
-                            # auto barge-in: cancel any in-flight TTS
+                            # Auto barge-in: cancel any in-flight TTS, then
+                            # open a fresh ASR utterance (pre-empts any
+                            # still-active session per spec).
                             t = state["current_tts_task"]
                             if t is not None and not t.done():
                                 t.cancel()
                             stop = state["current_tts_stop"]
                             if stop is not None:
                                 stop.set()
+                            async with coord.acquire("asr"):
+                                new_gen = await asr_manager.on_speech_start()
+                            state["asr_active"] = True
+                            state["asr_active_gen"] = new_gen
+                            speech_started_now = True
                         elif event == vad_mod.VADSession.SPEECH_END:
-                            if multi_utterance:
-                                # Mid-session: emit an utterance boundary; do
-                                # NOT terminate the session — keep accepting
-                                # audio for the next utterance.
-                                state["vad_endpoint_pending"] = True
-                            else:
-                                state["asr_eos"] = True
-                                state["vad_endpoint"] = True
-                    async with coord.acquire("asr"):
-                        await loop.run_in_executor(
-                            _get_asr_executor(), asr_stream.accept_waveform, sample_rate, samples
-                        )
+                            # Defer setting endpoint_pending until AFTER we
+                            # accept this final chunk below — otherwise the
+                            # asr_out_task observes the flag and calls
+                            # finalize() while the tail audio is still
+                            # in-flight, silently dropping it (BUG 3).
+                            speech_ended_now = True
+                    # No-VAD mode: open the session lazily on first audio.
+                    if vad is None and not state["asr_active"]:
+                        async with coord.acquire("asr"):
+                            new_gen = await asr_manager.on_speech_start()
+                        state["asr_active"] = True
+                        state["asr_active_gen"] = new_gen
+                    if state["asr_active"]:
+                        async with coord.acquire("asr"):
+                            await asr_manager.accept_audio(samples)
+                    # Now safe to flag the endpoint — audio chunk that
+                    # carried the speech-end has been delivered to the
+                    # stream. asr_out_task will pick this up on the next
+                    # poll and call finalize().
+                    if speech_ended_now:
+                        state["endpoint_pending"] = "vad"
+                        if not multi_utterance:
+                            state["asr_session_closed"] = True
                     continue
                 # text → JSON control
                 text = msg.get("text", "")
@@ -1034,7 +1067,9 @@ async def v2v_stream(ws: WebSocket):
                             await tts_q.put(sentence)
                     state["tts_flush"] = True
                 elif typ == v2v_proto.CLIENT_ASR_EOS:
-                    state["asr_eos"] = True
+                    state["endpoint_pending"] = "client_eos"
+                    if not multi_utterance:
+                        state["asr_session_closed"] = True
                 elif typ == v2v_proto.CLIENT_ABORT:
                     t = state["current_tts_task"]
                     if t is not None and not t.done():
@@ -1046,82 +1081,112 @@ async def v2v_stream(ws: WebSocket):
                     while not tts_q.empty():
                         try: tts_q.get_nowait()
                         except asyncio.QueueEmpty: break
+                    # Cancel any in-flight ASR utterance too — spec: barge-in
+                    # discards pending finals and resets to IDLE.
+                    if asr_manager is not None and state["asr_active"]:
+                        async with coord.acquire("asr"):
+                            await asr_manager.cancel("bargein")
+                        state["asr_active"] = False
         except WebSocketDisconnect:
             state["client_closed"] = True
 
     async def asr_out_task():
-        """Poll ASR stream for partials, emit endpoint + final.
+        """Drive partial polling + per-utterance finalize via the manager.
 
-        Single-utterance (default): asr_endpoint + asr_final emitted once,
-        then session ends. Client-driven asr_eos skips asr_endpoint.
-
-        Multi-utterance (config multi_utterance=True): on each VAD or
-        backend endpoint, emit asr_endpoint + asr_final with
-        session_complete=false, then keep listening. Session terminates
-        only on client asr_eos / disconnect, which sends a closing
-        asr_final with session_complete=true (and duplicate_of_streamed
-        if the text matches the last mid-session final).
+        Each utterance is its own ``ASRSessionManager`` stream. We poll
+        the *active* stream (manager.stream) for partials, then on an
+        endpoint trigger (VAD speech-end, client asr_eos, or backend
+        is_endpoint) we call ``manager.finalize()`` which destroys the
+        stream and returns the final text.
         """
-        backend_endpoint = False        # single-utterance only
-        last_streamed_final = None      # multi-utterance: last text emitted as a
-                                        # mid-session final, for dedup on close
-        while not state["asr_eos"] and not state["client_closed"]:
-            try:
-                async with coord.acquire("asr"):
-                    partial, is_endpoint = await loop.run_in_executor(
-                        _get_asr_executor(), asr_stream.get_partial
-                    )
-            except Exception:
-                partial, is_endpoint = "", False
-            if partial:
-                await send_json({"type": v2v_proto.SERVER_ASR_PARTIAL,
-                                 "text": partial, "is_stable": bool(is_endpoint)})
+        last_streamed_final = None
+        while not state["client_closed"]:
+            # Pull a stream snapshot under the manager's lock so we can
+            # tag any partial with the generation it came from. If the
+            # generation has advanced by emit-time, drop the partial —
+            # it belongs to an utterance that's already been replaced
+            # (BUG 4: stale-stream partial leak).
+            partial, is_endpoint, partial_gen = "", False, 0
+            if state["asr_active"]:
+                try:
+                    async with coord.acquire("asr"):
+                        partial_gen, partial, is_endpoint = (
+                            await asr_manager.get_partial_for_generation()
+                        )
+                except Exception:
+                    partial, is_endpoint, partial_gen = "", False, 0
+                if partial and partial_gen == asr_manager.current_generation \
+                        and partial_gen == state["asr_active_gen"]:
+                    await send_json({"type": v2v_proto.SERVER_ASR_PARTIAL,
+                                     "text": partial, "is_stable": bool(is_endpoint)})
 
-            # Endpoint sources: backend (is_endpoint from get_partial) or VAD
-            # (vad_endpoint_pending, multi only). Single-mode VAD also sets
-            # asr_eos so we never reach the "pending" path there.
-            endpoint_fired = is_endpoint or state["vad_endpoint_pending"]
-            if endpoint_fired and multi_utterance:
-                await send_json({"type": v2v_proto.SERVER_ASR_ENDPOINT})
-                text = partial or ""
-                await send_json({"type": v2v_proto.SERVER_ASR_FINAL,
-                                 "text": text,
-                                 "session_complete": False})
-                last_streamed_final = text
-                state["vad_endpoint_pending"] = False
-                # Backend stream is_endpoint will auto-reset on the next audio
-                # chunk via _check_new_utterance_resume; loop continues.
-                await asyncio.sleep(0.05)
-                continue
+            endpoint_reason = state["endpoint_pending"]
+            endpoint_fired = (
+                bool(endpoint_reason)
+                or (is_endpoint and state["asr_active"])
+            )
 
-            if is_endpoint:
-                state["asr_eos"] = True
-                backend_endpoint = True
-                break
+            if endpoint_fired:
+                # Drain pending flag now to avoid double-firing.
+                state["endpoint_pending"] = None
+                # Emit asr_endpoint only for VAD / backend endpoints,
+                # not client-driven eos.
+                if endpoint_reason != "client_eos":
+                    await send_json({"type": v2v_proto.SERVER_ASR_ENDPOINT})
+
+                if state["asr_active"]:
+                    finalize_gen = state["asr_active_gen"]
+                    async with coord.acquire("asr"):
+                        ran_gen, final_text = await asr_manager.finalize_with_generation(
+                            endpoint_reason or "backend_endpoint"
+                        )
+                    # Only clear asr_active if the generation we finalized
+                    # is still the active one. If a new speech_start
+                    # bumped the generation while finalize was in flight,
+                    # leaving asr_active=True is correct — audio for the
+                    # new utterance must continue to flow (BUG 2).
+                    if (
+                        ran_gen == finalize_gen
+                        and state["asr_active_gen"] == finalize_gen
+                    ):
+                        state["asr_active"] = False
+                else:
+                    final_text = ""
+
+                # Multi-utterance: mid-session finals carry
+                # session_complete=False; close-out final on
+                # asr_session_closed carries True.
+                if multi_utterance:
+                    is_closing = state["asr_session_closed"]
+                    if is_closing:
+                        duplicate = (final_text or "") == (last_streamed_final or "")
+                        await send_json({
+                            "type": v2v_proto.SERVER_ASR_FINAL,
+                            "text": final_text or "",
+                            "session_complete": True,
+                            "duplicate_of_streamed": duplicate,
+                        })
+                        return
+                    else:
+                        await send_json({
+                            "type": v2v_proto.SERVER_ASR_FINAL,
+                            "text": final_text or "",
+                            "session_complete": False,
+                        })
+                        last_streamed_final = final_text or ""
+                        # keep the loop running for the next utterance
+                else:
+                    await send_json({"type": v2v_proto.SERVER_ASR_FINAL,
+                                     "text": final_text or ""})
+                    return
+
+            # Exit only when the session is closed and there's nothing
+            # left to finalize — single-utterance terminates above on
+            # the endpoint; multi-utterance terminates on close-out.
+            if state["asr_session_closed"] and not state["asr_active"]:
+                return
+
             await asyncio.sleep(0.05)
-
-        if state["client_closed"]:
-            return
-        # Only emit asr_endpoint for VAD- or backend-detected endpoints,
-        # not when the client manually requested asr_eos.
-        if not multi_utterance and (state["vad_endpoint"] or backend_endpoint):
-            await send_json({"type": v2v_proto.SERVER_ASR_ENDPOINT})
-        try:
-            async with coord.acquire("asr"):
-                final_text = await loop.run_in_executor(_get_asr_executor(), asr_stream.finalize)
-        except Exception as e:
-            await send_error(f"asr finalize: {e}")
-            return
-
-        if multi_utterance:
-            duplicate = (final_text or "") == (last_streamed_final or "")
-            await send_json({"type": v2v_proto.SERVER_ASR_FINAL,
-                             "text": final_text or "",
-                             "session_complete": True,
-                             "duplicate_of_streamed": duplicate})
-        else:
-            await send_json({"type": v2v_proto.SERVER_ASR_FINAL,
-                             "text": final_text or ""})
 
     async def tts_out_task():
         """Drain sentence queue → synthesize → emit audio.
@@ -1211,7 +1276,7 @@ async def v2v_stream(ws: WebSocket):
     # them, then cancel the dispatcher.
     dispatcher_task = asyncio.create_task(dispatcher())
     work_tasks = []
-    if asr_stream is not None:
+    if asr_enabled:
         work_tasks.append(asyncio.create_task(asr_out_task()))
     if tts_be is not None:
         work_tasks.append(asyncio.create_task(tts_out_task()))
@@ -1244,6 +1309,13 @@ async def v2v_stream(ws: WebSocket):
         stop = state["current_tts_stop"]
         if stop is not None:
             stop.set()
+        # Cancel any in-flight ASR utterance before closing the socket
+        # so the worker doesn't leak the session.
+        if asr_manager is not None:
+            try:
+                await asr_manager.cancel("ws_close")
+            except Exception:
+                pass
         try:
             await ws.close()
         except Exception:

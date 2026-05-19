@@ -56,6 +56,51 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.lower() not in ("0", "false", "no")
 
 
+class WorkerProtocolError(RuntimeError):
+    """Base class for ASR worker protocol-level errors.
+
+    Distinct from generic RuntimeError so the ASRSessionManager can route
+    these into its ERROR_REBUILD recovery path while leaving unrelated
+    failures unhandled.
+    """
+
+
+class NoActiveSessionError(WorkerProtocolError):
+    """Worker reported there is no active session (stale id / double-end)."""
+
+
+class SessionAlreadyActiveError(WorkerProtocolError):
+    """Worker reported a session is already active for the given id."""
+
+
+class WorkerExitError(WorkerProtocolError):
+    """Worker subprocess exited or didn't respond before the ack deadline."""
+
+
+def _classify_worker_response(output_data: dict, *, request_event: str | None = None) -> WorkerProtocolError | None:
+    """Map a worker error JSON payload to a typed exception (or None)."""
+    if not isinstance(output_data, dict):
+        return None
+    if output_data.get("event") != "error" and output_data.get("ok") is not False:
+        return None
+    msg = ""
+    for key in ("error", "message", "reason", "detail"):
+        v = output_data.get(key)
+        if isinstance(v, str) and v:
+            msg = v
+            break
+    if not msg:
+        msg = str(output_data)
+    low = msg.lower()
+    if "no active session" in low or "no_active_session" in low or "unknown session" in low:
+        return NoActiveSessionError(msg)
+    if "already active" in low or "session_already_active" in low or "already exists" in low:
+        return SessionAlreadyActiveError(msg)
+    if "exit" in low or "terminated" in low or "worker dead" in low:
+        return WorkerExitError(msg)
+    return None
+
+
 class TRTEdgeLLMASRBackend(ASRBackend):
     """ASR via TRT-Edge-LLM llm_inference subprocess."""
 
@@ -64,6 +109,12 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         self._ready = False
         self._worker: Optional[subprocess.Popen] = None
         self._worker_lock = threading.Lock()
+        # Separate lock so restart_worker() can preempt a request thread
+        # that is blocked on stdout.readline() while holding _worker_lock.
+        # restart_worker() snapshots self._worker WITHOUT acquiring
+        # _worker_lock, then calls proc.kill() so the blocked readline
+        # returns and the request thread can release _worker_lock.
+        self._restart_lock = threading.Lock()
         self._worker_ready_meta: dict = {}
         self._worker_stderr_tail: deque[str] = deque(maxlen=80)
 
@@ -345,6 +396,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         self._worker_ready_meta = ready
 
     def _worker_request(self, input_data: dict) -> dict:
+        req_event = input_data.get("event") if isinstance(input_data, dict) else None
         with self._worker_lock:
             self._ensure_worker()
             assert self._worker is not None and self._worker.stdin is not None and self._worker.stdout is not None
@@ -354,11 +406,65 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         if not line:
             stderr = self._stderr_tail_text()
             self._worker = None
-            raise RuntimeError(f"ASR worker exited before response: {stderr}")
+            raise WorkerExitError(f"ASR worker exited before response: {stderr}")
         output_data = json.loads(line)
+        typed = _classify_worker_response(output_data, request_event=req_event)
+        if typed is not None:
+            raise typed
         if output_data.get("event") == "error" or output_data.get("ok") is False:
-            raise RuntimeError(f"ASR worker error: {output_data}")
+            raise WorkerProtocolError(f"ASR worker error: {output_data}")
         return output_data
+
+    def restart_worker(self) -> None:
+        """Forcibly kill the worker subprocess so the next request rebuilds it.
+
+        Crucially, this method MUST NOT acquire ``_worker_lock``. A request
+        thread may be blocked on ``stdout.readline()`` while holding
+        ``_worker_lock`` (typical "stuck cancel" scenario where the worker
+        is wedged and not emitting an ack). Acquiring the same lock here
+        would deadlock — the only way to release the readline is to kill
+        the subprocess so its stdout pipe EOFs.
+
+        Concurrent callers collapse to a single restart via
+        ``_restart_lock`` (cheap, doesn't block on IO).
+        """
+        # Snapshot WITHOUT _worker_lock — the lock holder is what we're
+        # trying to unstick. _restart_lock only serializes restarts.
+        with self._restart_lock:
+            worker = self._worker
+            if worker is None:
+                return
+            # Clear our reference first so other threads that finish their
+            # blocked readline (now EOF) see _worker = None and don't try
+            # to talk to a dead pipe.
+            self._worker = None
+            self._worker_ready_meta = {}
+            try:
+                if worker.poll() is None:
+                    # Use kill() directly (SIGKILL on POSIX) so a wedged
+                    # worker can't ignore SIGTERM. This force-closes its
+                    # stdout pipe, unblocking any readline holder of
+                    # _worker_lock so they release it on next op.
+                    try:
+                        worker.kill()
+                    except Exception:
+                        pass
+                    try:
+                        worker.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+                # Close pipes after kill so the readline-blocked thread
+                # definitely unblocks. close() on a stdout already EOF'd
+                # is a no-op.
+                for fh in (worker.stdin, worker.stdout, worker.stderr):
+                    try:
+                        if fh is not None and not fh.closed:
+                            fh.close()
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.warning("restart_worker: kill failed: %s", exc)
+        logger.info("ASR worker restarted (will respawn on next request)")
 
     @staticmethod
     def _strip_language_prefix(text: str) -> tuple[str, Optional[str]]:
@@ -810,11 +916,45 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
     def cancel_and_finalize(self) -> None:
         self._final_text = self._partial_text
         self._cancelled = True
+        # Send the `end` event but bound the wait to 500ms; if the worker
+        # is unresponsive raise WorkerExitError so the session manager
+        # can trigger restart_worker(). We must NOT use a
+        # ``with ThreadPoolExecutor`` context manager here — its __exit__
+        # waits for outstanding futures, so a wedged worker_request would
+        # hold the cancel path forever, defeating the timeout.
+        import concurrent.futures as _cf
+        pool = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr-cancel")
         try:
-            self._backend._worker_request({"event": "end", "id": self._session_id})
-        except Exception:
-            pass
-        self._closed = True
+            fut = pool.submit(
+                self._backend._worker_request,
+                {"event": "end", "id": self._session_id},
+            )
+            try:
+                fut.result(timeout=0.5)
+            except _cf.TimeoutError:
+                self._closed = True
+                # Fire-and-forget shutdown; the leaked worker thread will
+                # die once restart_worker() kills the subprocess (its
+                # stdout will EOF and _worker_request returns/raises).
+                pool.shutdown(wait=False)
+                raise WorkerExitError(
+                    f"ASR worker did not ack 'end' for session {self._session_id} within 500ms"
+                )
+            except WorkerProtocolError:
+                # NoActiveSession etc. is already informative — propagate.
+                self._closed = True
+                raise
+            except Exception:
+                # Other errors are swallowed (legacy behavior).
+                pass
+            self._closed = True
+        finally:
+            # Best-effort: don't block — if the future is still running,
+            # restart_worker() will unblock it shortly.
+            try:
+                pool.shutdown(wait=False)
+            except Exception:
+                pass
 
     def get_partial(self) -> tuple[str, bool]:
         if self._closed:
