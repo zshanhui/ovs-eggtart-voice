@@ -1,7 +1,24 @@
 # OpenVoiceStream Agent — 交接文档
 
-最近一次实机调试：2026-05-18，Mac 本机 + Orin NX 远端 SLV + edge-llm。
-全部新逻辑在 main 分支 ahead origin/main 约 50+ commits，**还没 push GitHub**（等 README 更新后再 push）。
+最近一次实机调试：2026-05-19，Mac 本机 + Orin NX 远端 SLV + edge-llm。
+main 分支已 push origin（HEAD `d936d2d`）。
+
+## 2026-05-19 SLV 侧重大变更（per-utterance ASR）
+
+SLV `/v2v/stream` 适配层重写为 per-utterance ASR session 模型，修了三个连锁 race：
+
+| Commit | 修复 |
+|---|---|
+| `1e123a3` 及之前 | per-utterance ASRSessionManager 框架 + 多轮 begin/end 协议 |
+| `e2a3166` | BrokenPipeError → WorkerExitError 分类，让 SIGKILL 触发 restart_worker |
+| `0c9972b` | endpoint_pending gen-stamp，防 stale VAD endpoint 触发错 utterance 的 finalize |
+| `d936d2d` | manager.finalize_with_status 返回 accepted flag，丢掉的 finalize 不再 emit 空 asr_final |
+
+**Orin NX 上线镜像**：`seeed-local-voice:jetson-v1.12-highperf-perutt-20260519c`
+**回滚镜像**：`perutt-20260519b` / `perutt-20260519` / `bargein-asrfix-20260518` 均保留
+**回滚命令**：`fleet exec orin-nx -- "cd /tmp/seeed-local-voice-release/deploy && sed -i 's|perutt-20260519c|perutt-20260519b|g' docker-compose.yml && docker compose -p seeed-local-voice-latest up -d speech"`
+
+**对 agent 侧的含义**：之前 `asr_final watchdog`（commit `6cf7b77`）是为应对 SLV always_on 偶发丢空 final 设的兜底；per-utterance 落地后 SLV 不再发空 final（除非真的没有 ASR 文本），watchdog 还在但触发频率应明显下降。如果再观察到"agent 收不到 final 卡住"应优先怀疑 SLV 镜像版本而不是 agent 状态机。
 
 ---
 
