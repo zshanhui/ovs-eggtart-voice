@@ -69,6 +69,10 @@ def _samples_to_wav(samples: list, sample_rate: int) -> bytes:
 class SherpaBackend(TTSBackend):
     """Sherpa-onnx TTS (Matcha Chinese+English or Kokoro English)."""
 
+    # PR5: CPU / ORT model — Python del + gc actually frees memory here, so
+    # this backend can be hot-reloaded in-process.
+    supports_hot_reload = True
+
     def __init__(self):
         self._tts = None
         self._ready = False
@@ -187,6 +191,24 @@ class SherpaBackend(TTSBackend):
             "language": detected_language,
         }
         return wav_bytes, meta
+
+    def unload(self) -> None:
+        """Release the sherpa-onnx OfflineTts handle. Idempotent.
+
+        PR5: After unload() ``is_ready()`` returns False and ``preload()`` can
+        be called again to rebuild. ``synthesize`` / ``generate_streaming``
+        must not be called between unload and a subsequent preload.
+        """
+        if not self._ready and self._tts is None:
+            return
+        try:
+            self._tts = None
+            import gc
+            gc.collect()
+        except Exception:
+            logger.exception("SherpaBackend.unload failed; continuing")
+        finally:
+            self._ready = False
 
     def generate_streaming(self, text: str, **kwargs):
         """Yield PCM int16 chunks as the vocoder produces them (true streaming)."""

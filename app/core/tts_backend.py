@@ -29,6 +29,15 @@ class TTSCapability(str, Enum):
 class TTSBackend(ABC):
     """Base class for all TTS backends."""
 
+    # PR5 / FIX_A: backends opt in by overriding this class attribute. Default
+    # False keeps reload safe — a Jetson in-process TRT backend that holds
+    # CUDA buffers, ORT sessions, or pybind engines cannot reliably release
+    # GPU memory inside the same process (spike measured <6% RSS drop on
+    # matcha/kokoro/qwen3). Only backends whose unload() truly frees the
+    # underlying resources (subprocess workers, CPU-only models) should set
+    # this to True. BackendManager.reload() refuses with HTTP 400 otherwise.
+    supports_hot_reload: bool = False
+
     @property
     @abstractmethod
     def name(self) -> str:

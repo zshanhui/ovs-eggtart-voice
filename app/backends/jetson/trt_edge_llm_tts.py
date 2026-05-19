@@ -349,9 +349,27 @@ _DEFAULT_SEGMENT_TEXT = os.environ.get("EDGE_LLM_TTS_SEGMENT_TEXT", "1").lower()
 class TRTEdgeLLMTTSBackend(TTSBackend):
     """TTS via TRT-Edge-LLM qwen3_tts_inference subprocess."""
 
+    # PR5b: supports_hot_reload is mode-dependent. The default
+    # edgellm_worker / official modes spawn a TRT subprocess that can be
+    # terminated to fully release GPU memory (safe to hot-reload). The
+    # product_explicit_kv mode embeds an in-process Qwen3TRTBackend
+    # (pybind / TRT context held in this process); Qwen3TRTBackend itself
+    # declares supports_hot_reload=False, so we must mirror that.
+    #
+    # Implemented as an instance property so BackendManager's
+    # ``getattr(self._current, "supports_hot_reload", False)`` returns the
+    # correct per-instance value.
+    @property
+    def supports_hot_reload(self) -> bool:  # type: ignore[override]
+        mode = getattr(self, "_resolved_mode", None) or self._backend_mode()
+        if mode in ("product_explicit_kv", "explicit_kv"):
+            return False
+        return True
+
     def __init__(self):
         self._ready = False
         self._product_backend = None
+        self._resolved_mode: Optional[str] = None
         self._worker: Optional[subprocess.Popen] = None
         self._worker_lock = threading.Lock()
         self._worker_ready_meta: dict = {}
@@ -412,6 +430,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
     def preload(self) -> None:
         """Verify all required files exist."""
         mode = self._backend_mode()
+        self._resolved_mode = mode
         if mode in ("product_explicit_kv", "explicit_kv"):
             self._product_backend = self._load_product_explicit_kv_backend()
             self._ready = True
@@ -461,6 +480,57 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         if self._use_worker():
             self._ensure_worker()
         self._ready = True
+
+    def unload(self) -> None:
+        """Kill the resident worker subprocess so GPU memory is fully released.
+
+        PR5: idempotent + early-return when never preloaded or no worker is
+        running. Used by ``BackendManager.reload()`` between profile swaps.
+
+        PR5c FIX_1: only early-return when *all* runtime handles are empty —
+        previously a half-finished preload could leave ``_product_backend``
+        non-None while ``_ready=False`` and ``_worker=None``, leaking the
+        embedded product backend's GPU memory. The product cleanup now also
+        runs in a ``finally`` block so a failure in the worker teardown path
+        still releases the embedded Qwen3 TRT backend.
+        """
+        if (
+            not self._ready
+            and self._worker is None
+            and self._product_backend is None
+        ):
+            return
+        try:
+            with self._worker_lock:
+                old = self._worker
+                self._worker = None
+                if old is not None:
+                    try:
+                        old.terminate()
+                        old.wait(timeout=5)
+                    except Exception:
+                        try:
+                            old.kill()
+                        except Exception:
+                            pass
+                self._worker_stderr_tail.clear()
+                self._worker_ready_meta = {}
+        except Exception:
+            logger.exception("TRTEdgeLLMTTSBackend.unload failed; continuing")
+        finally:
+            # product_backend cleanup MUST run even if the worker teardown
+            # path above raised, otherwise the embedded Qwen3 TRT backend
+            # would leak GPU memory across profile swaps.
+            if self._product_backend is not None:
+                try:
+                    self._product_backend.unload()
+                except Exception:
+                    logger.exception(
+                        "product_backend.unload failed; continuing"
+                    )
+                self._product_backend = None
+            self._resolved_mode = None
+            self._ready = False
 
     def _use_worker(self) -> bool:
         return os.environ.get("EDGE_LLM_TTS_WORKER", "1").lower() not in ("0", "false", "no")

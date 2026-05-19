@@ -228,6 +228,26 @@ class Qwen3TRTBackend(TTSBackend):
     def is_ready(self) -> bool:
         return self._ready
 
+    def unload(self) -> None:
+        """Best-effort release of the pybind11 Pipeline + tokenizer.
+
+        PR5: ``supports_hot_reload`` stays False — the C++ Pipeline has no
+        ``close()`` API and pybind holds internal references; spike measured
+        <6% RSS drop. Still implemented as idempotent + early-return for
+        completeness.
+        """
+        if not self._ready and self._engine is None:
+            return
+        try:
+            self._engine = None
+            self._tokenizer = None
+            import gc
+            gc.collect()
+        except Exception:
+            logger.exception("Qwen3TRTBackend.unload failed; continuing")
+        finally:
+            self._ready = False
+
     def preload(self) -> None:
         """Load C++ TRT engine + tokenizer. Models stay resident."""
         def _meminfo(tag):

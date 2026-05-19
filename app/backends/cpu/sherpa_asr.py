@@ -187,6 +187,9 @@ class SherpaASRStream(ASRStream):
 
 class SherpaASRBackend(ASRBackend):
 
+    # PR5: CPU / ORT model — releasable in-process via del + gc.
+    supports_hot_reload = True
+
     def __init__(self):
         self._online_recognizer = None
         self._offline_recognizer = None
@@ -222,6 +225,23 @@ class SherpaASRBackend(ASRBackend):
             logger.info("Sherpa offline ASR loaded")
         except Exception as e:
             logger.info("Offline ASR not available: %s", e)
+
+    def unload(self) -> None:
+        """Release online/offline recognizers. Idempotent.
+
+        PR5: After unload() ``is_ready()`` returns False (both fields are None).
+        ``create_stream`` / ``transcribe`` must not be called between unload
+        and a subsequent preload.
+        """
+        if self._online_recognizer is None and self._offline_recognizer is None:
+            return
+        try:
+            self._online_recognizer = None
+            self._offline_recognizer = None
+            import gc
+            gc.collect()
+        except Exception:
+            logger.exception("SherpaASRBackend.unload failed; continuing")
 
     def create_stream(self, language: str = "auto") -> ASRStream:
         if self._online_recognizer is None:

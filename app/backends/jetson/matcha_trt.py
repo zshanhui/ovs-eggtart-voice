@@ -153,6 +153,41 @@ class MatchaTRTBackend(TTSBackend):
     def is_ready(self) -> bool:
         return self._ready
 
+    def unload(self) -> None:
+        """Best-effort release of TRT engines / ORT sessions / CUDA pool.
+
+        PR5: ``supports_hot_reload`` stays False — spike showed <6% RSS drop.
+        Idempotent + early-return; safe to call from BackendManager rollback.
+        """
+        if not self._ready and self._acoustic_ort is None and self._vocos_engine is None:
+            return
+        try:
+            pool = self._cuda_pool
+            if pool is not None:
+                try:
+                    pool.free_all()
+                except Exception:
+                    logger.exception("Matcha pool.free_all failed; continuing")
+                try:
+                    # Drop the CUDA stream handle held by the pool object so
+                    # gc can finalize it.
+                    pool._stream = None  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            self._acoustic_ort = None
+            self._split_encoder_ort = None
+            self._split_estimator_engines = []
+            self._split_estimator_ctxs = []
+            self._vocos_engine = None
+            self._vocos_ctx = None
+            self._cuda_pool = None
+            import gc
+            gc.collect()
+        except Exception:
+            logger.exception("MatchaTRTBackend.unload failed; continuing")
+        finally:
+            self._ready = False
+
     def preload(self) -> None:
         self._load_lexicon()
         self._load_acoustic_ort()

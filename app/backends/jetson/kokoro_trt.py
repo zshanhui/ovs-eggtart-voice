@@ -165,6 +165,42 @@ class KokoroTRTBackend(TTSBackend):
     def is_ready(self) -> bool:
         return self._ready
 
+    def unload(self) -> None:
+        """Best-effort release of TRT engines / ORT sessions / CUDA pools.
+
+        PR5: ``supports_hot_reload`` stays False — the spike measured <6% RSS
+        drop here because pybind/TRT/ORT hold internal references we can't
+        nuke from Python. Still required for completeness and so a future
+        process-aware reload path can use it.
+        """
+        if not self._ready and self._engine is None and self._ort_sess is None:
+            return
+        try:
+            pool = self._pool
+            if pool is not None:
+                try:
+                    pool.free_all()
+                except Exception:
+                    logger.exception("Kokoro pool.free_all failed; continuing")
+            self._engine = None
+            self._ctx = None
+            self._pool = None
+            self._ort_sess = None
+            self._suffix_sess = None
+            self._split_length_sess = None
+            self._split_source_sess = None
+            self._split_istft_sess = None
+            self._split_engines = {}
+            self._split_ctxs = {}
+            self._split_long_engines = {}
+            self._split_long_ctxs = {}
+            import gc
+            gc.collect()
+        except Exception:
+            logger.exception("KokoroTRTBackend.unload failed; continuing")
+        finally:
+            self._ready = False
+
     def preload(self) -> None:
         self._load_tokens()
         if self._runtime_mode in ("cpu", "ort", "ort_cpu", "onnxruntime"):

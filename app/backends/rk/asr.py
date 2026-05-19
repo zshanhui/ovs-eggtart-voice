@@ -188,6 +188,13 @@ def _join_segments(texts: list[str], language: str) -> str:
 # Stream adapter
 # ---------------------------------------------------------------------------
 
+
+class _UnloadRaceError(RuntimeError):
+    """Raised by the stream adapter when its backing inner has been unloaded
+    mid-stream. Distinguishes "known unload race" from native RuntimeError
+    surfaced by rkvoice_stream itself."""
+
+
 class _RKASRStreamAdapter(ASRStream):
     """Forwards accept_waveform to the inner stream for partial emission, but
     intercepts finalize: if the accumulated audio is longer than the long-audio
@@ -201,22 +208,48 @@ class _RKASRStreamAdapter(ASRStream):
         self._chunks: list[np.ndarray] = []
         self._sample_rate = 16000
 
+    # PR5d FIX_1: every inner/backend._inner deref guards against the unload
+    # race window — manager hard-closes the WS on profile swap, but a stream
+    # task in flight may still touch the adapter one more time. Raise a
+    # dedicated _UnloadRaceError (subclass of RuntimeError) so callers can
+    # distinguish "known unload race" from a native RuntimeError surfaced by
+    # the rkvoice_stream inner. See finalize() long-path for why the
+    # narrower except matters.
+    def _live_inner(self):
+        inner = self._inner
+        if inner is None:
+            raise _UnloadRaceError(
+                "RK ASR stream adapter inner was unloaded; stream is dead"
+            )
+        return inner
+
+    def _live_backend_inner(self):
+        backend = self._backend
+        inner = getattr(backend, "_inner", None) if backend is not None else None
+        if inner is None:
+            raise _UnloadRaceError(
+                "RK ASR backend was unloaded; stream is dead"
+            )
+        return inner
+
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
+        inner = self._live_inner()
         self._sample_rate = sample_rate
         # Buffer for our own finalize path. Cheap copy; the underlying memory
         # is already a numpy array.
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
         self._chunks.append(samples)
-        self._inner.accept_waveform(sample_rate, samples)
+        inner.accept_waveform(sample_rate, samples)
 
     def finalize(self) -> str:
+        inner = self._live_inner()
         if not self._chunks:
-            return self._inner.finalize() or ""
+            return inner.finalize() or ""
         audio = np.concatenate(self._chunks)
         dur_s = len(audio) / max(self._sample_rate, 1)
         if dur_s <= _LONG_AUDIO_THRESHOLD_S:
-            text = self._inner.finalize() or ""
+            text = inner.finalize() or ""
             return _clean_segment_text(text)
 
         # Long path: segment + per-segment offline transcribe via inner.
@@ -233,9 +266,16 @@ class _RKASRStreamAdapter(ASRStream):
                 continue
             wav_bytes = _float_to_wav_bytes(seg, 16000)
             try:
-                result = self._backend._inner.transcribe(
+                backend_inner = self._live_backend_inner()
+                result = backend_inner.transcribe(
                     wav_bytes, language=self._language
                 )
+            except _UnloadRaceError:
+                # Backend was unloaded mid-finalize — propagate so the
+                # caller distinguishes this from a true transcribe error.
+                # Native RuntimeError from transcribe() still falls through
+                # to the broad except below and is logged-and-skipped.
+                raise
             except Exception as e:
                 logger.warning(
                     "RK ASR segment failed (%.1fs): %s", len(seg) / 16000, e
@@ -251,13 +291,13 @@ class _RKASRStreamAdapter(ASRStream):
         return _join_segments(texts, self._language)
 
     def prepare_finalize(self) -> None:
-        self._inner.prepare_finalize()
+        self._live_inner().prepare_finalize()
 
     def cancel_and_finalize(self) -> None:
-        self._inner.cancel_and_finalize()
+        self._live_inner().cancel_and_finalize()
 
     def get_partial(self) -> tuple[str, bool]:
-        return self._inner.get_partial()
+        return self._live_inner().get_partial()
 
 
 # ---------------------------------------------------------------------------
@@ -282,13 +322,37 @@ class RKASRBackend(ASRBackend):
         from rkvoice_stream import create_asr
         self._inner = create_asr()
         self._platform = os.environ.get("RK_PLATFORM", "rk3576")
+        # PR5c FIX_2: cache metadata at construction time so post-unload
+        # status queries don't crash on ``self._inner is None``.
+        try:
+            self._cached_name = f"rk:{self._inner.name}"
+        except Exception:
+            self._cached_name = "rk:unknown"
+        try:
+            self._cached_sample_rate = int(self._inner.sample_rate)
+        except Exception:
+            self._cached_sample_rate = 0
+        try:
+            cached_caps: set[ASRCapability] = set()
+            for cap in self._inner.capabilities:
+                value = cap.value if hasattr(cap, "value") else str(cap)
+                mapped = _CAP_MAP.get(value)
+                if mapped is not None:
+                    cached_caps.add(mapped)
+            self._cached_capabilities = cached_caps
+        except Exception:
+            self._cached_capabilities = set()
 
     @property
     def name(self) -> str:
+        if self._inner is None:
+            return self._cached_name
         return f"rk:{self._inner.name}"
 
     @property
     def capabilities(self) -> set[ASRCapability]:
+        if self._inner is None:
+            return set(self._cached_capabilities)
         out: set[ASRCapability] = set()
         for cap in self._inner.capabilities:
             value = cap.value if hasattr(cap, "value") else str(cap)
@@ -299,15 +363,37 @@ class RKASRBackend(ASRBackend):
 
     @property
     def sample_rate(self) -> int:
+        if self._inner is None:
+            return self._cached_sample_rate
         return self._inner.sample_rate
 
     def is_ready(self) -> bool:
+        if self._inner is None:
+            return False
         return self._inner.is_ready()
 
     def preload(self) -> None:
+        if self._inner is None:
+            raise RuntimeError("RKASRBackend not loaded (was unloaded)")
         self._inner.preload()
 
+    def unload(self) -> None:
+        """Drop the rkvoice-stream inner backend handle. Idempotent.
+
+        PR5: ``supports_hot_reload`` stays False — see RKTTSBackend.unload().
+        """
+        if self._inner is None:
+            return
+        try:
+            self._inner = None
+            import gc
+            gc.collect()
+        except Exception:
+            logger.exception("RKASRBackend.unload failed; continuing")
+
     def transcribe(self, audio_bytes: bytes, language: str = "auto") -> TranscriptionResult:
+        if self._inner is None:
+            raise RuntimeError("RKASRBackend not loaded (was unloaded)")
         # Long-audio guard: if WAV is >5s, split at silence and run each
         # segment through inner.transcribe() independently (fresh session
         # internally), then concatenate. Mirrors the streaming finalize path.
@@ -355,6 +441,8 @@ class RKASRBackend(ASRBackend):
         )
 
     def create_stream(self, language: str = "auto") -> ASRStream:
+        if self._inner is None:
+            raise RuntimeError("RKASRBackend not loaded (was unloaded)")
         return _RKASRStreamAdapter(
             self._inner.create_stream(language=language), self, language=language
         )

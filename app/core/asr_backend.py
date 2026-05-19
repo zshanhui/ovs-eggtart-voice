@@ -76,6 +76,10 @@ class ASRStream(ABC):
 
 class ASRBackend(ABC):
 
+    # PR5 / FIX_A: see TTSBackend.supports_hot_reload. Default False; backends
+    # whose unload() actually releases GPU/NPU resources should set True.
+    supports_hot_reload: bool = False
+
     @property
     @abstractmethod
     def name(self) -> str: ...
