@@ -122,6 +122,32 @@ def test_worker_request_injects_worker_exit_on_empty_line():
     assert isinstance(err, WorkerExitError)
 
 
+def test_worker_request_broken_pipe_raises_worker_exit():
+    """SIGKILL of the worker causes BrokenPipeError on stdin.write. Without
+    classification, that escapes as a raw IOError and the session manager
+    cannot route it to ERROR_REBUILD. After the fix, _worker_request must
+    surface this as WorkerExitError so restart_worker fires."""
+    import pytest
+    backend = TRTEdgeLLMASRBackend()
+
+    class _DeadStdin:
+        def write(self, _payload):
+            raise BrokenPipeError("worker dead")
+        def flush(self):
+            raise BrokenPipeError("worker dead")
+
+    class _Worker:
+        stdin = _DeadStdin()
+        stdout = object()  # truthy, never read because write fails first
+
+    backend._worker = _Worker()
+    backend._ensure_worker = lambda: None  # don't try to spawn
+
+    with pytest.raises(WorkerExitError):
+        backend._worker_request({"event": "begin", "id": "x"})
+    assert backend._worker is None  # cleared so next call rebuilds
+
+
 def test_restart_worker_is_idempotent_with_no_running_worker():
     """restart_worker() must be safe to call when nothing is running."""
     backend = TRTEdgeLLMASRBackend()

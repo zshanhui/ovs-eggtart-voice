@@ -400,8 +400,15 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         with self._worker_lock:
             self._ensure_worker()
             assert self._worker is not None and self._worker.stdin is not None and self._worker.stdout is not None
-            self._worker.stdin.write(json.dumps(input_data, ensure_ascii=False) + "\n")
-            self._worker.stdin.flush()
+            try:
+                self._worker.stdin.write(json.dumps(input_data, ensure_ascii=False) + "\n")
+                self._worker.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                stderr = self._stderr_tail_text()
+                self._worker = None
+                raise WorkerExitError(
+                    f"ASR worker stdin broken (likely killed): {exc}: {stderr}"
+                ) from exc
             line = self._worker.stdout.readline()
         if not line:
             stderr = self._stderr_tail_text()
