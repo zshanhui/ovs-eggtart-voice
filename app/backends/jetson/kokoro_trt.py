@@ -28,6 +28,10 @@ from app.core.tts_speakers import resolve_speaker_kwargs
 
 logger = logging.getLogger(__name__)
 
+# Paths — captured at module import for back-compat. Instance code reads
+# self._<path> attrs set in __init__ via _resolve_kokoro_paths(), so a backend
+# built after profile hot-reload sees the new artifact locations even though
+# these module constants stay frozen at first import.
 _MODEL_BASE = os.environ.get("KOKORO_MODEL_BASE", "/opt/models/kokoro-multi-lang-v1_0")
 _MODEL_ONNX = os.environ.get("KOKORO_ONNX", os.path.join(_MODEL_BASE, "model.onnx"))
 _ENGINE_PATH = os.environ.get(
@@ -97,12 +101,98 @@ STREAM_SEGMENT_TEXT = os.environ.get("KOKORO_STREAM_SEGMENT_TEXT", "1").lower() 
 SYNTH_SEGMENT_TEXT = os.environ.get("KOKORO_SYNTH_SEGMENT_TEXT", "1").lower() not in ("0", "false", "no")
 
 
-def _hybrid_prefix_engine_path() -> str:
-    if _HYBRID_PREFIX_ENGINE_ENV:
-        return _HYBRID_PREFIX_ENGINE_ENV
-    if os.path.exists(_HYBRID_PREFIX_ENGINE_DYN):
-        return _HYBRID_PREFIX_ENGINE_DYN
-    return _HYBRID_PREFIX_ENGINE_FIXED
+def _hybrid_prefix_engine_path(paths: dict[str, str] | None = None) -> str:
+    """Resolve the hybrid prefix engine path.
+
+    If a ``paths`` dict (from :func:`_resolve_kokoro_paths`) is supplied, use
+    its values so the resolution matches what the backend instance captured
+    at __init__. Falling back to module-level state preserves cold-boot
+    behaviour for any external caller that still imports this helper.
+    """
+    if paths is not None:
+        env_explicit = paths["hybrid_prefix_engine_env"]
+        dyn = paths["hybrid_prefix_engine_dyn"]
+        fixed = paths["hybrid_prefix_engine_fixed"]
+    else:
+        env_explicit = _HYBRID_PREFIX_ENGINE_ENV
+        dyn = _HYBRID_PREFIX_ENGINE_DYN
+        fixed = _HYBRID_PREFIX_ENGINE_FIXED
+    if env_explicit:
+        return env_explicit
+    if os.path.exists(dyn):
+        return dyn
+    return fixed
+
+
+def _resolve_kokoro_paths() -> dict[str, str | None]:
+    """Resolve all Kokoro artifact paths from the *current* os.environ.
+
+    Called from KokoroTRTBackend.__init__ on each construction so the backend
+    sees the latest profile-applied env (BackendManager rebuilds the backend
+    after each apply_profile()).
+    """
+    model_base = os.environ.get(
+        "KOKORO_MODEL_BASE", "/opt/models/kokoro-multi-lang-v1_0"
+    )
+    hybrid_dir = os.environ.get("KOKORO_HYBRID_DIR", os.path.join(model_base, "hybrid"))
+    return {
+        "model_base": model_base,
+        "model_onnx": os.environ.get("KOKORO_ONNX", os.path.join(model_base, "model.onnx")),
+        "engine_path": os.environ.get(
+            "KOKORO_TRT_ENGINE",
+            os.path.join(model_base, "engines", "kokoro_fp16.engine"),
+        ),
+        "hybrid_dir": hybrid_dir,
+        "hybrid_prefix_engine_env": os.environ.get("KOKORO_HYBRID_PREFIX_ENGINE"),
+        "hybrid_prefix_engine_dyn": os.path.join(hybrid_dir, "kokoro_prefix_encoder_dyn4_128_fp16.engine"),
+        "hybrid_prefix_engine_fixed": os.path.join(hybrid_dir, "kokoro_prefix_encoder_s96_fp16.engine"),
+        "hybrid_suffix_onnx": os.environ.get(
+            "KOKORO_HYBRID_SUFFIX_ONNX",
+            os.path.join(hybrid_dir, "kokoro_suffix_encoder.onnx"),
+        ),
+        "split_encoder_engine": os.environ.get(
+            "KOKORO_SPLIT_ENCODER_ENGINE",
+            os.path.join(model_base, "engines", "kokoro_prefix_encoder_dyn4_128_fp16.engine"),
+        ),
+        "split_length_onnx": os.environ.get(
+            "KOKORO_SPLIT_LENGTH_ONNX",
+            os.path.join(model_base, "engines", "cpu_length_regulator.onnx"),
+        ),
+        "split_decoder_engine": os.environ.get(
+            "KOKORO_SPLIT_DECODER_ENGINE",
+            os.path.join(model_base, "engines", "kokoro_decoder_backbone_dyn64_256_fp16.engine"),
+        ),
+        "split_decoder_engine_long": os.environ.get(
+            "KOKORO_SPLIT_DECODER_ENGINE_LONG",
+            os.path.join(model_base, "engines", "kokoro_decoder_backbone_dyn256_512_fp16.engine"),
+        ),
+        "split_source_engine": os.environ.get(
+            "KOKORO_SPLIT_SOURCE_ENGINE",
+            os.path.join(model_base, "engines", "kokoro_generator_source_dyn128_512_bf16.engine"),
+        ),
+        "split_source_engine_long": os.environ.get(
+            "KOKORO_SPLIT_SOURCE_ENGINE_LONG",
+            os.path.join(model_base, "engines", "kokoro_generator_source_dyn512_1024_bf16.engine"),
+        ),
+        "split_source_onnx": os.environ.get(
+            "KOKORO_SPLIT_SOURCE_ONNX",
+            os.path.join(model_base, "engines", "cpu_generator_source.onnx"),
+        ),
+        "split_generator_engine": os.environ.get(
+            "KOKORO_SPLIT_GENERATOR_ENGINE",
+            os.path.join(model_base, "engines", "kokoro_generator_rest_preexp_dyn64_256_fp16.engine"),
+        ),
+        "split_generator_engine_long": os.environ.get(
+            "KOKORO_SPLIT_GENERATOR_ENGINE_LONG",
+            os.path.join(model_base, "engines", "kokoro_generator_rest_preexp_dyn256_512_fp16.engine"),
+        ),
+        "split_istft_onnx": os.environ.get(
+            "KOKORO_SPLIT_ISTFT_ONNX",
+            os.path.join(model_base, "engines", "cpu_postspec_istft.onnx"),
+        ),
+        "voices_bin": os.environ.get("KOKORO_VOICES", os.path.join(model_base, "voices.bin")),
+        "tokens_path": os.environ.get("KOKORO_TOKENS", os.path.join(model_base, "tokens.txt")),
+    }
 
 
 def _samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
@@ -145,6 +235,12 @@ class KokoroTRTBackend(TTSBackend):
         self._hybrid_fixed_seq_len: int | None = None
         self._hybrid_max_seq_len: int | None = None
         self._ready = False
+        # Snapshot artifact paths from the *current* env at construction.
+        # BackendManager rebuilds the backend after each apply_profile() so
+        # __init__ sees the latest profile-applied env. Module-level _*_PATH
+        # constants are kept frozen for back-compat (no external imports use
+        # them; verified at the time of this refactor 2026-05-21).
+        self._paths = _resolve_kokoro_paths()
 
     @property
     def name(self) -> str:
@@ -209,14 +305,14 @@ class KokoroTRTBackend(TTSBackend):
             self._load_split_generator()
         elif self._runtime_mode in ("hybrid", "trt_cpu", "trt_prefix"):
             self._load_hybrid()
-        elif os.path.exists(_ENGINE_PATH):
+        elif os.path.exists(self._paths['engine_path']):
             self._load_engine()
         elif self._split_generator_assets_exist():
             self._load_split_generator()
-        elif os.path.exists(_hybrid_prefix_engine_path()) and os.path.exists(_HYBRID_SUFFIX_ONNX):
+        elif os.path.exists(_hybrid_prefix_engine_path(self._paths)) and os.path.exists(self._paths['hybrid_suffix_onnx']):
             self._load_hybrid()
         else:
-            logger.warning("Kokoro TRT engine missing at %s; using CPU ORT fallback", _ENGINE_PATH)
+            logger.warning("Kokoro TRT engine missing at %s; using CPU ORT fallback", self._paths['engine_path'])
             self._load_ort()
         try:
             self._warmup()
@@ -236,9 +332,9 @@ class KokoroTRTBackend(TTSBackend):
         self._ready = True
 
     def _load_tokens(self) -> None:
-        if not os.path.exists(_TOKENS_PATH):
-            raise FileNotFoundError(f"Kokoro tokens not found: {_TOKENS_PATH}")
-        with open(_TOKENS_PATH, "r", encoding="utf-8") as f:
+        if not os.path.exists(self._paths['tokens_path']):
+            raise FileNotFoundError(f"Kokoro tokens not found: {self._paths['tokens_path']}")
+        with open(self._paths['tokens_path'], "r", encoding="utf-8") as f:
             for line in f:
                 raw = line.rstrip("\n").rstrip("\r")
                 if not raw:
@@ -251,17 +347,17 @@ class KokoroTRTBackend(TTSBackend):
                     self._token_to_id[tok] = int(raw[rsep + 1:])
                 except ValueError:
                     continue
-        logger.info("Loaded %d Kokoro tokens from %s", len(self._token_to_id), _TOKENS_PATH)
+        logger.info("Loaded %d Kokoro tokens from %s", len(self._token_to_id), self._paths['tokens_path'])
 
     def _load_engine(self) -> None:
         import tensorrt as trt
 
         t0 = time.time()
-        with open(_ENGINE_PATH, "rb") as f:
+        with open(self._paths['engine_path'], "rb") as f:
             runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
             self._engine = runtime.deserialize_cuda_engine(f.read())
         if self._engine is None:
-            raise RuntimeError(f"Failed to deserialize Kokoro engine: {_ENGINE_PATH}")
+            raise RuntimeError(f"Failed to deserialize Kokoro engine: {self._paths['engine_path']}")
         self._ctx = self._engine.create_execution_context()
         names = [self._engine.get_tensor_name(i) for i in range(self._engine.num_io_tensors)]
         if "tokens" in names:
@@ -270,17 +366,17 @@ class KokoroTRTBackend(TTSBackend):
             self._token_input_name = "input_ids"
         self._pool = CudaMemoryPool()
         self._runtime_mode = "engine"
-        logger.info("Kokoro TRT engine loaded: %s (%.1fs)", _ENGINE_PATH, time.time() - t0)
+        logger.info("Kokoro TRT engine loaded: %s (%.1fs)", self._paths['engine_path'], time.time() - t0)
 
     def _load_hybrid(self) -> None:
         import onnxruntime as ort
         import tensorrt as trt
 
-        prefix_engine = _hybrid_prefix_engine_path()
+        prefix_engine = _hybrid_prefix_engine_path(self._paths)
         if not os.path.exists(prefix_engine):
             raise FileNotFoundError(f"Kokoro hybrid prefix engine not found: {prefix_engine}")
-        if not os.path.exists(_HYBRID_SUFFIX_ONNX):
-            raise FileNotFoundError(f"Kokoro hybrid suffix ONNX not found: {_HYBRID_SUFFIX_ONNX}")
+        if not os.path.exists(self._paths['hybrid_suffix_onnx']):
+            raise FileNotFoundError(f"Kokoro hybrid suffix ONNX not found: {self._paths['hybrid_suffix_onnx']}")
 
         t0 = time.time()
         with open(prefix_engine, "rb") as f:
@@ -291,13 +387,13 @@ class KokoroTRTBackend(TTSBackend):
         self._ctx = self._engine.create_execution_context()
         self._pool = CudaMemoryPool()
         self._configure_hybrid_token_profile()
-        self._suffix_sess = ort.InferenceSession(_HYBRID_SUFFIX_ONNX, providers=["CPUExecutionProvider"])
+        self._suffix_sess = ort.InferenceSession(self._paths['hybrid_suffix_onnx'], providers=["CPUExecutionProvider"])
         self._token_input_name = "tokens"
         self._runtime_mode = "hybrid"
         logger.info(
             "Kokoro hybrid loaded: prefix=%s suffix=%s token_profile=fixed:%s max:%s (%.1fs)",
             prefix_engine,
-            _HYBRID_SUFFIX_ONNX,
+            self._paths['hybrid_suffix_onnx'],
             self._hybrid_fixed_seq_len,
             self._hybrid_max_seq_len,
             time.time() - t0,
@@ -305,39 +401,39 @@ class KokoroTRTBackend(TTSBackend):
 
     def _split_generator_assets_exist(self) -> bool:
         required = (
-            _SPLIT_ENCODER_ENGINE,
-            _SPLIT_LENGTH_ONNX,
-            _SPLIT_DECODER_ENGINE,
-            _SPLIT_GENERATOR_ENGINE,
-            _SPLIT_ISTFT_ONNX,
+            self._paths['split_encoder_engine'],
+            self._paths['split_length_onnx'],
+            self._paths['split_decoder_engine'],
+            self._paths['split_generator_engine'],
+            self._paths['split_istft_onnx'],
         )
         if not all(os.path.exists(path) for path in required):
             return False
-        return os.path.exists(_SPLIT_SOURCE_ENGINE) or os.path.exists(_SPLIT_SOURCE_ONNX)
+        return os.path.exists(self._paths['split_source_engine']) or os.path.exists(self._paths['split_source_onnx'])
 
     def _load_split_generator(self) -> None:
         import onnxruntime as ort
         import tensorrt as trt
 
         required = {
-            "encoder": _SPLIT_ENCODER_ENGINE,
-            "decoder": _SPLIT_DECODER_ENGINE,
-            "generator": _SPLIT_GENERATOR_ENGINE,
+            "encoder": self._paths['split_encoder_engine'],
+            "decoder": self._paths['split_decoder_engine'],
+            "generator": self._paths['split_generator_engine'],
         }
-        if os.path.exists(_SPLIT_SOURCE_ENGINE):
-            required["source"] = _SPLIT_SOURCE_ENGINE
+        if os.path.exists(self._paths['split_source_engine']):
+            required["source"] = self._paths['split_source_engine']
         for name, path in required.items():
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Kokoro split {name} engine not found: {path}")
         for name, path in {
-            "length regulator": _SPLIT_LENGTH_ONNX,
-            "ISTFT": _SPLIT_ISTFT_ONNX,
+            "length regulator": self._paths['split_length_onnx'],
+            "ISTFT": self._paths['split_istft_onnx'],
         }.items():
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Kokoro split {name} ONNX not found: {path}")
-        if "source" not in required and not os.path.exists(_SPLIT_SOURCE_ONNX):
+        if "source" not in required and not os.path.exists(self._paths['split_source_onnx']):
             raise FileNotFoundError(
-                f"Kokoro split source engine/ONNX not found: {_SPLIT_SOURCE_ENGINE} / {_SPLIT_SOURCE_ONNX}"
+                f"Kokoro split source engine/ONNX not found: {self._paths['split_source_engine']} / {self._paths['split_source_onnx']}"
             )
 
         t0 = time.time()
@@ -354,9 +450,9 @@ class KokoroTRTBackend(TTSBackend):
             self._split_engines[name] = engine
             self._split_ctxs[name] = engine.create_execution_context()
         long_required = {
-            "decoder": _SPLIT_DECODER_ENGINE_LONG,
-            "source": _SPLIT_SOURCE_ENGINE_LONG,
-            "generator": _SPLIT_GENERATOR_ENGINE_LONG,
+            "decoder": self._paths['split_decoder_engine_long'],
+            "source": self._paths['split_source_engine_long'],
+            "generator": self._paths['split_generator_engine_long'],
         }
         if all(os.path.exists(path) for path in long_required.values()):
             for name, path in long_required.items():
@@ -371,22 +467,22 @@ class KokoroTRTBackend(TTSBackend):
             logger.warning("Ignoring incomplete Kokoro 256-512 bucket; missing: %s", missing)
         self._pool = CudaMemoryPool()
         self._configure_split_token_profile()
-        self._split_length_sess = ort.InferenceSession(_SPLIT_LENGTH_ONNX, providers=["CPUExecutionProvider"])
-        self._split_istft_sess = ort.InferenceSession(_SPLIT_ISTFT_ONNX, providers=["CPUExecutionProvider"])
+        self._split_length_sess = ort.InferenceSession(self._paths['split_length_onnx'], providers=["CPUExecutionProvider"])
+        self._split_istft_sess = ort.InferenceSession(self._paths['split_istft_onnx'], providers=["CPUExecutionProvider"])
         if "source" not in required:
-            self._split_source_sess = ort.InferenceSession(_SPLIT_SOURCE_ONNX, providers=["CPUExecutionProvider"])
+            self._split_source_sess = ort.InferenceSession(self._paths['split_source_onnx'], providers=["CPUExecutionProvider"])
         self._token_input_name = "tokens"
         self._runtime_mode = "split_generator"
         logger.info(
             "Kokoro split-generator loaded: encoder=%s decoder=%s source=%s generator=%s "
             "long_bucket=%s length=%s istft=%s token_profile=fixed:%s max:%s (%.1fs)",
-            _SPLIT_ENCODER_ENGINE,
-            _SPLIT_DECODER_ENGINE,
-            _SPLIT_SOURCE_ENGINE if "source" in required else _SPLIT_SOURCE_ONNX,
-            _SPLIT_GENERATOR_ENGINE,
+            self._paths['split_encoder_engine'],
+            self._paths['split_decoder_engine'],
+            self._paths['split_source_engine'] if "source" in required else self._paths['split_source_onnx'],
+            self._paths['split_generator_engine'],
             bool(self._split_long_engines),
-            _SPLIT_LENGTH_ONNX,
-            _SPLIT_ISTFT_ONNX,
+            self._paths['split_length_onnx'],
+            self._paths['split_istft_onnx'],
             self._hybrid_fixed_seq_len,
             self._hybrid_max_seq_len,
             time.time() - t0,
@@ -422,12 +518,12 @@ class KokoroTRTBackend(TTSBackend):
     def _load_ort(self) -> None:
         import onnxruntime as ort
 
-        if not os.path.exists(_MODEL_ONNX):
-            raise FileNotFoundError(f"Kokoro ONNX not found: {_MODEL_ONNX}")
+        if not os.path.exists(self._paths['model_onnx']):
+            raise FileNotFoundError(f"Kokoro ONNX not found: {self._paths['model_onnx']}")
         providers = ["CPUExecutionProvider"]
         sess_opt = ort.SessionOptions()
         sess_opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self._ort_sess = ort.InferenceSession(_MODEL_ONNX, sess_opt, providers=providers)
+        self._ort_sess = ort.InferenceSession(self._paths['model_onnx'], sess_opt, providers=providers)
         input_names = {item.name for item in self._ort_sess.get_inputs()}
         if "tokens" in input_names:
             self._token_input_name = "tokens"
@@ -682,17 +778,17 @@ class KokoroTRTBackend(TTSBackend):
             ids.append(tid)
 
     def _load_style(self, speaker_id: int, token_count: int) -> np.ndarray:
-        if not os.path.exists(_VOICES_BIN):
-            raise FileNotFoundError(f"Kokoro voices not found: {_VOICES_BIN}")
+        if not os.path.exists(self._paths['voices_bin']):
+            raise FileNotFoundError(f"Kokoro voices not found: {self._paths['voices_bin']}")
         style_idx = max(0, min(VOICE_STYLES - 1, int(token_count)))
         offset = speaker_id * STYLE_BYTES + style_idx * STYLE_DIM * 4
-        size = os.path.getsize(_VOICES_BIN)
+        size = os.path.getsize(self._paths['voices_bin'])
         if offset + STYLE_DIM * 4 > size:
             raise ValueError(
-                f"Kokoro speaker_id {speaker_id} out of range for {_VOICES_BIN} "
+                f"Kokoro speaker_id {speaker_id} out of range for {self._paths['voices_bin']} "
                 f"(file has about {size // STYLE_BYTES} speakers)"
             )
-        with open(_VOICES_BIN, "rb") as f:
+        with open(self._paths['voices_bin'], "rb") as f:
             f.seek(offset)
             data = f.read(STYLE_DIM * 4)
         return np.frombuffer(data, dtype=np.float32).reshape(1, STYLE_DIM).copy()

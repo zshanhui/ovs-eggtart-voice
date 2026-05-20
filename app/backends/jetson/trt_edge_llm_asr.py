@@ -41,12 +41,14 @@ from app.backends.jetson.trt_edge_llm_ipc import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MAX_GENERATE_LENGTH = int(
-    os.environ.get("ASR_MAX_GENERATE_LENGTH", "200")
-)
-_DEFAULT_TEMPERATURE = float(os.environ.get("ASR_TEMPERATURE", "1.0"))
-_DEFAULT_TOP_P = float(os.environ.get("ASR_TOP_P", "1.0"))
-_DEFAULT_TOP_K = int(os.environ.get("ASR_TOP_K", "1"))
+# Sampling defaults — read fresh per backend instance via _load_config().
+# The module-level fallbacks below are kept for the rare external importer
+# (none currently) and historical introspection; ALL request-time code must
+# pull from self._config so hot reload of ASR_TEMPERATURE etc. is honored.
+_DEFAULT_MAX_GENERATE_LENGTH = 200
+_DEFAULT_TEMPERATURE = 1.0
+_DEFAULT_TOP_P = 1.0
+_DEFAULT_TOP_K = 1
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -225,6 +227,14 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 "EDGE_LLM_ASR_MEL_FILTERS",
                 manifest.get("mel_filters_path", ""),
             ),
+            # Sampling defaults — captured per-instance so a fresh backend
+            # built after profile reload (BackendManager rebuilds on every
+            # apply_profile) honors the new ASR_TEMPERATURE / ASR_TOP_P /
+            # ASR_TOP_K / ASR_MAX_GENERATE_LENGTH values.
+            "temperature": float(os.environ.get("ASR_TEMPERATURE", "1.0")),
+            "top_p": float(os.environ.get("ASR_TOP_P", "1.0")),
+            "top_k": int(os.environ.get("ASR_TOP_K", "1")),
+            "max_generate_length": int(os.environ.get("ASR_MAX_GENERATE_LENGTH", "200")),
             "manifest_path": manifest_path,
         }
 
@@ -573,10 +583,10 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 }
             ],
             "batch_size": 1,
-            "temperature": _DEFAULT_TEMPERATURE,
-            "top_p": _DEFAULT_TOP_P,
-            "top_k": _DEFAULT_TOP_K,
-            "max_generate_length": _DEFAULT_MAX_GENERATE_LENGTH,
+            "temperature": self._config["temperature"],
+            "top_p": self._config["top_p"],
+            "top_k": self._config["top_k"],
+            "max_generate_length": self._config["max_generate_length"],
             "apply_chat_template": True,
             "add_generation_prompt": True,
         }
@@ -690,10 +700,10 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                     }
                 ],
                 "batch_size": 1,
-                "temperature": _DEFAULT_TEMPERATURE,
-                "top_p": _DEFAULT_TOP_P,
-                "top_k": _DEFAULT_TOP_K,
-                "max_generate_length": _DEFAULT_MAX_GENERATE_LENGTH,
+                "temperature": self._config["temperature"],
+                "top_p": self._config["top_p"],
+                "top_k": self._config["top_k"],
+                "max_generate_length": self._config["max_generate_length"],
                 "apply_chat_template": True,
                 "add_generation_prompt": True,
             }

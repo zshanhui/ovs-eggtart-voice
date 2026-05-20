@@ -190,7 +190,10 @@ def _concat_wav_bytes(parts: list[bytes], pauses_ms: Optional[list[int]] = None)
             writer.writeframes(frame_bytes)
     return out.getvalue()
 
-# Paths — all under /opt/models/qwen3-tts (persistent volume)
+# Paths — captured at module import for back-compat. Instance code reads
+# self._paths set in __init__ via _resolve_qwen3_paths(), so a backend built
+# after profile hot-reload sees the new artifact locations even though these
+# module constants stay frozen at first import.
 _BASE = os.environ.get("QWEN3_MODEL_BASE", "/opt/models/qwen3-tts")
 QWEN3_SHERPA_DIR = os.environ.get("QWEN3_SHERPA_DIR", os.path.join(_BASE, "onnx"))
 QWEN3_MODEL_DIR = os.environ.get("QWEN3_MODEL_DIR", os.path.join(_BASE, "onnx"))
@@ -201,6 +204,37 @@ QWEN3_TOKENIZER_DIR = os.environ.get("QWEN3_TOKENIZER_DIR", os.path.join(_BASE, 
 QWEN3_EXTRACT_SCRIPT = os.environ.get("QWEN3_EXTRACT_SCRIPT", os.path.join(_BASE, "extract_speaker_emb.py"))
 
 
+def _resolve_qwen3_paths() -> dict[str, str]:
+    """Resolve all Qwen3 TTS artifact paths from the *current* os.environ.
+
+    Called from Qwen3TRTBackend.__init__ each construction so a fresh backend
+    built after apply_profile() picks up the new env (BackendManager rebuilds
+    the backend on every reload).
+    """
+    base = os.environ.get("QWEN3_MODEL_BASE", "/opt/models/qwen3-tts")
+    return {
+        "base": base,
+        "sherpa_dir": os.environ.get("QWEN3_SHERPA_DIR", os.path.join(base, "onnx")),
+        "model_dir": os.environ.get("QWEN3_MODEL_DIR", os.path.join(base, "onnx")),
+        "talker_engine": os.environ.get(
+            "QWEN3_TALKER_ENGINE",
+            os.path.join(base, "engines", "talker_decode_bf16.engine"),
+        ),
+        "cp_engine": os.environ.get(
+            "QWEN3_CP_ENGINE", os.path.join(base, "engines", "cp_bf16.engine")
+        ),
+        "speaker_encoder": os.environ.get(
+            "QWEN3_SPEAKER_ENCODER", os.path.join(base, "onnx", "speaker_encoder.onnx")
+        ),
+        "tokenizer_dir": os.environ.get(
+            "QWEN3_TOKENIZER_DIR", os.path.join(base, "tokenizer")
+        ),
+        "extract_script": os.environ.get(
+            "QWEN3_EXTRACT_SCRIPT", os.path.join(base, "extract_speaker_emb.py")
+        ),
+    }
+
+
 class Qwen3TRTBackend(TTSBackend):
     """Qwen3-TTS via C++ TRT native inference (pybind11 module, models resident)."""
 
@@ -208,6 +242,10 @@ class Qwen3TRTBackend(TTSBackend):
         self._engine = None  # qwen3_speech_engine.Pipeline
         self._tokenizer = None
         self._ready = False
+        # Snapshot artifact paths from the *current* os.environ. BackendManager
+        # rebuilds the backend after each apply_profile() so __init__ always
+        # sees the latest profile-applied env.
+        self._paths = _resolve_qwen3_paths()
 
     @property
     def name(self) -> str:
@@ -217,7 +255,7 @@ class Qwen3TRTBackend(TTSBackend):
     def capabilities(self) -> set[TTSCapability]:
         caps = {TTSCapability.BASIC_TTS, TTSCapability.MULTI_LANGUAGE,
                 TTSCapability.STREAMING}
-        if os.path.exists(QWEN3_SPEAKER_ENCODER):
+        if os.path.exists(self._paths["speaker_encoder"]):
             caps.add(TTSCapability.VOICE_CLONE)
         return caps
 
@@ -275,10 +313,10 @@ class Qwen3TRTBackend(TTSBackend):
 
         # Verify files
         for path, desc in [
-            (QWEN3_TALKER_ENGINE, "talker engine"),
-            (QWEN3_CP_ENGINE, "CP engine"),
-            (os.path.join(_BASE, "engines", "vocoder_fp16.engine"), "vocoder engine"),
-            (os.path.join(QWEN3_SHERPA_DIR, "config.json"), "config.json (authoritative)"),
+            (self._paths["talker_engine"], "talker engine"),
+            (self._paths["cp_engine"], "CP engine"),
+            (os.path.join(self._paths["base"], "engines", "vocoder_fp16.engine"), "vocoder engine"),
+            (os.path.join(self._paths["sherpa_dir"], "config.json"), "config.json (authoritative)"),
         ]:
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Missing {desc}: {path}")
@@ -299,8 +337,8 @@ class Qwen3TRTBackend(TTSBackend):
         try:
             import qwen3_speech_engine
             self._engine = qwen3_speech_engine.Pipeline(
-                QWEN3_MODEL_DIR, QWEN3_SHERPA_DIR,
-                QWEN3_TALKER_ENGINE, QWEN3_CP_ENGINE,
+                self._paths["model_dir"], self._paths["sherpa_dir"],
+                self._paths["talker_engine"], self._paths["cp_engine"],
             )
         finally:
             _stop.set()
@@ -325,8 +363,8 @@ class Qwen3TRTBackend(TTSBackend):
         _meminfo("tts_ready")
 
     def _load_tokenizer(self):
-        vocab_path = os.path.join(QWEN3_TOKENIZER_DIR, "vocab.json")
-        merges_path = os.path.join(QWEN3_TOKENIZER_DIR, "merges.txt")
+        vocab_path = os.path.join(self._paths["tokenizer_dir"], "vocab.json")
+        merges_path = os.path.join(self._paths["tokenizer_dir"], "merges.txt")
         if not os.path.exists(vocab_path):
             raise FileNotFoundError(f"Tokenizer not found: {vocab_path}")
 
@@ -336,7 +374,7 @@ class Qwen3TRTBackend(TTSBackend):
 
         self._tokenizer = Tokenizer(BPE(vocab_path, merges_path))
         self._tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
-        logger.info("Tokenizer loaded from %s", QWEN3_TOKENIZER_DIR)
+        logger.info("Tokenizer loaded from %s", self._paths["tokenizer_dir"])
 
     def _tokenize(self, text: str) -> list[int]:
         if self._tokenizer is None:
@@ -592,9 +630,9 @@ class Qwen3TRTBackend(TTSBackend):
 
         try:
             result = subprocess.run(
-                ["python3", QWEN3_EXTRACT_SCRIPT,
+                ["python3", self._paths["extract_script"],
                  "--audio", wav_path,
-                 "--model", QWEN3_SPEAKER_ENCODER,
+                 "--model", self._paths["speaker_encoder"],
                  "--output", emb_path],
                 capture_output=True, text=True, timeout=30,
             )

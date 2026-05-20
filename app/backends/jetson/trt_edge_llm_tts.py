@@ -28,14 +28,14 @@ from app.core.tts_speakers import resolve_speaker_kwargs
 
 from app.backends.jetson.trt_edge_llm_ipc import (
     TTS_BINARY,
-    TTS_WORKER_BINARY,
-    TTS_CODE2WAV_DIR,
     PLUGIN_PATH,
-    QWEN3_RUNTIME_PROFILE,
     qwen3_highperf_enabled,
+    qwen3_runtime_profile,
     resolve_tts_talker_dir,
     resolve_tts_code_predictor_dir,
     resolve_tts_tokenizer_dir,
+    resolve_tts_code2wav_dir,
+    resolve_tts_worker_binary,
     run_binary,
 )
 
@@ -199,11 +199,19 @@ def _qwen3_speaker_embed_inproc(audio_wav_bytes: bytes, encoder_path: str) -> by
     return emb.tobytes()
 
 
-def _code2wav_engine_path() -> str:
-    """Return the Code2Wav engine path used by current Qwen3 artifact sets."""
+def _code2wav_engine_path(code2wav_dir: str | None = None) -> str:
+    """Return the Code2Wav engine path used by current Qwen3 artifact sets.
+
+    Re-reads env via resolve_tts_code2wav_dir() when no dir is supplied so
+    callers from module scope (no instance state) still respect hot reload.
+    Backend instances should pass their captured ``self._code2wav_dir`` to
+    keep the resolution consistent with what __init__ saw.
+    """
+    if code2wav_dir is None:
+        code2wav_dir = resolve_tts_code2wav_dir()
     candidates = [
-        os.path.join(TTS_CODE2WAV_DIR, "code2wav.engine"),
-        os.path.join(TTS_CODE2WAV_DIR, "code2wav_stateful.engine"),
+        os.path.join(code2wav_dir, "code2wav.engine"),
+        os.path.join(code2wav_dir, "code2wav_stateful.engine"),
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -483,13 +491,15 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         # Capture artifact paths from the *current* env at instance creation
         # time. BackendManager builds a fresh backend after apply_profile()
         # clears the factory cache, so __init__ always sees the latest
-        # profile-applied env. Avoid relying on the module-level
-        # TTS_TALKER_DIR/TTS_CODE_PREDICTOR_DIR/TTS_TOKENIZER_DIR constants
-        # which are frozen at first import — see resolve_tts_*_dir() in
-        # trt_edge_llm_ipc.py.
+        # profile-applied env. Avoid relying on module-level constants in
+        # trt_edge_llm_ipc.py which are frozen at first import — see the
+        # resolve_*() helpers there.
         self._talker_dir = resolve_tts_talker_dir()
         self._code_predictor_dir = resolve_tts_code_predictor_dir()
         self._tokenizer_dir = resolve_tts_tokenizer_dir()
+        self._code2wav_dir = resolve_tts_code2wav_dir()
+        self._worker_binary = resolve_tts_worker_binary()
+        self._qwen3_runtime_profile = qwen3_runtime_profile()
 
     # -- TTSBackend interface ------------------------------------------------
 
@@ -559,7 +569,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
         explicit_talker_engine = os.environ.get("EDGE_LLM_TTS_TALKER_ENGINE")
         required = [
-            (TTS_WORKER_BINARY if self._use_worker() else TTS_BINARY, "TTS binary"),
+            (self._worker_binary if self._use_worker() else TTS_BINARY, "TTS binary"),
             (PLUGIN_PATH, "TRT-Edge-LLM plugin"),
             (os.path.join(self._talker_dir, "config.json"), "talker config"),
             (os.path.join(self._tokenizer_dir, "tokenizer.json"), "tokenizer"),
@@ -578,7 +588,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             )
 
         # Code2Wav is optional (graceful fallback)
-        c2w_path = _code2wav_engine_path()
+        c2w_path = _code2wav_engine_path(self._code2wav_dir)
         if os.path.exists(c2w_path):
             logger.info("Code2Wav engine found at %s", c2w_path)
         else:
@@ -589,8 +599,8 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
         logger.info(
             "TTS backend preload OK (profile=%s binary=%s talker=%s)",
-            QWEN3_RUNTIME_PROFILE,
-            TTS_WORKER_BINARY if self._use_worker() else TTS_BINARY,
+            self._qwen3_runtime_profile,
+            self._worker_binary if self._use_worker() else TTS_BINARY,
             self._talker_dir,
         )
         if self._use_worker():
@@ -698,7 +708,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         if self._worker is not None and self._worker.poll() is None:
             return
         cmd = [
-            TTS_WORKER_BINARY,
+            self._worker_binary,
             "--talkerEngineDir",
             self._talker_dir,
             "--codePredictorEngineDir",
@@ -706,7 +716,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             "--tokenizerDir",
             self._tokenizer_dir,
             "--code2wavEngineDir",
-            TTS_CODE2WAV_DIR,
+            self._code2wav_dir,
         ]
         optional_flags = [
             ("EDGE_LLM_TTS_TALKER_BACKEND", "--qwen3TtsTalkerBackend"),
@@ -1226,9 +1236,9 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             ]
 
             # Add code2wav if engine exists
-            c2w_path = _code2wav_engine_path()
+            c2w_path = _code2wav_engine_path(self._code2wav_dir)
             if os.path.exists(c2w_path):
-                cli_args += ["--code2wavEngineDir", TTS_CODE2WAV_DIR]
+                cli_args += ["--code2wavEngineDir", self._code2wav_dir]
 
             t0 = time.time()
             result = run_binary(TTS_BINARY, cli_args, timeout=120)

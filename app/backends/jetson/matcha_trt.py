@@ -23,7 +23,10 @@ from app.core.tts_speakers import resolve_speaker_kwargs
 
 logger = logging.getLogger(__name__)
 
-# Paths
+# Paths — captured at module import for back-compat read access. Instance
+# code (MatchaTRTBackend.__init__) re-resolves these from os.environ on each
+# construction so a backend created after profile hot-reload sees the new
+# paths. Direct module-level access is kept only for historical introspection.
 _LANGUAGE_MODE = os.environ.get("LANGUAGE_MODE", "zh_en")
 _MODEL_BASE = os.environ.get("MATCHA_MODEL_BASE", "/opt/models/matcha-icefall-zh-en")
 VOCOS_ENGINE = os.environ.get(
@@ -44,6 +47,44 @@ SPLIT_ESTIMATOR_ENGINE = os.environ.get(
 )
 LEXICON_PATH = os.environ.get("LEXICON_PATH", os.path.join(_MODEL_BASE, "lexicon.txt"))
 TOKENS_PATH = os.environ.get("TOKENS_PATH", os.path.join(_MODEL_BASE, "tokens.txt"))
+
+
+def _resolve_matcha_paths() -> dict[str, str]:
+    """Resolve all Matcha artifact paths from the *current* os.environ.
+
+    Called from MatchaTRTBackend.__init__ so each new instance picks up the
+    profile-applied env (BackendManager rebuilds the backend on every
+    apply_profile() — see test_jetson_backends_env_fresh).
+    """
+    model_base = os.environ.get(
+        "MATCHA_MODEL_BASE", "/opt/models/matcha-icefall-zh-en"
+    )
+    return {
+        "language_mode": os.environ.get("LANGUAGE_MODE", "zh_en"),
+        "model_base": model_base,
+        "vocos_engine": os.environ.get(
+            "VOCOS_ENGINE",
+            os.path.join(model_base, "engines", "vocos_fp16.engine"),
+        ),
+        "acoustic_onnx": os.environ.get(
+            "ACOUSTIC_ONNX",
+            os.path.join(model_base, "model-steps-3.onnx"),
+        ),
+        "split_encoder_onnx": os.environ.get(
+            "MATCHA_SPLIT_ENCODER_ONNX",
+            os.path.join(model_base, "onnx", "matcha_encoder_trt.onnx"),
+        ),
+        "split_estimator_engine": os.environ.get(
+            "MATCHA_SPLIT_ESTIMATOR_ENGINE",
+            os.path.join(model_base, "engines", "matcha_estimator_step0_bf16.engine"),
+        ),
+        "lexicon_path": os.environ.get(
+            "LEXICON_PATH", os.path.join(model_base, "lexicon.txt")
+        ),
+        "tokens_path": os.environ.get(
+            "TOKENS_PATH", os.path.join(model_base, "tokens.txt")
+        ),
+    }
 
 # Audio constants
 SAMPLE_RATE = 16000
@@ -154,6 +195,19 @@ class MatchaTRTBackend(TTSBackend):
         self._lexicon = None
         self._token_to_id = None
         self._ready = False
+        # Snapshot artifact paths from the *current* os.environ. BackendManager
+        # rebuilds this backend after every apply_profile(), so __init__ always
+        # sees the latest profile-applied env. See trt_edge_llm_tts.py and
+        # test_jetson_backends_env_fresh for the analogous pattern.
+        paths = _resolve_matcha_paths()
+        self._language_mode = paths["language_mode"]
+        self._model_base = paths["model_base"]
+        self._vocos_engine_path = paths["vocos_engine"]
+        self._acoustic_onnx = paths["acoustic_onnx"]
+        self._split_encoder_onnx = paths["split_encoder_onnx"]
+        self._split_estimator_engine = paths["split_estimator_engine"]
+        self._lexicon_path = paths["lexicon_path"]
+        self._tokens_path = paths["tokens_path"]
 
     @property
     def name(self) -> str:
@@ -286,20 +340,20 @@ class MatchaTRTBackend(TTSBackend):
         if ep_override in ("SPLIT_TRT", "TRT_SPLIT", "HYBRID_TRT"):
             self._acoustic_mode = "split_trt"
             self._ensure_split_onnx()
-            if not os.path.exists(SPLIT_ENCODER_ONNX):
+            if not os.path.exists(self._split_encoder_onnx):
                 raise FileNotFoundError(
-                    f"Split Matcha encoder ONNX not found: {SPLIT_ENCODER_ONNX}. "
+                    f"Split Matcha encoder ONNX not found: {self._split_encoder_onnx}. "
                     "Generate it with scripts/split_matcha_trt.py."
                 )
             sess_opt = ort.SessionOptions()
             sess_opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             self._split_encoder_ort = ort.InferenceSession(
-                SPLIT_ENCODER_ONNX, sess_opt, providers=["CPUExecutionProvider"]
+                self._split_encoder_onnx, sess_opt, providers=["CPUExecutionProvider"]
             )
-            logger.info("Split Matcha encoder ORT loaded: %s", SPLIT_ENCODER_ONNX)
+            logger.info("Split Matcha encoder ORT loaded: %s", self._split_encoder_onnx)
             return
 
-        path = os.path.join(_MODEL_BASE, "model-steps-3.onnx")
+        path = os.path.join(self._model_base, "model-steps-3.onnx")
         if ep_override == "CPU":
             providers = ["CPUExecutionProvider"]
         else:
@@ -316,18 +370,18 @@ class MatchaTRTBackend(TTSBackend):
     def _ensure_split_onnx(self) -> None:
         """Generate fixed-path split ONNX artifacts from the full Matcha model."""
         estimator0 = os.path.join(
-            os.path.dirname(SPLIT_ENCODER_ONNX),
+            os.path.dirname(self._split_encoder_onnx),
             "matcha_estimator_step0_trt.onnx",
         )
-        if os.path.exists(SPLIT_ENCODER_ONNX) and os.path.exists(estimator0):
+        if os.path.exists(self._split_encoder_onnx) and os.path.exists(estimator0):
             return
 
-        full_onnx = os.environ.get("ACOUSTIC_ONNX") or os.path.join(_MODEL_BASE, "model-steps-3.onnx")
+        full_onnx = os.environ.get("ACOUSTIC_ONNX") or os.path.join(self._model_base, "model-steps-3.onnx")
         if not os.path.exists(full_onnx):
             logger.warning("Cannot generate split Matcha ONNX; full model missing: %s", full_onnx)
             return
 
-        out_dir = os.path.dirname(SPLIT_ENCODER_ONNX)
+        out_dir = os.path.dirname(self._split_encoder_onnx)
         os.makedirs(out_dir, exist_ok=True)
         logger.info("Generating split Matcha ONNX at %s from %s", out_dir, full_onnx)
         try:
@@ -343,17 +397,17 @@ class MatchaTRTBackend(TTSBackend):
     def _load_lexicon(self):
         """Load lexicon.txt and tokens.txt."""
         self._lexicon = {}
-        if os.path.exists(LEXICON_PATH):
-            with open(LEXICON_PATH, "r", encoding="utf-8") as f:
+        if os.path.exists(self._lexicon_path):
+            with open(self._lexicon_path, "r", encoding="utf-8") as f:
                 for line in f:
                     parts = line.strip().split()
                     if len(parts) >= 2:
                         self._lexicon[parts[0]] = parts[1:]
-            logger.info("Loaded %d lexicon entries from %s", len(self._lexicon), LEXICON_PATH)
+            logger.info("Loaded %d lexicon entries from %s", len(self._lexicon), self._lexicon_path)
 
         self._token_to_id = {}
-        if os.path.exists(TOKENS_PATH):
-            with open(TOKENS_PATH, "r", encoding="utf-8") as f:
+        if os.path.exists(self._tokens_path):
+            with open(self._tokens_path, "r", encoding="utf-8") as f:
                 for line in f:
                     raw = line.rstrip("\n").rstrip("\r")
                     if not raw:
@@ -368,7 +422,7 @@ class MatchaTRTBackend(TTSBackend):
                     except ValueError:
                         continue
                     self._token_to_id[tok] = tid
-            logger.info("Loaded %d tokens from %s", len(self._token_to_id), TOKENS_PATH)
+            logger.info("Loaded %d tokens from %s", len(self._token_to_id), self._tokens_path)
 
     def _load_engines(self):
         """Load TRT engines FIRST, then initialize CUDA memory pool."""
@@ -385,13 +439,13 @@ class MatchaTRTBackend(TTSBackend):
             return engine
 
         t0 = time.time()
-        self._vocos_engine = load_engine(VOCOS_ENGINE)
+        self._vocos_engine = load_engine(self._vocos_engine_path)
         self._vocos_ctx = self._vocos_engine.create_execution_context()
-        logger.info("Vocos loaded: %s (%.1fs)", VOCOS_ENGINE, time.time() - t0)
+        logger.info("Vocos loaded: %s (%.1fs)", self._vocos_engine_path, time.time() - t0)
 
         if self._acoustic_mode == "split_trt":
             t0 = time.time()
-            base_dir = os.path.dirname(SPLIT_ESTIMATOR_ENGINE)
+            base_dir = os.path.dirname(self._split_estimator_engine)
             self._split_estimator_engines = []
             self._split_estimator_ctxs = []
             names = []

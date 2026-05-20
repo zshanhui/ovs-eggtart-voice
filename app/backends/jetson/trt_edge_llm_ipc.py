@@ -52,8 +52,23 @@ QWEN3_RUNTIME_PROFILE = os.environ.get(
 ).strip().lower().replace("-", "_")
 
 
+def qwen3_runtime_profile() -> str:
+    """Resolve the qwen3 runtime profile (highperf / official / etc.)
+    from the *current* os.environ.
+
+    Mirrors the module-level QWEN3_RUNTIME_PROFILE assignment above. Reading
+    env fresh on each call so hot reload picks up new profile defaults without
+    forcing the whole process to reimport the module.
+    """
+    raw = os.environ.get(
+        "EDGE_LLM_QWEN3_PROFILE",
+        os.environ.get("OVS_QWEN3_PROFILE", "highperf"),
+    )
+    return raw.strip().lower().replace("-", "_")
+
+
 def qwen3_highperf_enabled() -> bool:
-    return QWEN3_RUNTIME_PROFILE in ("highperf", "perf", "performance", "v2v")
+    return qwen3_runtime_profile() in ("highperf", "perf", "performance", "v2v")
 
 
 def _prefer_existing(primary: str, fallback: str) -> str:
@@ -219,6 +234,63 @@ def resolve_tts_tokenizer_dir() -> str:
     if os.path.exists(os.path.join(_TTS_DEFAULT_ROOT, "processed_chat_template.json")):
         return _TTS_DEFAULT_ROOT
     return os.path.expanduser("~/qwen3-tts-trt-edge-llm-export")
+
+
+def resolve_tts_code2wav_dir() -> str:
+    """Resolve the code2wav engine dir from the *current* os.environ.
+
+    Mirrors the module-level TTS_CODE2WAV_DIR resolution at lines 134-142.
+    """
+    explicit = os.environ.get("EDGE_LLM_TTS_CODE2WAV_DIR")
+    if explicit:
+        return explicit
+    return _first_existing_dir(
+        os.path.expanduser("~/qwen3-tts-trt-edge-llm-export/engines/tokenizer_decoder_vocoder100_compat/code2wav"),
+        os.path.expanduser("~/qwen3-tts-trt-edge-llm-export/engines/tokenizer_decoder_vocoder50_compat/code2wav"),
+        os.path.join(_TTS_DEFAULT_ROOT, "engines", "code2wav"),
+        os.path.expanduser("~/qwen3-tts-trt-edge-llm-export/engines/tokenizer_decoder/code2wav"),
+    )
+
+
+def resolve_tts_worker_binary() -> str:
+    """Resolve the TTS worker binary path from the *current* os.environ.
+
+    Mirrors the module-level TTS_WORKER_BINARY resolution at lines 67-73.
+    Hot reload may rewrite EDGE_LLM_TTS_WORKER_BIN; instance state captured
+    at __init__ then becomes stale until the BackendManager rebuilds the
+    backend, but transient resolves still need to honor the new env.
+    """
+    explicit = os.environ.get("EDGE_LLM_TTS_WORKER_BIN")
+    if explicit:
+        return explicit
+    return _prefer_existing(
+        os.path.join(_VOICE_WORKER_BUILD, "qwen3_tts_worker"),
+        os.path.join(_EDGE_LLM_BUILD, "examples/omni/qwen3_tts_worker"),
+    )
+
+
+def resolve_asr_worker_binary() -> str:
+    """Resolve the ASR worker binary path from the *current* os.environ.
+
+    Mirrors the module-level ASR_WORKER_BINARY resolution at lines 78-84.
+    """
+    explicit = os.environ.get("EDGE_LLM_ASR_WORKER_BIN")
+    if explicit:
+        return explicit
+    return _prefer_existing(
+        os.path.join(_VOICE_WORKER_BUILD, "qwen3_asr_worker"),
+        os.path.join(_EDGE_LLM_BUILD, "examples/llm/qwen3_asr_worker"),
+    )
+
+
+def resolve_plugin_path() -> str:
+    """Resolve the TRT-Edge-LLM plugin .so path from the *current* os.environ."""
+    explicit = os.environ.get("EDGELLM_PLUGIN_PATH")
+    if explicit:
+        return explicit
+    return os.path.join(_EDGE_LLM_BUILD, "libNvInfer_edgellm_plugin.so")
+
+
 
 # ASR engine directories
 _ASR_PRUNED_ENGINE_DIR = os.path.expanduser(
