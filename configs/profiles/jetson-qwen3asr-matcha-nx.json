@@ -34,7 +34,13 @@
     "MATCHA_MODEL_BASE": "/opt/models/matcha-icefall-zh-en",
     "MATCHA_ACOUSTIC_EP": "SPLIT_TRT",
     "MATCHA_SPLIT_ENCODER_ONNX": "/opt/models/matcha-icefall-zh-en/onnx/matcha_encoder_trt.onnx",
-    "MATCHA_SPLIT_ESTIMATOR_ENGINE": "/opt/models/matcha-icefall-zh-en/engines/matcha_estimator_step0_bf16.engine"
+    "MATCHA_SPLIT_ESTIMATOR_ENGINE": "/opt/models/matcha-icefall-zh-en/engines/matcha_estimator_step0_bf16.engine",
+    "OVS_TTS_LOW_LATENCY_CJK_MIN_CHARS": "15",
+    "OVS_TTS_LOW_LATENCY_CJK_TARGET_CHARS": "24",
+    "OVS_TTS_LOW_LATENCY_CJK_MAX_CHARS": "40",
+    "OVS_TTS_LOW_LATENCY_LATIN_MIN_CHARS": "40",
+    "OVS_TTS_LOW_LATENCY_LATIN_TARGET_CHARS": "60",
+    "OVS_TTS_LOW_LATENCY_LATIN_MAX_CHARS": "120"
   },
   "required_engines": [
     {

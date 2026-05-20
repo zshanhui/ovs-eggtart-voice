@@ -10,7 +10,23 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from types import SimpleNamespace
+from types import SimpleNamespace  # noqa: F401 — kept for backwards compat / other call sites
+
+
+class _WSHandle:
+    """Lightweight WS-session handle for BackendManager.register_ws().
+
+    Replaces ``types.SimpleNamespace`` here because Python 3.10's
+    SimpleNamespace lacks ``__weakref__`` (added in 3.11), and
+    BackendManager._ws_handles is a WeakSet. The Jetson image still
+    ships Python 3.10.12, so any handle stored in a WeakSet must be a
+    plain class.
+    """
+    __slots__ = ("websocket", "task", "__weakref__")
+
+    def __init__(self, websocket, task):
+        self.websocket = websocket
+        self.task = task
 from typing import Literal, Optional
 
 logging.basicConfig(
@@ -1105,7 +1121,7 @@ async def asr_stream(
     # subsequent /admin/backend/reload can force-close it (code 1012) and
     # cancel the handler task instead of waiting forever for drain.
     _asr_mgr = _try_asr_manager()
-    _ws_handle = SimpleNamespace(websocket=ws, task=asyncio.current_task())
+    _ws_handle = _WSHandle(websocket=ws, task=asyncio.current_task())
     if _asr_mgr is not None:
         _asr_mgr.register_ws(_ws_handle)
     vad_backend = vad if vad is not None else _default_vad_backend()
@@ -1341,7 +1357,7 @@ async def v2v_stream(ws: WebSocket):
     # the WS (code 1012) instead of letting the connection linger.
     _v2v_asr_mgr = _try_asr_manager()
     _v2v_tts_mgr = _try_tts_manager()
-    _v2v_handle = SimpleNamespace(websocket=ws, task=asyncio.current_task())
+    _v2v_handle = _WSHandle(websocket=ws, task=asyncio.current_task())
     if _v2v_asr_mgr is not None:
         _v2v_asr_mgr.register_ws(_v2v_handle)
     if _v2v_tts_mgr is not None:
@@ -1461,8 +1477,9 @@ async def v2v_stream(ws: WebSocket):
         else:
             tts_buffer = v2v_proto.SentenceBuffer(language=tts_language_norm)
 
-    logger.info("v2v stream opened (asr=%s tts=%s vad=%s)",
-                asr_language or "off", tts_language or "off", vad_backend if asr_language else "off")
+    logger.info("v2v stream opened (asr=%s tts=%s vad=%s spk_id=%s spk_kwargs=%s)",
+                asr_language or "off", tts_language or "off", vad_backend if asr_language else "off",
+                tts_speaker_id, list(tts_speaker_kwargs.keys()) if tts_speaker_kwargs else None)
 
     # ── Stage 3: per-connection state + write serialization ─────────
     send_lock = asyncio.Lock()

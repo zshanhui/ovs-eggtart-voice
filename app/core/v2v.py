@@ -243,9 +243,9 @@ class LowLatencyTTSBuffer:
         lang = (self.language or "").strip().lower()
         cjk = lang in ("zh", "chinese", "ja", "japanese", "ko", "korean")
         prefix = "OVS_TTS_LOW_LATENCY_CJK" if cjk else "OVS_TTS_LOW_LATENCY_LATIN"
-        default_min = int(os.environ.get(f"{prefix}_MIN_CHARS", "8" if cjk else "24"))
-        default_target = int(os.environ.get(f"{prefix}_TARGET_CHARS", "12" if cjk else "48"))
-        default_max = int(os.environ.get(f"{prefix}_MAX_CHARS", "16" if cjk else "80"))
+        default_min = int(os.environ.get(f"{prefix}_MIN_CHARS", "15" if cjk else "24"))
+        default_target = int(os.environ.get(f"{prefix}_TARGET_CHARS", "24" if cjk else "48"))
+        default_max = int(os.environ.get(f"{prefix}_MAX_CHARS", "40" if cjk else "80"))
         if self.min_chars is None:
             self.min_chars = default_min
         if self.target_chars is None:
@@ -307,10 +307,11 @@ class LowLatencyTTSBuffer:
         soft_idx = self._last_break_index(self._buf, soft_breaks, limit=len(self._buf))
         if soft_idx >= 0 and len(self._buf[: soft_idx + 1].strip()) >= self.min_chars:
             return self._take(soft_idx + 1)
-        if soft_idx >= 0 and len(self._buf.strip()) >= self.min_chars:
+        if soft_idx >= 0 and len(self._buf.strip()) >= self.target_chars:
             return self._take(len(self._buf))
 
-        if len(self._buf.strip()) < self.target_chars:
+        length_cut_threshold = self.max_chars if is_cjk else self.target_chars
+        if len(self._buf.strip()) < length_cut_threshold:
             return None
 
         end = self._choose_length_cut(is_cjk=is_cjk)
@@ -340,7 +341,7 @@ class LowLatencyTTSBuffer:
             soft_idx = self._last_break_index(self._buf, "，,、：:", limit=limit)
             if soft_idx >= self.min_chars - 1:
                 return soft_idx + 1
-            return min(len(self._buf), self.target_chars)
+            return limit
 
         window = self._buf[:limit]
         for idx in range(len(window) - 1, self.min_chars - 2, -1):

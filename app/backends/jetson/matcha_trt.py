@@ -52,11 +52,25 @@ HOP_LENGTH = 256
 
 # Model constants
 MAX_MEL_FRAMES = 600
+MIN_MEL_FRAMES = int(os.environ.get("MATCHA_MIN_MEL_FRAMES", "72"))
 MEL_DIM = 80
 ODE_DT = 1.0 / 3.0
 N_ODE_STEPS = 3
 MEL_SIGMA = 5.446792
 MEL_MEAN = -2.9521978
+
+
+def _pad_mel_axis(arr: np.ndarray, min_frames: int = MIN_MEL_FRAMES) -> np.ndarray:
+    """Pad mel-time tensors to the TensorRT profile minimum.
+
+    Current Matcha estimator/vocos engines are built with a 72-frame lower
+    bound. Short CJK chunks can produce fewer frames, so pad on the right and
+    let callers keep the original valid frame count for output trimming.
+    """
+    frames = int(arr.shape[2])
+    if frames >= min_frames:
+        return arr
+    return np.pad(arr, ((0, 0), (0, 0), (0, min_frames - frames)), mode="constant")
 
 
 def _samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
@@ -513,8 +527,11 @@ class MatchaTRTBackend(TTSBackend):
         if mel.shape[2] > MAX_MEL_FRAMES:
             mel = mel[:, :, :MAX_MEL_FRAMES]
             mel_frames = MAX_MEL_FRAMES
+        valid_mel_frames = mel_frames
+        mel = _pad_mel_axis(mel)
+        mel_frames = mel.shape[2]
         mask = None
-        mask_valid = mel_frames
+        mask_valid = valid_mel_frames
 
         def alloc(arr):
             ptr = pool.allocate(arr.nbytes)
@@ -549,8 +566,8 @@ class MatchaTRTBackend(TTSBackend):
         pool.copy_dtoh(d_y_out, out_y)
         vocos_ms = (time.time() - t0) * 1000
 
-        # ISTFT (length matches mel_frames * HOP_LENGTH)
-        audio = _istft(mag[0], out_x[0], out_y[0], length=mel_frames * HOP_LENGTH)
+        # ISTFT runs on the padded engine shape, then trims to real duration.
+        audio = _istft(mag[0], out_x[0], out_y[0], length=valid_mel_frames * HOP_LENGTH)
 
         # No peak normalize — sherpa returns raw ISTFT (offline-tts-impl.cc:88-102 only int16-scales).
         # Clip to int16 range to prevent overflow on rare loud frames.
@@ -635,6 +652,9 @@ class MatchaTRTBackend(TTSBackend):
             z = z[:, :, :MAX_MEL_FRAMES]
 
         valid_frames = int(np.clip(np.rint(mask.sum()), 1, MAX_MEL_FRAMES))
+        mu = _pad_mel_axis(mu)
+        mask = _pad_mel_axis(mask)
+        z = _pad_mel_axis(z)
         for step in range(N_ODE_STEPS):
             feeds = {"z": z, "mu": mu, "mask": mask}
             velocity = self._run_estimator_trt(step, feeds)
