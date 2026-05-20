@@ -373,19 +373,21 @@ async def test_reload_succeeds_when_supports_hot_reload_true():
 
 
 @asynctest
-async def test_reload_kind_mismatch_returns_400():
+async def test_reload_cross_kind_succeeds():
+    """Cross-kind reload should succeed: the factory (registry-dispatched in
+    real code) builds whatever the new profile declares. The manager no longer
+    gates on old_kind != new_kind."""
     mgr = _make_mgr(name="tts")
     await mgr.start()
 
-    # Patch the kind loader on this instance to declare a different tts_backend.
+    # Patch the kind loader to declare a different tts_backend on the new profile.
     original = BackendManager._load_profile_kind
     BackendManager._load_profile_kind = lambda self, ref: {  # type: ignore[assignment]
         "name": ref, "tts_backend": "other", "asr_backend": "fake"
     }
     try:
-        with pytest.raises(HTTPException) as ei:
-            await mgr.reload("p-new")
-        assert ei.value.status_code == 400
+        out = await mgr.reload("p-new")
+        assert out["status"] == "reloaded"
         assert mgr.state == BackendState.READY
     finally:
         BackendManager._load_profile_kind = original  # type: ignore[assignment]

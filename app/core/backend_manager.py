@@ -349,21 +349,10 @@ class BackendManager(Generic[T]):
                         detail={"error": "invalid_profile", "message": str(exc)},
                     ) from exc
 
-                key = f"{self.name}_backend"
-                old_kind = old_profile.get(key)
-                new_kind = new_profile_preview.get(key)
-                # Only enforce when both sides declare it; profiles that omit
-                # the field are treated as compatible (kind unchanged).
-                if old_kind is not None and new_kind is not None and old_kind != new_kind:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "error": "backend_kind_mismatch",
-                            "kind": self.name,
-                            "old": old_kind,
-                            "new": new_kind,
-                        },
-                    )
+                # Note: backend_kind_mismatch gate removed — create_tts_backend /
+                # create_asr_backend dispatch via a registry keyed on the
+                # profile's *_backend field, so self._factory() after
+                # apply_profile() builds the correct new-kind backend.
 
             # 4. Drain ---------------------------------------------------------
             async with self._state_lock:
