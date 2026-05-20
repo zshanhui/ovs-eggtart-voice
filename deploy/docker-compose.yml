@@ -10,7 +10,7 @@
 
 services:
   speech:
-    image: sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.12-highperf
+    image: sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.13-highperf
     build:
       context: ..
       dockerfile: deploy/docker/Dockerfile.jetson

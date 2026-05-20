@@ -60,7 +60,7 @@ After startup, the service listens on `http://device:8621`:
 
 | Target | URL | Compose file | Image |
 |---|---|---|---|
-| Jetson | `http://device:8621` | `deploy/docker-compose.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.12-highperf` |
+| Jetson | `http://device:8621` | `deploy/docker-compose.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.13-highperf` |
 | RK3576 | `http://device:8621` | `deploy/docker-compose.rk.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rk-v1.4-closedloop` |
 | RK3588 | `http://device:8621` | `deploy/docker-compose.radxa.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rk-v1.4-closedloop` |
 | Raspberry Pi | `http://device:8621` | `deploy/docker-compose.rpi.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rpi-v1.0-onnx` |
@@ -103,13 +103,23 @@ OVS_PROFILE=jetson-paraformer-kokoro docker compose -f deploy/docker-compose.yml
 # Qwen3 multilingual ASR/TTS on Jetson Orin NX.
 OVS_PROFILE=jetson-multilang-highperf-nx \
 docker compose -f deploy/docker-compose.yml up -d
+
+# Paraformer RKNN ASR + Matcha RKNN TTS on Rockchip RK3588.
+OVS_PROFILE=rk3588-paraformer-matcha \
+docker compose -f deploy/docker-compose.radxa.yml up -d
+
+# Paraformer RKNN ASR + Matcha RKNN TTS on Rockchip RK3576.
+OVS_PROFILE=rk3576-paraformer-matcha \
+docker compose -f deploy/docker-compose.rk.yml up -d
 ```
 
 `deploy/install.sh --pull --verify` auto-detects Jetson/RK/RPi when run on the
 target device. The Jetson default stays on the lightweight `zh_en` path (Paraformer +
 Matcha) because it is the fastest path to reproduce. Use `jetson-paraformer-kokoro`
 for bilingual ASR with expressive English TTS, `jetson-kokoro-trt` for TTS-only,
-or a `jetson-multilang-*` profile for the Qwen3 TensorRT-EdgeLLM route.
+or a `jetson-multilang-*` profile for the Qwen3 TensorRT-EdgeLLM route. On Rockchip,
+use `rk3588-paraformer-matcha` or `rk3576-paraformer-matcha` for the NPU-accelerated
+Paraformer RKNN ASR with Matcha TTS.
 
 ## Table of Contents
 
@@ -147,7 +157,7 @@ or a `jetson-multilang-*` profile for the Qwen3 TensorRT-EdgeLLM route.
 │                                                           │
 │  FastAPI service (container :8000; host default :8621)     │
 │  ├── WS /asr/stream    Streaming ASR                      │
-│  │     └─ zh_en: Paraformer  │  en: Zipformer  │  multi: Qwen3-ASR │
+│  │     └─ zh_en: Paraformer  │  en: Zipformer  │  multi: Qwen3-ASR  │  rk: Paraformer RKNN · Qwen3-ASR │
 │  ├── POST /asr          SenseVoice offline ASR (zh+en)    │
 │  ├── POST /tts          Batch TTS                         │
 │  └── POST /tts/stream   Streaming TTS                     │
@@ -174,6 +184,7 @@ Models are selected automatically based on `LANGUAGE_MODE`:
 | Backend | Speed control | Pitch shift | Voice clone | Languages | Streaming |
 |---------|--------------|-------------|-------------|-----------|-----------|
 | Sherpa (zh_en/en) | ✅ | ✅ | ❌ | 2 (zh+en) | ✅ |
+| Paraformer RKNN (RK) | ❌ | ❌ | ❌ | 2 (zh+en) | ✅ |
 | Kokoro TRT (Jetson) | ❌ | ❌ | ❌ | 1 (en) | ✅ |
 | Qwen3 (multilingual) | ❌ | ❌ | ✅ (x-vector) | 52 | ✅ |
 | RKNN (Rockchip) | ✅ | ✅ | ❌ | 2 (zh+en) | ✅ |
@@ -512,7 +523,7 @@ Clone with `--recurse-submodules` to pull `third_party/*`, or run `git submodule
 
 ### Current Container Release
 
-- **Jetson highperf image** — `jetson-v1.12-highperf`, 2.02 GB, with host CUDA/TensorRT libraries mounted from JetPack and models/engines cached in `speech-models`.
+- **Jetson highperf image** — `jetson-v1.13-highperf`, 2.02 GB, with host CUDA/TensorRT libraries mounted from JetPack and models/engines cached in `speech-models`. Ships the BackendManager hot-reload state machine (`POST /admin/backend/reload`, `GET /admin/backend/status`) for live profile swaps without container recreate. Image tags follow `jetson-v<MAJOR>.<MINOR>-<variant>` and are immutable once published; each release bumps the version and READMEs/compose files reference it explicitly so production upgrades require a deliberate commit rather than a floating tag.
 - **RK release image** — `rk-v1.4-closedloop`, 767 MB, with runtime-pinned RKNN dependencies and validated hybrid Matcha TTS.
 - **Raspberry Pi image** — `rpi-v1.0-onnx`, 568 MB, CPU-only ONNX path.
 
@@ -522,6 +533,7 @@ resident memory, startup time, and concurrency results.
 ### v2.3
 
 - **Paraformer + Kokoro combined profile** — new `jetson-paraformer-kokoro` profile pairs bilingual Paraformer ASR with Kokoro TensorRT TTS (53 English speakers) on Jetson Orin.
+- **Paraformer RKNN on Rockchip** — NPU-accelerated Paraformer ASR via RKNN (hybrid encoder on NPU + ONNX decoder on CPU) with dedicated `rk3588-paraformer-matcha` and `rk3576-paraformer-matcha` profiles.
 - **Model-scoped speaker registry** — speaker tables are now per-TTS-model; Kokoro exposes all 53 labeled voices (`af_heart`, `bm_george`, `zf_xiaobei`, etc.).
 - **Speaker management API** — `GET /tts/speakers`, `POST /tts/speakers/register`, `DELETE /tts/speakers/{id}` for listing, registering, and deleting speakers.
 - **Profile loader hardening** — operator-set env keys are preserved across profile reloads; stale keys are cleaned on profile switch.
