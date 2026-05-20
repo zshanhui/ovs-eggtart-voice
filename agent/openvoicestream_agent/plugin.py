@@ -93,7 +93,7 @@ class Plugin(ABC):
         """Per-turn LLM prefix-cache stats. data = {"hit_tokens": int, "total_tokens": int}."""
 
     async def on_tts_audio_frame(self, data: dict) -> None:
-        """First TTS audio frame of a turn. data = {"sample_rate": int, "frame_len": int}."""
+        """TTS audio frame. data = {"sample_rate": int, "frame_len": int, "first": bool}."""
 
     async def on_mode_change(self, data: dict) -> None:
         """AppMode switched. data = {"name": str, "display_name": str, "icon": str, "prev": str | None}."""

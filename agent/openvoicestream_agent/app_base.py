@@ -1178,14 +1178,20 @@ class BaseApp:
             # latch, but skip the state flip here too).
             if self._state == ConvState.BARGED_IN:
                 return
+            first_frame = False
             if not self._first_tts_seen:
                 self._first_tts_seen = True
+                first_frame = True
                 self.audio.set_output_sample_rate(evt.sample_rate)
                 self._set_state(ConvState.SPEAKING)
-                await self._broadcast(
-                    "on_tts_audio_frame",
-                    {"sample_rate": evt.sample_rate, "frame_len": len(evt.pcm)},
-                )
+            await self._broadcast(
+                "on_tts_audio_frame",
+                {
+                    "sample_rate": evt.sample_rate,
+                    "frame_len": len(evt.pcm),
+                    "first": first_frame,
+                },
+            )
             await self.audio.play(evt.pcm)
             return
 

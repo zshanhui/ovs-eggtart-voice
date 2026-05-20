@@ -9,6 +9,7 @@ import pytest
 from openvoicestream_agent.app_base import BaseApp
 from openvoicestream_agent.state import ConvState
 from openvoicestream_agent.event_bus import EventBus
+from openvoicestream_agent.slv_client import TTSAudio
 
 
 def _fresh_app() -> BaseApp:
@@ -132,6 +133,41 @@ async def test_barge_in_cancels_llm_turn():
     assert stop_calls == [1]
     assert app._first_tts_seen is False
     assert app._state == ConvState.BARGED_IN
+
+
+@pytest.mark.asyncio
+async def test_tts_audio_broadcasts_every_frame_but_speaks_once():
+    app = _fresh_app()
+    app._first_tts_seen = False
+    broadcasts: list[tuple[str, dict]] = []
+
+    class _Audio:
+        def __init__(self):
+            self.played = []
+            self.sample_rates = []
+
+        def set_output_sample_rate(self, sample_rate):
+            self.sample_rates.append(sample_rate)
+
+        async def play(self, pcm):
+            self.played.append(pcm)
+
+    async def _br(name, data=None):
+        broadcasts.append((name, data))
+
+    app.audio = _Audio()
+    app._broadcast = _br
+
+    await app._dispatch_one(TTSAudio(pcm=b"\x01\x00" * 8, sample_rate=24000))
+    await app._dispatch_one(TTSAudio(pcm=b"\x02\x00" * 4, sample_rate=24000))
+
+    frames = [data for name, data in broadcasts if name == "on_tts_audio_frame"]
+    assert frames == [
+        {"sample_rate": 24000, "frame_len": 16, "first": True},
+        {"sample_rate": 24000, "frame_len": 8, "first": False},
+    ]
+    assert app.audio.sample_rates == [24000]
+    assert len(app.audio.played) == 2
 
 
 @pytest.mark.asyncio
