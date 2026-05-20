@@ -242,6 +242,7 @@ class KokoroTRTBackend(TTSBackend):
         self._output_name = None
         self._hybrid_fixed_seq_len: int | None = None
         self._hybrid_max_seq_len: int | None = None
+        self._hybrid_min_seq_len: int | None = None
         self._ready = False
         # Snapshot artifact paths from the *current* env at construction.
         # BackendManager rebuilds the backend after each apply_profile() so
@@ -394,6 +395,7 @@ class KokoroTRTBackend(TTSBackend):
             self._output_name = None
             self._hybrid_fixed_seq_len = None
             self._hybrid_max_seq_len = None
+            self._hybrid_min_seq_len = None
             self._ready = False
 
     def preload(self) -> None:
@@ -595,9 +597,11 @@ class KokoroTRTBackend(TTSBackend):
             min_shape, _opt_shape, max_shape = engine.get_tensor_profile_shape("tokens", 0)
             min_seq = int(tuple(min_shape)[1])
             max_seq = int(tuple(max_shape)[1])
+            self._hybrid_min_seq_len = min_seq
             self._hybrid_max_seq_len = max_seq
             self._hybrid_fixed_seq_len = max_seq if min_seq == max_seq else None
         except Exception:
+            self._hybrid_min_seq_len = None
             self._hybrid_fixed_seq_len = None
             self._hybrid_max_seq_len = int(os.environ.get("KOKORO_SPLIT_MAX_SEQ_LEN", "128"))
 
@@ -607,10 +611,12 @@ class KokoroTRTBackend(TTSBackend):
             min_shape, _opt_shape, max_shape = self._engine.get_tensor_profile_shape("tokens", 0)
             min_seq = int(tuple(min_shape)[1])
             max_seq = int(tuple(max_shape)[1])
+            self._hybrid_min_seq_len = min_seq
             self._hybrid_max_seq_len = max_seq
             self._hybrid_fixed_seq_len = max_seq if min_seq == max_seq else None
         except Exception:
             fixed = int(os.environ.get("KOKORO_HYBRID_TOKEN_LEN", "0"))
+            self._hybrid_min_seq_len = None
             self._hybrid_fixed_seq_len = fixed or None
             self._hybrid_max_seq_len = fixed or int(os.environ.get("KOKORO_HYBRID_MAX_SEQ_LEN", "128"))
 
@@ -722,8 +728,16 @@ class KokoroTRTBackend(TTSBackend):
         truncated = len(token_ids) > max_tokens
         token_ids = token_ids[:max_tokens]
         ids = [0, *token_ids, 0]
-        if self._runtime_mode in ("hybrid", "split_generator") and self._hybrid_fixed_seq_len:
-            ids = ids + [0] * max(0, self._hybrid_fixed_seq_len - len(ids))
+        # Padding policy:
+        #   1) Fixed-shape engine -> pad to fixed len (legacy behavior)
+        #   2) Dynamic engine with known min -> pad up to min if below
+        #      (defensive: avoids triggering the CPU ORT fallback below which
+        #      leaks an untracked ORT session per short input).
+        if self._runtime_mode in ("hybrid", "split_generator"):
+            if self._hybrid_fixed_seq_len:
+                ids = ids + [0] * max(0, self._hybrid_fixed_seq_len - len(ids))
+            elif self._hybrid_min_seq_len and len(ids) < self._hybrid_min_seq_len:
+                ids = ids + [0] * (self._hybrid_min_seq_len - len(ids))
         input_ids = np.array([ids], dtype=np.int64)
         style = self._load_style(sid, len(token_ids))
         speed_arr = np.array([spd], dtype=np.float32)
