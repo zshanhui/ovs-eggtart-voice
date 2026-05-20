@@ -43,3 +43,6 @@ tests/asr_real_wav_eval/librispeech/
 # TRT engine files (binary, built per-device)
 artifacts/engines/
 artifacts/onnx/
+
+# Local Claude Code session state (settings, worktrees, lock files)
+.claude/
