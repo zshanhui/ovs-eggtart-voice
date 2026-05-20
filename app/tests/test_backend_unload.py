@@ -45,7 +45,7 @@ _FLAG_TABLE = [
     ("app.backends.cpu.sherpa",              "SherpaBackend",        True),
     ("app.backends.cpu.sherpa_asr",          "SherpaASRBackend",     True),
     ("app.backends.jetson.kokoro_trt",       "KokoroTRTBackend",     False),
-    ("app.backends.jetson.matcha_trt",       "MatchaTRTBackend",     False),
+    ("app.backends.jetson.matcha_trt",       "MatchaTRTBackend",     True),
     ("app.backends.jetson.qwen3_trt",        "Qwen3TRTBackend",      False),
     ("app.backends.rk.tts",                  "RKTTSBackend",         False),
     ("app.backends.rk.asr",                  "RKASRBackend",         False),
