@@ -371,6 +371,7 @@ class BackendManager(Generic[T]):
                 self._state = BackendState.RELOADING
             self._current = None
 
+            new_backend: T | None = None
             try:
                 try:
                     self._unloader(old_backend)
@@ -414,6 +415,20 @@ class BackendManager(Generic[T]):
 
             except Exception as exc:
                 logger.exception("BackendManager[%s] reload failed; rolling back", self.name)
+                # Unload the partially-constructed NEW backend so the factory's
+                # module-level cache (main.py _asr_backend / _tts_service_mod._backend)
+                # is cleared. Without this, the rollback's self._factory() returns the
+                # broken cached instance whose _config snapshot still points at the
+                # NEW profile's (missing) artifact paths. See memory:
+                # backend_manager_rollback_env_pollution for the orin-nano repro.
+                if new_backend is not None:
+                    try:
+                        self._unloader(new_backend)
+                    except Exception:
+                        logger.exception(
+                            "BackendManager[%s] failed-new-backend unload raised; continuing",
+                            self.name,
+                        )
                 # --- rollback to old profile + fresh factory ----------------
                 try:
                     if profile_ref is not None and old_profile_ref is not None:
