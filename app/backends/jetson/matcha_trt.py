@@ -354,13 +354,12 @@ class MatchaTRTBackend(TTSBackend):
             return
 
         path = os.path.join(self._model_base, "model-steps-3.onnx")
-        if ep_override == "CPU":
-            providers = ["CPUExecutionProvider"]
-        else:
-            providers = [
-                ("CUDAExecutionProvider", {"device_id": 0, "arena_extend_strategy": "kSameAsRequested"}),
-                "CPUExecutionProvider",
-            ]
+        # Full-acoustic ORT path. CUDA EP was removed 2026-05-21 (Codex review):
+        # production profiles all run MATCHA_ACOUSTIC_EP=SPLIT_TRT so the CUDA
+        # branch was dead, and ORT's CUDAExecutionProvider doesn't expose a
+        # clean way to release its allocator across hot reload. CPU-only here
+        # keeps fallback safe; for accelerated inference set SPLIT_TRT.
+        providers = ["CPUExecutionProvider"]
         sess_opt = ort.SessionOptions()
         sess_opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self._acoustic_ort = ort.InferenceSession(path, sess_opt, providers=providers)
