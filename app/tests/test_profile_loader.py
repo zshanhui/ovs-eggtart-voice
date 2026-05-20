@@ -285,6 +285,97 @@ def test_find_missing_artifacts_some_missing(tmp_path):
         assert m["path"].startswith("/")
 
 
+def test_expected_artifact_paths_two_pass_expansion(monkeypatch):
+    """Profile-self-referential ${VAR} must resolve against the profile's
+    own env block, not whatever value (if any) is in the current process env."""
+    # Crucially, do NOT set QWEN3_ARTIFACT_ROOT in os.environ — the profile
+    # defines it itself; the second key references it.
+    monkeypatch.delenv("QWEN3_ARTIFACT_ROOT", raising=False)
+    profile = {
+        "env": {
+            "QWEN3_ARTIFACT_ROOT": "/opt/X",
+            "EDGE_LLM_ASR_ENGINE_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nano/asr",
+        }
+    }
+    out = profile_loader.expected_artifact_paths(profile)
+    assert out["QWEN3_ARTIFACT_ROOT"] == "/opt/X"
+    assert out["EDGE_LLM_ASR_ENGINE_DIR"] == "/opt/X/engines/orin-nano/asr"
+
+
+def test_expected_artifact_paths_profile_overrides_env(monkeypatch):
+    """If both os.environ and the profile define the same key, the profile
+    value wins (otherwise dry-run validates the wrong paths)."""
+    monkeypatch.setenv("QWEN3_ARTIFACT_ROOT", "/wrong/from/env")
+    profile = {
+        "env": {
+            "QWEN3_ARTIFACT_ROOT": "/right/from/profile",
+            "X_DIR": "${QWEN3_ARTIFACT_ROOT}/sub",
+        }
+    }
+    out = profile_loader.expected_artifact_paths(profile)
+    assert out["X_DIR"] == "/right/from/profile/sub"
+
+
+def test_expected_artifact_paths_new_suffixes(monkeypatch):
+    """New path-suffix heuristics added 2026-05-21: _ONNX, _ROOT, _BASE,
+    _VOICES, _TOKENS, _LONG."""
+    monkeypatch.delenv("ANYTHING_ROOT", raising=False)
+    profile = {
+        "env": {
+            "FOO_ONNX": "/m/foo.onnx",
+            "BAR_ROOT": "/r/bar",
+            "BAZ_BASE": "/b/baz",
+            "VOX_VOICES": "/v/voices.bin",
+            "TOK_TOKENS": "/t/tokens.txt",
+            "ENG_LONG": "/e/engine_long.engine",
+            # Non-path _TOKENS value (scalar) should be filtered by startswith("/")
+            "SEG_TOKENS": "64",
+        }
+    }
+    out = profile_loader.expected_artifact_paths(profile)
+    assert out == {
+        "FOO_ONNX": "/m/foo.onnx",
+        "BAR_ROOT": "/r/bar",
+        "BAZ_BASE": "/b/baz",
+        "VOX_VOICES": "/v/voices.bin",
+        "TOK_TOKENS": "/t/tokens.txt",
+        "ENG_LONG": "/e/engine_long.engine",
+    }
+
+
+def test_json_blob_not_treated_as_path(monkeypatch):
+    """_JSON suffix matches both a path and a JSON blob; the startswith("/")
+    filter is the safety net that keeps blobs out of the artifact list."""
+    profile = {
+        "env": {
+            "OVS_TTS_SPEAKERS_JSON": '{"0":"","2301":"2301"}',
+            "MY_CONFIG_JSON": "/etc/cfg.json",
+        }
+    }
+    out = profile_loader.expected_artifact_paths(profile)
+    assert "OVS_TTS_SPEAKERS_JSON" not in out
+    assert out["MY_CONFIG_JSON"] == "/etc/cfg.json"
+
+
+def test_apply_profile_two_pass_expansion_writes_env(tmp_path, monkeypatch):
+    """apply_profile must write the fully-resolved paths into os.environ,
+    using the profile's own env block to resolve self-references."""
+    import os
+
+    monkeypatch.delenv("QWEN3_ARTIFACT_ROOT", raising=False)
+    monkeypatch.delenv("EDGE_LLM_ASR_ENGINE_DIR", raising=False)
+
+    p = _write_profile(tmp_path, "P", {
+        "env": {
+            "QWEN3_ARTIFACT_ROOT": "/opt/X",
+            "EDGE_LLM_ASR_ENGINE_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/asr",
+        }
+    })
+    profile_loader.apply_profile(str(p))
+    assert os.environ["QWEN3_ARTIFACT_ROOT"] == "/opt/X"
+    assert os.environ["EDGE_LLM_ASR_ENGINE_DIR"] == "/opt/X/engines/asr"
+
+
 def test_apply_profile_returns_empty_when_no_ref(monkeypatch):
     """No env hints + no explicit ref → returns {} without touching state."""
     for k in ("OVS_PROFILE_JSON", "OVS_PROFILE", "OVS_PROFILE_DEFAULT",
