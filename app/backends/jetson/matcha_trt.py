@@ -135,6 +135,13 @@ class MatchaTRTBackend(TTSBackend):
     high-compute ODE estimator steps as TensorRT engines.
     """
 
+    # After unload() rework: TRT contexts + engines + ORT sessions + CUDA
+    # stream are all explicitly destroyed in correct order, so VRAM is
+    # actually returned across hot reload. See unload() docstring for the
+    # release sequence and the verification report in memory:
+    # matcha_trt_unload_vram_release (orin-nx N-round swap test).
+    supports_hot_reload: bool = True
+
     def __init__(self):
         self._acoustic_ort = None
         self._split_encoder_ort = None
@@ -168,38 +175,94 @@ class MatchaTRTBackend(TTSBackend):
         return self._ready
 
     def unload(self) -> None:
-        """Best-effort release of TRT engines / ORT sessions / CUDA pool.
+        """Release TRT engines + execution contexts + ORT sessions + CUDA pool.
 
-        PR5: ``supports_hot_reload`` stays False — spike showed <6% RSS drop.
-        Idempotent + early-return; safe to call from BackendManager rollback.
+        Implements correct release ordering so RSS / VRAM is actually returned
+        to the OS, enabling matcha_trt to participate in cross-implementation
+        hot reload. Ordering matters:
+            1. Sync the CUDA stream — pending kernels must finish before we
+               pull TRT contexts out from under them.
+            2. Drop execution contexts BEFORE engines. The TRT engine
+               destructor may skip workspace cleanup if execution contexts
+               are still attached, leaking activation memory.
+            3. Drop engines (each holds hundreds of MB of device weights).
+            4. Drop ORT sessions (release the CUDA EP allocator if used).
+            5. Destroy the CUDA pool (cudaStreamDestroy + free remaining
+               allocations).
+            6. gc.collect() twice — first pass clears acyclic, second pass
+               walks reference cycles. TRT Python bindings produce cycles.
+
+        Idempotent. Safe to call from BackendManager rollback.
         """
-        if not self._ready and self._acoustic_ort is None and self._vocos_engine is None:
+        if (
+            not self._ready
+            and self._acoustic_ort is None
+            and self._split_encoder_ort is None
+            and not self._split_estimator_engines
+            and self._vocos_engine is None
+            and self._cuda_pool is None
+        ):
             return
+
         try:
-            pool = self._cuda_pool
-            if pool is not None:
+            # 1. Sync stream
+            if self._cuda_pool is not None:
                 try:
-                    pool.free_all()
+                    self._cuda_pool.synchronize()
                 except Exception:
-                    logger.exception("Matcha pool.free_all failed; continuing")
+                    logger.exception("Matcha unload: pool.synchronize failed; continuing")
+
+            # 2. Execution contexts before engines
+            for i, ctx in enumerate(self._split_estimator_ctxs):
                 try:
-                    # Drop the CUDA stream handle held by the pool object so
-                    # gc can finalize it.
-                    pool._stream = None  # type: ignore[attr-defined]
+                    del ctx
                 except Exception:
-                    pass
+                    logger.exception("Matcha unload: estimator ctx[%d] del raised", i)
+            self._split_estimator_ctxs = []
+
+            if self._vocos_ctx is not None:
+                try:
+                    del self._vocos_ctx
+                except Exception:
+                    logger.exception("Matcha unload: vocos ctx del raised")
+                self._vocos_ctx = None
+
+            # 3. Engines
+            for i, eng in enumerate(self._split_estimator_engines):
+                try:
+                    del eng
+                except Exception:
+                    logger.exception("Matcha unload: estimator engine[%d] del raised", i)
+            self._split_estimator_engines = []
+
+            if self._vocos_engine is not None:
+                try:
+                    del self._vocos_engine
+                except Exception:
+                    logger.exception("Matcha unload: vocos engine del raised")
+                self._vocos_engine = None
+
+            # 4. ORT sessions
             self._acoustic_ort = None
             self._split_encoder_ort = None
-            self._split_estimator_engines = []
-            self._split_estimator_ctxs = []
-            self._vocos_engine = None
-            self._vocos_ctx = None
-            self._cuda_pool = None
+
+            # 5. CUDA pool teardown
+            if self._cuda_pool is not None:
+                try:
+                    self._cuda_pool.destroy()
+                except Exception:
+                    logger.exception("Matcha unload: pool.destroy failed; continuing")
+                self._cuda_pool = None
+
+            # 6. Force finalizers
             import gc
             gc.collect()
+            gc.collect()
         except Exception:
-            logger.exception("MatchaTRTBackend.unload failed; continuing")
+            logger.exception("MatchaTRTBackend.unload outer-try failed; continuing")
         finally:
+            self._lexicon = None
+            self._token_to_id = None
             self._ready = False
 
     def preload(self) -> None:
@@ -777,3 +840,22 @@ class CudaMemoryPool:
         """Return stream handle as int for TRT."""
         self._init_cuda()
         return int(self._stream)
+
+    def destroy(self) -> None:
+        """Free remaining allocations and destroy the stream. Idempotent.
+
+        Distinct from free_all() which only frees per-request device buffers
+        and keeps the stream warm for the next request. destroy() is the
+        hot-reload teardown path.
+        """
+        self.free_all()
+        if self._stream is not None:
+            try:
+                from cuda import cudart
+                err = cudart.cudaStreamDestroy(self._stream)
+                if self._cuda_err(err) != cudart.cudaError_t.cudaSuccess:
+                    logger.warning("cudaStreamDestroy returned err=%s", err)
+            except Exception:
+                logger.exception("CudaMemoryPool.destroy stream destroy raised; continuing")
+            self._stream = None
+        self._initialized = False
