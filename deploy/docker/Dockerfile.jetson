@@ -68,7 +68,7 @@ ENV LANGUAGE_MODE=${LANGUAGE_MODE}
 RUN set -eux; \
     case "$LANGUAGE_MODE" in \
       zh_en) echo "OVS_PROFILE_DEFAULT=jetson-zh-en" >> /etc/openvoicestream.env ;; \
-      multilanguage) echo "OVS_PROFILE_DEFAULT=jetson-multilang-highperf" >> /etc/openvoicestream.env ;; \
+      multilanguage) echo "OVS_PROFILE_DEFAULT=jetson-qwen3asr-matcha-nx" >> /etc/openvoicestream.env ;; \
       *) echo "Unknown LANGUAGE_MODE=$LANGUAGE_MODE (expected zh_en|multilanguage)" >&2; exit 1 ;; \
     esac; \
     rm -rf /root/.cache /tmp/*
