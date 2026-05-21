@@ -22,7 +22,7 @@ if [[ -z "${OVS_PROFILE:-}" && -z "${OVS_PROFILE_JSON:-}" ]]; then
         export OVS_PROFILE="jetson-zh-en"
         ;;
       multilanguage)
-        export OVS_PROFILE="jetson-multilang-highperf"
+        export OVS_PROFILE="jetson-qwen3asr-matcha-nx"
         ;;
     esac
   fi

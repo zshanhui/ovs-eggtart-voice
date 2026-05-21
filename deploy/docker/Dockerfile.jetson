@@ -3,9 +3,10 @@
 # OpenVoiceStream — Jetson Orin Nano / NX / AGX (JetPack 6.x, CUDA 12.6, TRT 10.3)
 #
 # Single Python dependency set, selected at runtime by profile:
-#   jetson-zh-en              — Paraformer ASR + Matcha TTS
-#   jetson-multilang-highperf — Qwen3 ASR + Qwen3 TTS high-performance workers
-#   jetson-qwen3asr-matcha    — Qwen3 ASR + Matcha TTS
+#   jetson-zh-en                 — Paraformer ASR + Matcha TTS (zh_en default)
+#   jetson-qwen3asr-matcha-nx    — Qwen3 ASR + Matcha TTS (multilanguage default,
+#                                  runs on Nano 8GB and NX 16GB)
+#   jetson-multilang-highperf    — Qwen3 ASR + Qwen3 TTS heavy preset (NX/AGX only)
 #
 # Build:
 #   docker build -f deploy/docker/Dockerfile.jetson \

@@ -14,8 +14,11 @@ model sources over checked-in binary blobs.
 
 Validated image:
 
-- `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.12-highperf`
-- Profile used for the 2026-05-17 release gate: `jetson-multilang-highperf`
+- `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.14-hotswap` — current
+- Profile used for the 2026-05-21 release gate: `jetson-qwen3asr-matcha-nx` (default
+  multilanguage preset) and `jetson-multilang-highperf` (heavy preset)
+- Hot-reload support across `kokoro_trt ↔ matcha_trt ↔ trt_edge_llm` (orin-nano + orin-nx verified)
+- Previously validated: `jetson-v1.12-highperf` (2026-05-17 gate, kept on registry for rollback)
 
 The lightweight Jetson `zh_en` path still downloads official sherpa-onnx /
 Matcha assets at first boot and does not require Qwen3 artifacts.
@@ -31,7 +34,9 @@ Matcha assets at first boot and does not require Qwen3 artifacts.
 Validated artifact:
 
 - `models/kokoro-multi-lang-v1_0/engines/sm87-trt10.3-jp6.2-cuda12.6.tar.gz`
-- SHA-256: `4e6e11099624e9900807851c8721fdd61179d0a6a3ebf9132a82765da199c0cb`
+- SHA-256: `d0eceb74ecda55f3314d8fc451e7fd3d7d40e5f67100b48b4e7bf9a4684db0c8` (2026-05-21
+  rebuild with `MIN_T=4` covering all short inputs; replaces earlier
+  `4e6e1109…c0cb` which had `MIN_T=64` and forced CPU ORT fallback on <64-token inputs)
 
 ## Rockchip RK3576/RK3588 Artifacts
 

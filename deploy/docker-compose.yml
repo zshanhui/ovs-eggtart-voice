@@ -6,11 +6,13 @@
 #
 # Models auto-download on first start (~1-2 min) and persist in a Docker volume.
 # Set LANGUAGE_MODE to "zh_en" (default, Chinese+English), "en" (English only),
-# or OVS_PROFILE=jetson-multilang-highperf for Qwen3 ASR/TTS.
+# or LANGUAGE_MODE=multilanguage for Qwen3 ASR + Matcha TTS (default multilang
+# preset, runs on Orin Nano 8GB and Orin NX 16GB). Set OVS_PROFILE=jetson-multilang-highperf
+# explicitly for the heavier Qwen3 ASR + Qwen3 TTS combination (NX/AGX only).
 
 services:
   speech:
-    image: sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.13-highperf
+    image: sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.14-hotswap
     build:
       context: ..
       dockerfile: deploy/docker/Dockerfile.jetson
