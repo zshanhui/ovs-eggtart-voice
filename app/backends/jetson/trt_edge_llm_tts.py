@@ -410,6 +410,25 @@ def _wav_duration_and_samples(wav_bytes: bytes) -> tuple[float, int]:
     return (samples / rate if rate > 0 else 0.0), samples
 
 
+def _event_request_id(event: dict) -> str | None:
+    """Return the request id of a worker stdout event.
+
+    Phase 1 of the TTS worker concurrency spec (docs/specs/tts-worker-concurrency.md)
+    adds a ``request_id`` field to every stdout event while keeping the legacy
+    ``id`` field as an alias for back-compat. Callers that need to demux
+    events back to a request (or just defensively verify the worker's
+    response belongs to the request they issued) should read the id through
+    this helper rather than indexing ``event["id"]`` directly. At N=1 with
+    ``_worker_lock`` the demux is implicit, so this is informational today;
+    it becomes load-bearing once the Phase 2/3 reader thread lands.
+    """
+    rid = event.get("request_id")
+    if rid:
+        return rid
+    rid = event.get("id")
+    return rid if rid else None
+
+
 def _pcm16_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
     """Wrap raw mono int16 little-endian PCM in a minimal WAV container."""
     buf = io.BytesIO()
@@ -1000,6 +1019,18 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                     self._worker = None
                     raise RuntimeError(f"TTS worker exited during stream: {self._worker_stderr_snip()}")
                 event = json.loads(line)
+                # Forward-compat (TTS worker concurrency Phase 1): the worker
+                # now emits both "request_id" and "id" on every event. With
+                # N=1 + _worker_lock the demux is still implicit, but log
+                # any unexpected id so we catch protocol drift early.
+                event_rid = _event_request_id(event)
+                if event_rid is not None and event_rid != req_id and event_rid != "__worker__":
+                    logger.debug(
+                        "TTS worker event id mismatch: expected=%s got=%s event=%s",
+                        req_id,
+                        event_rid,
+                        event.get("event"),
+                    )
                 if not event.get("ok"):
                     raise RuntimeError(f"TTS streaming worker failed: {event}")
                 if event.get("event") == "chunk":
