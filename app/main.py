@@ -270,20 +270,21 @@ def _get_tts_stream_executor() -> ThreadPoolExecutor:
         # picks it up) but its only practical effect today is making the
         # cold-start eager-init less of a spike when the cap eventually
         # rises.
-        # Phase B stability gate landed: C1 (codecHiddensBuffer per-request)
-        # + C5 (Code2Wav worker mutex) + worker-side runtime mutex (fork
-        # commit 718b233) make N=2 stable — no CUDA crashes, audio MD5
-        # byte-identical at N=1. However throughput is currently
-        # SERIALIZED at the runtime layer because the broad mutex around
-        # handleAudioGeneration() prevents real parallelism. Default
-        # stays at 1 until Phase B C2/C3 lands (per-call locals for the
-        # ~14 racing runtime scratch tensors, see
-        # docs/specs/tts-n2-phase-b-patches.md §1). Set
-        # OVS_TTS_STREAM_MAX_WORKERS=2 to opt into N=2 with the current
-        # stability-without-throughput tradeoff (slow-client TTFA ≈
-        # 2-4× single-client baseline).
+        # Phase B C1+C2+C3+C5 landed (fork commits e1abd90, fff8a38,
+        # 99cf14a) — per-request locals for the talker + CP scratch
+        # tensors plus C5 Code2Wav worker mutex. Real N=2 throughput
+        # IS achievable on Orin NX: empirically 1.3-1.5× single-client
+        # TTFA on the first N=2 request-pair after restart (within the
+        # ≤ 1.5× spec gate). Audio MD5 byte-identical baseline at N=1.
+        # Caveat: sustained N=2 (3+ consecutive bursts) still shows
+        # cumulative state corruption from residual shared state
+        # (mSamplingWorkspace and/or TRT context sharing inside the
+        # CodePredictor engine slot pool, not yet traced). Default
+        # max_workers=2 lets the optimization apply; if you observe
+        # CUDA errors in production, set OVS_TTS_STREAM_MAX_WORKERS=1
+        # to fall back to the C5b runtime-mutex stability gate.
         _tts_stream_executor = ThreadPoolExecutor(
-            max_workers=int(os.environ.get("OVS_TTS_STREAM_MAX_WORKERS", "1")),
+            max_workers=int(os.environ.get("OVS_TTS_STREAM_MAX_WORKERS", "2")),
             thread_name_prefix="tts-stream",
         )
     return _tts_stream_executor
