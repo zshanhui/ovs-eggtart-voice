@@ -549,12 +549,37 @@ class _WorkerIO:
                 if event.get("event") == "_worker_exit":
                     raise WorkerExitError("TTS worker died mid-request")
                 yield event
-                if event.get("event") == "done":
+                if event.get("event") in ("done", "cancelled"):
                     return
         finally:
             with self._inflight_lock:
                 self._inflight.pop(req_id, None)
             self._sem.release()
+
+    def cancel(self, req_id: str) -> None:
+        """Best-effort cancel for an in-flight request.
+
+        Writes a cancel JSON to the worker's stdin. The worker will check
+        its per-request atomic flag at the next chunk boundary and emit
+        a ``{"event":"cancelled", ...}`` terminal event in lieu of ``done``.
+
+        Safe to call from any thread. Safe to call after the request has
+        naturally completed (worker silently drops unknown cancels).
+        """
+        try:
+            assert self._proc.stdin is not None
+            with self._stdin_lock:
+                self._proc.stdin.write(
+                    json.dumps({"type": "cancel", "id": req_id}) + "\n"
+                )
+                self._proc.stdin.flush()
+        except Exception:
+            # Worker may have already exited; the reader-loop sentinel
+            # will surface that via WorkerExitError on the next q.get().
+            logger.debug(
+                "cancel() write failed; worker may be exiting",
+                exc_info=True,
+            )
 
     def _reader_loop(self) -> None:
         """Drain worker stdout, dispatching events to per-request queues."""
@@ -1178,6 +1203,16 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                         event_rid,
                         event.get("event"),
                     )
+                # Cooperative cancel: terminal "cancelled" event has ok:true
+                # per spec §4.1; check it BEFORE the ok-flag gate so it
+                # never surfaces as a RuntimeError.
+                if event.get("event") == "cancelled":
+                    logger.info(
+                        "TTS worker acknowledged cancel for %s (reason=%s)",
+                        req_id,
+                        event.get("reason"),
+                    )
+                    return
                 if not event.get("ok"):
                     raise RuntimeError(f"TTS streaming worker failed: {event}")
                 if event.get("event") == "chunk":
@@ -1217,6 +1252,21 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                                 f"stateful stream returned 0 chunks for request {req_id}"
                             )
                     break
+        except GeneratorExit:
+            # Consumer abandoned us mid-stream (HTTP client disconnect /
+            # caller broke out of the for loop). Notify the worker so its
+            # CUDA context doesn't get poisoned by partial cleanup — see
+            # docs/specs/tts-worker-cancel-protocol.md §1.
+            logger.info(
+                "generator exit during TTS stream; cancelling worker for %s",
+                req_id,
+            )
+            try:
+                worker_io.cancel(req_id)
+            except Exception:
+                logger.debug("worker_io.cancel() failed during GeneratorExit",
+                             exc_info=True)
+            raise
         except WorkerExitError as exc:
             self._worker = None
             self._worker_io = None
