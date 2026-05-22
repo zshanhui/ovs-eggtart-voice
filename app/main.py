@@ -556,6 +556,15 @@ async def health():
         "tts_capabilities": [c.value for c in tts_service.capabilities()] if tts_service.is_ready() else [],
     }
 
+    # Part D disconnect-watcher instrumentation: expose _WorkerIO cancel
+    # counter so stress harness can read it. Temporary; remove once stable.
+    try:
+        from app.backends.jetson.trt_edge_llm_tts import _WorkerIO
+        with _WorkerIO._cancel_count_lock:
+            result["tts_worker_cancel_count"] = _WorkerIO._cancel_count
+    except Exception:
+        pass
+
     # ASR
     try:
         from app.core.asr_backend import create_asr_backend
@@ -792,26 +801,99 @@ async def tts_stream(req: TTSRequest, request: Request):
             sr = backend.sample_rate
 
             async def stream():
+                # Part D disconnect watcher (spec §3): Starlette cancellation
+                # does not reliably close the inner sync generator running in
+                # _tts_stream_executor — so poll request.is_disconnected()
+                # every 100 ms and explicitly close the generator on
+                # disconnect. The for-loop break path in _run calls .close()
+                # on the wrapped generator, which raises GeneratorExit into
+                # _generate_streaming_single() and triggers
+                # _WorkerIO.cancel(req_id) (trt_edge_llm_tts.py:1255-1269).
+                import threading as _threading
+                cancel_flag = _threading.Event()
+                gen_holder: list = [None]
+                gen_lock = _threading.Lock()
+                watcher_task: asyncio.Task | None = None
+
+                async def _disconnect_watcher():
+                    # Directly drain the ASGI receive channel; Starlette's
+                    # is_disconnected() uses a tight cancel-scope that often
+                    # misses uvicorn's http.disconnect events under
+                    # StreamingResponse on Python 3.10. Blocking on raw
+                    # request.receive() is reliable: uvicorn pushes
+                    # http.disconnect there as soon as the socket closes.
+                    logger.info("tts/stream: disconnect watcher started")
+                    try:
+                        while not cancel_flag.is_set():
+                            try:
+                                message = await request.receive()
+                            except Exception:
+                                logger.debug(
+                                    "disconnect watcher receive() failed",
+                                    exc_info=True,
+                                )
+                                return
+                            if message.get("type") == "http.disconnect":
+                                cancel_flag.set()
+                                with gen_lock:
+                                    g = gen_holder[0]
+                                if g is not None:
+                                    try:
+                                        g.close()
+                                    except Exception:
+                                        logger.debug(
+                                            "disconnect watcher gen.close() raised",
+                                            exc_info=True,
+                                        )
+                                logger.info(
+                                    "tts/stream: client disconnected — cancel flag raised"
+                                )
+                                return
+                    except asyncio.CancelledError:
+                        pass
+
                 try:
                     async with get_coordinator().acquire("tts"):
                         yield struct.pack("<I", sr)
                         if not sentences:
                             return
                         loop = asyncio.get_event_loop()
+                        watcher_task = asyncio.create_task(_disconnect_watcher())
                         for sentence in sentences:
+                            if cancel_flag.is_set():
+                                break
                             queue: asyncio.Queue[bytes | None] = asyncio.Queue()
 
                             def _run(text=sentence):
+                                gen = None
                                 try:
-                                    for chunk in backend.generate_streaming(
+                                    gen = backend.generate_streaming(
                                         text,
                                         language=req.language,
                                         **voice_kwargs,
-                                    ):
+                                    )
+                                    with gen_lock:
+                                        gen_holder[0] = gen
+                                    for chunk in gen:
+                                        if cancel_flag.is_set():
+                                            break
                                         loop.call_soon_threadsafe(queue.put_nowait, chunk)
                                 except Exception:
                                     logger.exception("tts/stream synthesis failed for sentence=%r", text)
                                 finally:
+                                    # Explicit close → triggers GeneratorExit
+                                    # in _generate_streaming_single, which
+                                    # calls worker_io.cancel(req_id).
+                                    if gen is not None:
+                                        try:
+                                            gen.close()
+                                        except Exception:
+                                            logger.debug(
+                                                "gen.close() in _run raised",
+                                                exc_info=True,
+                                            )
+                                    with gen_lock:
+                                        gen_holder[0] = None
                                     loop.call_soon_threadsafe(queue.put_nowait, None)
 
                             loop.run_in_executor(_get_tts_stream_executor(), _run)
@@ -821,6 +903,12 @@ async def tts_stream(req: TTSRequest, request: Request):
                                     break
                                 yield chunk
                 finally:
+                    if watcher_task is not None:
+                        watcher_task.cancel()
+                        try:
+                            await watcher_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
                     await acquire_cm.__aexit__(None, None, None)
 
             return StreamingResponse(stream(), media_type="application/octet-stream")
@@ -843,32 +931,97 @@ async def tts_stream(req: TTSRequest, request: Request):
         return StreamingResponse(empty(), media_type="application/octet-stream")
 
     async def stream_legacy():
-        async with get_coordinator().acquire("tts"):
-            yield struct.pack("<I", sr)
-            loop = asyncio.get_event_loop()
-            for sentence in sentences:
-                queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        # Part D disconnect watcher — mirrors the manager-branch logic above.
+        import threading as _threading
+        cancel_flag = _threading.Event()
+        gen_holder: list = [None]
+        gen_lock = _threading.Lock()
+        watcher_task: asyncio.Task | None = None
 
-                def _run(text=sentence):
+        async def _disconnect_watcher():
+            logger.info("tts/stream (legacy): disconnect watcher started")
+            try:
+                while not cancel_flag.is_set():
                     try:
-                        for chunk in backend.generate_streaming(
-                            text,
-                            language=req.language,
-                            **voice_kwargs,
-                        ):
-                            loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                        message = await request.receive()
                     except Exception:
-                        logger.exception("tts/stream synthesis failed for sentence=%r", text)
-                    finally:
-                        loop.call_soon_threadsafe(queue.put_nowait, None)
+                        logger.debug(
+                            "legacy disconnect watcher receive() failed",
+                            exc_info=True,
+                        )
+                        return
+                    if message.get("type") == "http.disconnect":
+                        cancel_flag.set()
+                        with gen_lock:
+                            g = gen_holder[0]
+                        if g is not None:
+                            try:
+                                g.close()
+                            except Exception:
+                                logger.debug(
+                                    "legacy disconnect watcher gen.close() raised",
+                                    exc_info=True,
+                                )
+                        logger.info(
+                            "tts/stream (legacy): client disconnected — cancel flag raised"
+                        )
+                        return
+            except asyncio.CancelledError:
+                pass
 
-                loop.run_in_executor(_get_tts_stream_executor(), _run)
-
-                while True:
-                    chunk = await queue.get()
-                    if chunk is None:
+        try:
+            async with get_coordinator().acquire("tts"):
+                yield struct.pack("<I", sr)
+                loop = asyncio.get_event_loop()
+                watcher_task = asyncio.create_task(_disconnect_watcher())
+                for sentence in sentences:
+                    if cancel_flag.is_set():
                         break
-                    yield chunk
+                    queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+                    def _run(text=sentence):
+                        gen = None
+                        try:
+                            gen = backend.generate_streaming(
+                                text,
+                                language=req.language,
+                                **voice_kwargs,
+                            )
+                            with gen_lock:
+                                gen_holder[0] = gen
+                            for chunk in gen:
+                                if cancel_flag.is_set():
+                                    break
+                                loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                        except Exception:
+                            logger.exception("tts/stream synthesis failed for sentence=%r", text)
+                        finally:
+                            if gen is not None:
+                                try:
+                                    gen.close()
+                                except Exception:
+                                    logger.debug(
+                                        "legacy gen.close() in _run raised",
+                                        exc_info=True,
+                                    )
+                            with gen_lock:
+                                gen_holder[0] = None
+                            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+                    loop.run_in_executor(_get_tts_stream_executor(), _run)
+
+                    while True:
+                        chunk = await queue.get()
+                        if chunk is None:
+                            break
+                        yield chunk
+        finally:
+            if watcher_task is not None:
+                watcher_task.cancel()
+                try:
+                    await watcher_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     return StreamingResponse(stream_legacy(), media_type="application/octet-stream")
 

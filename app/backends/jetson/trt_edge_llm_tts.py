@@ -503,6 +503,14 @@ class _WorkerIO:
     ``_ensure_worker`` / ``_restart_worker``).
     """
 
+    # Class-level temporary instrumentation for Part D disconnect-watcher
+    # validation (spec docs/specs/tts-n2-throughput.md §3). Counts every
+    # cancel() invocation across all _WorkerIO instances since process
+    # start. Surfaced via the /health endpoint and via debug log. Remove
+    # once Part D is validated and stable.
+    _cancel_count: int = 0
+    _cancel_count_lock = threading.Lock()
+
     def __init__(self, proc: subprocess.Popen, concurrency: int):
         self._proc = proc
         self._stdin_lock = threading.Lock()
@@ -566,6 +574,14 @@ class _WorkerIO:
         Safe to call from any thread. Safe to call after the request has
         naturally completed (worker silently drops unknown cancels).
         """
+        with _WorkerIO._cancel_count_lock:
+            _WorkerIO._cancel_count += 1
+            count_snapshot = _WorkerIO._cancel_count
+        logger.info(
+            "_WorkerIO.cancel: req_id=%s total_cancel_count=%d",
+            req_id,
+            count_snapshot,
+        )
         try:
             assert self._proc.stdin is not None
             with self._stdin_lock:
