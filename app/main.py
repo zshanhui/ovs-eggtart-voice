@@ -1803,6 +1803,21 @@ async def v2v_stream(ws: WebSocket):
         while not state["client_closed"]:
             # Exit when client said flush and the queue is drained.
             if state["tts_flush"] and tts_q.empty():
+                # Multi-utterance: per-turn flush ends one turn but not
+                # the SESSION. Reset the sticky flag, emit a per-turn
+                # tts_done (session_complete=False mirroring ASR's
+                # mid-session final at :1763-1779), then loop back to
+                # wait for the next turn. Without this the task returns
+                # after round 1 → asyncio.gather() unblocks → WS closes,
+                # which is the "TTS stuck after round 1" bug.
+                if multi_utterance and not state.get("asr_session_closed", False):
+                    state["tts_flush"] = False
+                    if not state["client_closed"]:
+                        await send_json({
+                            "type": v2v_proto.SERVER_TTS_DONE,
+                            "session_complete": False,
+                        })
+                    continue
                 break
             try:
                 sentence = await asyncio.wait_for(tts_q.get(), timeout=0.2)
@@ -1900,7 +1915,14 @@ async def v2v_stream(ws: WebSocket):
                 state["current_tts_task"] = None
                 state["current_tts_stop"] = None
         if not state["client_closed"]:
-            await send_json({"type": v2v_proto.SERVER_TTS_DONE})
+            # Session-final tts_done. In multi-utterance mode tag it as
+            # session_complete=True so the client can distinguish it from
+            # the per-turn dones emitted above. Single-utterance mode
+            # omits the field for backward compatibility.
+            payload = {"type": v2v_proto.SERVER_TTS_DONE}
+            if multi_utterance:
+                payload["session_complete"] = True
+            await send_json(payload)
 
     # ── Stage 5: orchestrate ────────────────────────────────────────
     # Bug #3 fix: dispatcher loops on ws.receive() forever (only exits
