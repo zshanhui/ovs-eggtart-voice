@@ -228,7 +228,7 @@
       },
       "runtime_contract": {
         "tts_path": "kokoro_hybrid",
-        "closed_loop_validated": false,
+        "closed_loop_validated": true,
         "env": {
           "TTS_BACKEND": "kokoro_rknn",
           "KOKORO_RKNN_MODE": "hybrid",
