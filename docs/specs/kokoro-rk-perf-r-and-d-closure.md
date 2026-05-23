@@ -40,6 +40,7 @@ tokens → misaki G2P → CPU prefix → RKNN decoder-front INT8 → RKNN vocode
 - **P2 Phase 1** per-sentence streaming verification — already worked, added TTFA instrumentation
 - **P2 Phase 2** dynamic bucket router (8/16/32) — landed
 - **P3** full reproduction documentation + HF mirror
+- **P7b (bucket-8 only)** tail-rest ORT static MM+Gemm INT8 — bucket-8 TTFA p50 671 ms (vs P7a 747 ms → -10 %), bucket-16/32 untouched (no perf delta from static at longer sequences). Audio gate PASS (rel_l2 0.020, gate 0.05). Shipped 2026-05-23 as 3-tier env-gated default (static > dynamic > FP32). Bucket-16/32 static QDQ built but not wired (perf-neutral; would only add artifact complexity). Conv/ConvTranspose static QDQ confirmed audio-incompatible on this vocoder (structural NO-GO — see negative findings).
 
 ### Negative findings (NO-GO with evidence)
 
@@ -50,6 +51,7 @@ tokens → misaki G2P → CPU prefix → RKNN decoder-front INT8 → RKNN vocode
 | P2 Phase 3b — bucket-32 chunked tail-rest | Same ConvTranspose CPU-bound constraint as 3a; chunking adds complexity without fixing root cause | dependency on 3a |
 | P4 codex Q4 — decoder-front single-segment extension | RKNN one-graph-one-precision constraint: INT8 full-segment fails audio gate (M4 history rel_l2 0.07-0.41); FP16 full-segment slows decoder-front by 25-35ms vs 10ms dispatch savings → net loss | this doc + codex eval |
 | P7a tail-rest ORT dynamic INT8 (MatMul+Gemm) | Audio gate PASS (worst rel_l2 0.018, gate 0.05); deployed env-gated. But measured TTFA delta ±5% (run-to-run noise) vs spec-projected -15-20%. Tail-rest is Conv-dominated, not MatMul-dominated → wrong target. Shipped as opt-in baseline-equivalent default; future work needs static QDQ with calibration covering Conv ops. | `kokoro-rk-tail-rest-int8.md` |
+| P7b tail-rest static QDQ on **Conv + ConvTranspose** (the spec target) | Universal audio gate FAIL: worst rel_l2 0.42–0.55 (10× over 0.05 gate), uniform across every text and bucket. 1D iSTFT magnitude path is exquisitely sensitive to per-channel activation quantization noise on the upsample Conv stack. Structural blocker — would need quantization-aware fine-tuning or a different vocoder. **Spec's 10-25% TTFA improvement target is not achievable at INT8 with this vocoder architecture.** | `kokoro-rk-tail-rest-int8-static.md` §3 |
 
 ### Parked (low ROI / high risk / quality-not-perf)
 

@@ -238,6 +238,7 @@ HF matches the wsl2-local build-host source (verified 2026-05-23).
 | `kokoro-decoder-front-bucket8.fp16.rknn`                      | `bucket8/kokoro-decoder-front-bucket8.fp16.rknn`                      | `/home/radxa/models/tts/kokoro-bucket-8/rk3588/kokoro-decoder-front-bucket8.fp16.rknn` |
 | `kokoro-vocoder-front-half-bucket8.native.fp16.rknn`          | `bucket8/kokoro-vocoder-front-half-bucket8.native.fp16.rknn`          | `/home/radxa/models/tts/kokoro-bucket-8/rk3588/kokoro-vocoder-front-half-bucket8.native.fp16.rknn` |
 | `kokoro-vocoder-tail-rest-cpu-bucket8.onnx`                   | `bucket8/kokoro-vocoder-tail-rest-cpu-bucket8.onnx`                   | `/home/radxa/models/tts/kokoro-bucket-8/kokoro-vocoder-tail-rest-cpu-bucket8.onnx` |
+| `kokoro-vocoder-tail-rest-cpu-bucket8.int8static.onnx` (P7b — opt-in) | `bucket8/kokoro-vocoder-tail-rest-cpu-bucket8.int8static.onnx`        | `/home/radxa/models/tts/kokoro-bucket-8/kokoro-vocoder-tail-rest-cpu-bucket8.int8static.onnx` |
 | `kokoro-prefix-cpu-bucket16.onnx`                             | `bucket16/kokoro-prefix-cpu-bucket16.onnx`                            | `/home/radxa/models/tts/kokoro-bucket-16/kokoro-prefix-cpu-bucket16.onnx` |
 | `kokoro-decoder-front-bucket16.fp16.rknn`                     | `bucket16/kokoro-decoder-front-bucket16.fp16.rknn`                    | `/home/radxa/models/tts/kokoro-bucket-16/kokoro-decoder-front-bucket16.fp16.rknn` |
 | `kokoro-vocoder-front-half-bucket16.native.fp16.rknn`         | `bucket16/kokoro-vocoder-front-half-bucket16.native.fp16.rknn`        | `/home/radxa/models/tts/kokoro-bucket-16/kokoro-vocoder-front-half-bucket16.native.fp16.rknn` |
@@ -276,6 +277,7 @@ Bucket-8:
   814c558955a8eb6a3f6b95cfc5eab0b9  rk3588/kokoro-decoder-front-bucket8.fp16.rknn
   bcf1d03b3aef869bac66ac98140b40e9  rk3588/kokoro-vocoder-front-half-bucket8.native.fp16.rknn
   9e03458e86a8732ccaeccd7c7b0618f9  kokoro-vocoder-tail-rest-cpu-bucket8.onnx
+  6eff2d5b0f381c3a262844011079ae85  kokoro-vocoder-tail-rest-cpu-bucket8.int8static.onnx  (P7b opt-in static MM+Gemm INT8)
 
 Bucket-16:
   3f85d7f235b1d879c1346075176de71d  kokoro-prefix-cpu-bucket16.onnx
@@ -352,6 +354,8 @@ docker run -d --name openvoicestream-kokoro --restart=unless-stopped \
   `# P7a: opt-in tail-rest INT8 (env-gated; remove these 3 lines to keep FP32):` \
   -e KOKORO_RKNN_TAIL_REST_INT8_PATH=/opt/kokoro-rknn/kokoro-vocoder-tail-rest-cpu.int8.onnx \
   -e KOKORO_RKNN_BUCKET8_TAIL_REST_INT8_PATH=/opt/kokoro-bucket-8/kokoro-vocoder-tail-rest-cpu-bucket8.int8.onnx \
+  # P7b (2026-05-23): bucket-8 static MM+Gemm INT8 — preferred over dynamic INT8 above. Loader auto-falls-back to dynamic INT8 / FP32 if file is missing.
+  -e KOKORO_RKNN_BUCKET8_TAIL_REST_INT8STATIC_PATH=/opt/kokoro-bucket-8/kokoro-vocoder-tail-rest-cpu-bucket8.int8static.onnx \
   -e KOKORO_RKNN_BUCKET16_TAIL_REST_INT8_PATH=/opt/kokoro-bucket-16/kokoro-vocoder-tail-rest-cpu-bucket16.int8.onnx \
   \
   openvoicestream:rk-kokoro-2026-05-23
