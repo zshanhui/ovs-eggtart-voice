@@ -49,6 +49,7 @@ tokens → misaki G2P → CPU prefix → RKNN decoder-front INT8 → RKNN vocode
 | P2 Phase 3a — bucket-8/16 tail-rest on NPU | REGTASK bit-width overflow on bucket-16 (silent zero output); bucket-8 NPU 13% slower than CPU (ConvTranspose unfavorable on RKNPU) | this doc + agent a45ad569b09af4a8b report |
 | P2 Phase 3b — bucket-32 chunked tail-rest | Same ConvTranspose CPU-bound constraint as 3a; chunking adds complexity without fixing root cause | dependency on 3a |
 | P4 codex Q4 — decoder-front single-segment extension | RKNN one-graph-one-precision constraint: INT8 full-segment fails audio gate (M4 history rel_l2 0.07-0.41); FP16 full-segment slows decoder-front by 25-35ms vs 10ms dispatch savings → net loss | this doc + codex eval |
+| P7a tail-rest ORT dynamic INT8 (MatMul+Gemm) | Audio gate PASS (worst rel_l2 0.018, gate 0.05); deployed env-gated. But measured TTFA delta ±5% (run-to-run noise) vs spec-projected -15-20%. Tail-rest is Conv-dominated, not MatMul-dominated → wrong target. Shipped as opt-in baseline-equivalent default; future work needs static QDQ with calibration covering Conv ops. | `kokoro-rk-tail-rest-int8.md` |
 
 ### Parked (low ROI / high risk / quality-not-perf)
 

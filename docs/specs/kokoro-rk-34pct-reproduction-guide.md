@@ -349,17 +349,32 @@ docker run -d --name openvoicestream-kokoro --restart=unless-stopped \
   -e KOKORO_RKNN_BUCKET16_VOCODER_FRONT_PATH=/opt/kokoro-bucket-16/kokoro-vocoder-front-half-bucket16.native.fp16.rknn \
   -e KOKORO_RKNN_BUCKET16_TAIL_REST_PATH=/opt/kokoro-bucket-16/kokoro-vocoder-tail-rest-cpu-bucket16.onnx \
   \
+  `# P7a: opt-in tail-rest INT8 (env-gated; remove these 3 lines to keep FP32):` \
+  -e KOKORO_RKNN_TAIL_REST_INT8_PATH=/opt/kokoro-rknn/kokoro-vocoder-tail-rest-cpu.int8.onnx \
+  -e KOKORO_RKNN_BUCKET8_TAIL_REST_INT8_PATH=/opt/kokoro-bucket-8/kokoro-vocoder-tail-rest-cpu-bucket8.int8.onnx \
+  -e KOKORO_RKNN_BUCKET16_TAIL_REST_INT8_PATH=/opt/kokoro-bucket-16/kokoro-vocoder-tail-rest-cpu-bucket16.int8.onnx \
+  \
   openvoicestream:rk-kokoro-2026-05-23
 ```
 
 Notes:
+- **P7a INT8 (2026-05-23, opt-in default)**: 3 INT8 `.int8.onnx` files mirror
+  the FP32 tail-rest filenames; live in the same directory next to their
+  FP32 sibling. When set + file exists → INT8 loaded. When unset or file
+  missing → automatic FP32 fallback (warning logged). Audio rel_l2 PASS at
+  worst 0.018 (gate 0.05). TTFA neutral (±5 % run-to-run noise vs FP32
+  baseline) — see `kokoro-rk-tail-rest-int8.md` for the full negative
+  perf result; INT8 is shipped because it's safe, not because it's faster.
+  HF mirror under `…/kokoro-hybrid-v1/bucket{8,16,-32}/…int8.onnx`.
 - `KOKORO_RKNN_VOCODER_FRONT_PATH` and `KOKORO_RKNN_TAIL_REST_PATH` are
   **filenames** (resolved against `MODEL_DIR=/opt/kokoro-rknn`).
 - All bucket-8/16 paths are **absolute** to avoid collision with the
   bucket-32 `MODEL_DIR` resolution.
 - The two `/tmp/fixed-*.py` files come from the working hot-patch (md5
   `4961497d910cac5531ceafe35e4f1713` for `tts.py`,
-  `ccc43371ee16465899f57e1ee4ed5a5f` for `kokoro_rknn.py`). If they're
+  `ccc43371ee16465899f57e1ee4ed5a5f` for FP32-only `kokoro_rknn.py`,
+  `1d8de71252ebdaa828b35c2c9dd39946` for P7a INT8-aware `kokoro_rknn.py`).
+  If they're
   missing on a fresh box, copy them from the running production radxa, or
   push from your repo:
 
