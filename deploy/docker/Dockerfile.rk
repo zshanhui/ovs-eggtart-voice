@@ -71,14 +71,14 @@ RUN pip install --no-cache-dir --index-url ${PIP_INDEX} \
         python-multipart \
         websockets \
         requests \
-        misaki \
-        jieba \
-        pypinyin \
-        pypinyin_dict \
-        ordered_set \
-        cn2an \
-        proces \
-        addict \
+        'misaki[zh]==0.9.4' \
+        'jieba==0.42.1' \
+        'pypinyin==0.55.0' \
+        'pypinyin_dict==0.9.0' \
+        'ordered_set==4.1.0' \
+        'cn2an==0.5.24' \
+        'proces==0.1.7' \
+        'addict==2.4.0' \
         regex \
     && ldconfig
 
