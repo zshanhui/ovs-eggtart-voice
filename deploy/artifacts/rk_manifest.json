@@ -267,8 +267,9 @@
       },
       "runtime_contract": {
         "tts_path": "kokoro_hybrid_4stage",
-        "closed_loop_validated": false,
-        "validation_status": "audio_ab_pass_rtf_fail",
+        "closed_loop_validated": true,
+        "production_validated_at": "2026-05-23",
+        "validation_status": "http_rtf_pass",
         "closed_loop_phrase": "Hello, how are you today?",
         "env": {
           "TTS_BACKEND": "kokoro_rknn",
