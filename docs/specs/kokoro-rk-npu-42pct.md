@@ -10,27 +10,32 @@
 
 **B. Vocoder front-half boundary**：当前 CPU tail 输入已确认是 `/decoder/decode.3/Mul_output_0` 和 `/Slice_2_output_0`，输出 `audio`（`third_party/rkvoice-stream/models/tts/kokoro/export_kokoro_decoder_front.py:115-130`）。目标 front-half 是 `resblocks.0-2 + noise_res.0`，算力占 16.8%，文档判定"能上 RKNN"；back-half `resblocks.3-5 + noise_res.1` 占 50.2%，因 dim=13081 不能上 RKNN（`third_party/rkvoice-stream/docs/kokoro-rknn-analysis.md:24-26`）。`probe_kokoro_tail_splits.py` 支持从 tail 输入抽任意 candidate tensor（`third_party/rkvoice-stream/models/tts/kokoro/probe_kokoro_tail_splits.py:6-12`）。已知候选包括 `/decoder/generator/ups.0/ConvTranspose_output_0` 和 `/decoder/generator/noise_res.0/Add_8_output_0`，但 `noise_res.0` 曾在真实 runtime 返回 `None`，需谨慎（`third_party/rkvoice-stream/docs/kokoro-rknn-analysis.md:111-116`）。最终决策：先用 `probe_kokoro_tail_splits.py` 找到所有 `resblocks.2` consumer 与第一个 `resblocks.3` input；若 exact tensor 无法稳定导出，则采用保守 front-half boundary 到 `/decoder/generator/noise_res.0/Add_8_output_0`。
 
-**目标 topology：**
+**目标 topology**（基于 M1 boundary report + ground-truth inspect 2026-05-23 修正）：
 
 ```
-tokens/style/speed
+tokens, style, speed
    |
-   | tokens ─► [RKNN bert-encoder FP16]──► /encoder/MatMul_1_output_0
-   | style,speed ─────────────────────────────────────────────────────+
-   ▼                                                                  |
-[CPU prefix-regulator / duration predictor] ◄─────────────────────────+
-   | outputs: /MatMul_1_output_0, /Slice_2_output_0
-   ▼
-[RKNN decoder-front INT8]  ← existing validated segment
-   | output: /decoder/decode.3/Mul_output_0
-   ▼
-[RKNN vocoder-front-half FP16: ups.0 + resblocks.0-2 + noise_res.0]
-   | output: probe-confirmed tensor before resblocks.3
-   ▼
-[CPU vocoder-back-half: resblocks.3-5 + noise_res.1 + post/ISTFT]
-   |
- audio
+   | tokens ─► [RKNN bert-encoder FP16, M2]──► /bert_encoder/Add_output_0 [1,32,512]
+   |                                                                            |
+   |                                                                            ▼
+   | style, speed ─────────────────────────────► [CPU residual prefix ORT, M3]
+   |                                                  (text_encoder + duration predictor)
+   |                                              outputs: /MatMul_1_output_0 [1,512,210]
+   |                                                       /Slice_2_output_0  [1,128]
+   |                                                                            |
+   ▼                                                                            ▼
+                              [RKNN decoder-front INT8]  ← existing validated, unchanged
+                                          | output: /decoder/decode.3/Mul_output_0
+                                          ▼
+                              [RKNN vocoder-front-half FP16, M4: ups.0 + resblocks.0-2 + noise_res.0]
+                                          | output: /decoder/generator/Add_5_output_0 [1,256,4200]
+                                          ▼
+                              [CPU vocoder-back-half: resblocks.3-5 + noise_res.1 + post/ISTFT]
+                                          |
+                                       audio
 ```
+
+**Ground truth 备注**：当前 shipped `kokoro-prefix-cpu.onnx`（22MB，sha `549fece0…`）包含 776 个 `bert*`-named 节点（整个 BERT + text_encoder + predictor），从 `tokens/style/speed` 走到 `/MatMul_1_output_0 + /Slice_2_output_0`。BERT 当前是 CPU。RKNN decoder-front（40MB INT8）实际 inputs 只有 `[/MatMul_1_output_0, /Slice_2_output_0]`、不含 BERT 权重（kmodel.decoder.* only）。要让 M2 BERT FP16 RKNN 真正接入，必须把现有 CPU prefix 在 `/bert_encoder/Add_output_0` 处再切一刀：上半 = BERT（由 M2 RKNN 替代），下半 = `residual prefix CPU`（text_encoder + predictor，输入 `/bert_encoder/Add_output_0 + style + speed`，输出维持原 ABI）。decoder-front 和 tail 不动。
 
 ## §2 Operator compatibility pre-assessment
 
@@ -70,7 +75,7 @@ tokens/style/speed
 |---|---|---|---|
 | M1 Boundary discovery | `boundary-report.md`：确认 BERT 和 vocoder front-half 输出 tensor name + shape | 无候选 time dim >8191；`inspect_onnx_tensors.py` / `probe_kokoro_tail_splits.py` 输出中可引用 exact name | 半天 |
 | M2 BERT FP16 RKNN | `kokoro-bert-encoder.onnx`、`rk3588/kokoro-bert-encoder.fp16.rknn`、extractor script | ORT vs RKNN hidden max-abs-diff ≤0.02；RK3588 inference 非 None | 1 天 |
-| M3 Prefix pipeline refactor | `kokoro-prefix-regulator-cpu.onnx`（消费 BERT 输出 + style/speed；输出 `/MatMul_1_output_0` + `/Slice_2_output_0`） | 输出与当前 prefix 等价，max-abs-diff ≤0.02；不改动 `kokoro_rknn.py` 加载入口结构（`:255-292`） | 1 天 |
+| M3 Prefix split + 4-stage wiring | (a) `kokoro-bert-only.onnx`（`tokens → /bert_encoder/Add_output_0`）— 用于校验 M2 BERT RKNN parity；(b) `kokoro-prefix-residual-cpu.onnx`（`/bert_encoder/Add_output_0 + style + speed → /MatMul_1_output_0 + /Slice_2_output_0`）；(c) `kokoro_rknn.py` `_preload_hybrid` / `_infer_segment_hybrid` 改为 4 段流水（CPU tokenize → BERT RKNN → residual prefix ORT → decoder-front RKNN → tail ORT），新增第二个 RKNN handle | 端到端 audio vs 旧三段路径 max-abs-diff ≤0.02、rel_l2 ≤0.005；`/MatMul_1_output_0` + `/Slice_2_output_0` ABI 不变；新 pipeline 5 段总时长 ≤ 旧 3 段（NPU 抵消多段 dispatch） | 1-2 天 |
 | M4 Vocoder front-half FP16 RKNN | `kokoro-vocoder-front-half.onnx`、`rk3588/kokoro-vocoder-front-half.fp16.rknn`、`kokoro-vocoder-tail-rest-cpu.onnx` | front-half 输出 max-abs-diff ≤0.03；50 真实输入 RKNN 无 None | 2 天 |
 | M5 INT8 experiments (optional) | `bert.int8.rknn`（如可行）、`vocoder-front-half.int8.rknn` | 全 audio max-abs-diff ≤0.05 AND rel_l2 ≤0.01；否则保持 FP16 | 1 天 |
 | M6 Manifest/profile integration | 追加 `rk_manifest.json:240-258` 后方的新 artifact 条目；更新 `rk3588-kokoro-rknn.json` profile | `abc.` RTF ≤0.673；profile env 序列化正常 | 半天 |
