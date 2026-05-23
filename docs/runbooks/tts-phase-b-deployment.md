@@ -56,7 +56,43 @@ Confirmed 2026-05-23:
 
 … will revert ALL of the above to the baked image baseline, dropping Phase B + pipeline parallelism.
 
-## §3 To真正固化 (bake into a new image)
+## §3 To真正固化 (bake into a new image) — RECOMMENDED: overlay path
+
+**TL;DR — 30 seconds on orin-nx:**
+
+```bash
+cd /home/harvest/seeed-local-voice-hotswap
+DOCKER_BUILDKIT=0 docker build \
+    -f deploy/docker/Dockerfile.jetson.tts-phase-b-overlay \
+    -t openvoicestream:jetson-v1.15-tts-phase-b .
+docker tag openvoicestream:jetson-v1.15-tts-phase-b \
+    sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.15-tts-phase-b
+```
+
+The overlay Dockerfile (`deploy/docker/Dockerfile.jetson.tts-phase-b-overlay`) takes the production `jetson-v1.14-hotswap` image as base and just COPYs the 4 files that changed:
+
+- `deploy/jetson-workers/qwen3_tts_worker` (Phase B binary)
+- `app/main.py` (Part D watcher + pipeline parallelism)
+- `app/backends/jetson/trt_edge_llm_tts.py` (cancel counter)
+- `configs/profiles/jetson-multilang-highperf-nx.json` (OVS_TTS_WORKER_CONCURRENCY=2)
+
+Builds in ~30 seconds (vs ~30 minutes for `jetson-release-highperf.sh` full rebuild). All system / pip / submodule layers are inherited from the base image untouched, so there's no risk of dependency drift.
+
+Verified post-build:
+```
+binary  md5 4cf47793532b3951ffa5c77585b0eae4
+main.py md5 09c495cc7527c65f5ca6fb598224ad75
+asr.py  md5 19e01be0c8f0ea69d256c59be42bc1ea
+profile md5 0836ff0a6da6d33c35f841984ab96294
+```
+
+These are byte-identical to the files currently hot-deployed in the live `deploy-speech-1` container, so swapping in this image is a no-op for behaviour and only fixes the persistence gap.
+
+### Full rebuild path (ALTERNATE, only if base image needs to change)
+
+Use this only when you also need to update system/pip dependencies or third_party submodules. Otherwise it's a 30-minute waste.
+
+## §3-bis Full rebuild (legacy reference)
 
 ### Prerequisites
 - Orin NX (or AGX) build host with at least 4GB free RAM and 20GB free disk
