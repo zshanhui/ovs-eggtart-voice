@@ -2825,6 +2825,10 @@ async def v2v_stream(ws: WebSocket):
         if tts_be is not None:
             work_tasks.append(asyncio.create_task(tts_out_task()))
     
+        # NIT 3 round 3: track whether the V2V loop exited via a server
+        # error so the WebSocket close frame carries the standard 1011
+        # "internal error" code rather than the default 1005/1000.
+        _v2v_server_error = False
         try:
             if work_tasks:
                 await asyncio.gather(*work_tasks, return_exceptions=False)
@@ -2833,6 +2837,7 @@ async def v2v_stream(ws: WebSocket):
                 # just keep the dispatcher running until the client closes.
                 await dispatcher_task
         except Exception as e:
+            _v2v_server_error = True
             logger.error("v2v stream error: %s", e, exc_info=True)
             try:
                 await send_error(f"{type(e).__name__}: {e}")
@@ -2861,7 +2866,10 @@ async def v2v_stream(ws: WebSocket):
                 except Exception:
                     pass
             try:
-                await ws.close()
+                if _v2v_server_error:
+                    await ws.close(code=1011)
+                else:
+                    await ws.close()
             except Exception:
                 pass
             if _v2v_asr_mgr is not None:
