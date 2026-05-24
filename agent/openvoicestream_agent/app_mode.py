@@ -46,6 +46,30 @@ class ModeContext:
     broadcast: Callable[..., Awaitable[None]]
     translator: Any = None  # TranslatorBackend; optional (defaults to None for backward compat)
     mode_manager: "ModeManager | None" = None  # Optional ModeManager handle
+    # ASR-reported language for the utterance currently being handled
+    # (human-readable name like "Chinese" / "English"). None when the
+    # backend doesn't perform language ID, or when no utterance is being
+    # processed (e.g. enter/exit hooks). InterpreterMode uses this to
+    # auto-pick the translator src language.
+    detected_language: "str | None" = None
+
+    async def speak(self, text: str) -> None:
+        """Stream a pre-composed ``text`` to TTS without invoking the LLM.
+
+        Used by modes that produce assistant text by some non-LLM path
+        (e.g. InterpreterMode → NLLB translation). The text is pushed
+        verbatim to SLV's text channel and flushed; no history append,
+        no system prompt, no token streaming.
+        """
+        if not text or not text.strip():
+            logger.info("ModeContext.speak: empty text — skipping")
+            return
+        try:
+            await self.slv.send_text(text)
+            await self.slv.flush_tts()
+        except Exception:  # pragma: no cover - best effort
+            logger.exception("ModeContext.speak: send/flush failed")
+            raise
 
     async def run_default_dialogue_turn(
         self,

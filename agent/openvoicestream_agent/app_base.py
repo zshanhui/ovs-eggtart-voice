@@ -399,8 +399,16 @@ class BaseApp:
         self.plugins.append(plugin)
         return True
 
-    async def on_user_utterance(self, text: str) -> None:
-        """Subclasses MUST override. Default raises."""
+    async def on_user_utterance(
+        self, text: str, detected_language: str | None = None
+    ) -> None:
+        """Subclasses MUST override. Default raises.
+
+        ``detected_language`` is the ASR-reported language for this turn
+        (e.g. ``"Chinese"``) or ``None`` if the backend doesn't do LID.
+        Passed per-call so mode lifecycle hooks (enter/exit) never see a
+        stale value.
+        """
         raise NotImplementedError("Subclass BaseApp and implement on_user_utterance")
 
     async def run(self) -> None:
@@ -1097,7 +1105,9 @@ class BaseApp:
                 self._set_state(ConvState.IDLE)
                 self._reset_sleep_timer()
                 return
-            logger.info("asr_final received: %r", evt.text)
+            logger.info(
+                "asr_final received: %r (language=%r)", evt.text, evt.language
+            )
             # Re-enable speaker playback for the next turn. stop_playback
             # latched discard=True on the prior barge-in / sleep so SLV's
             # tail-end TTS didn't keep playing; clear that now so the new
@@ -1163,7 +1173,8 @@ class BaseApp:
             # THINKING in _update_vad.
             self._set_state(ConvState.THINKING)
             self._llm_turn_task = asyncio.create_task(
-                self._run_user_utterance(evt.text), name="llm-turn"
+                self._run_user_utterance(evt.text, evt.language),
+                name="llm-turn",
             )
             return
 
@@ -1260,10 +1271,12 @@ class BaseApp:
                 logger.info("SLVError while SLEEPING; staying SLEEPING")
             return
 
-    async def _run_user_utterance(self, text: str) -> None:
+    async def _run_user_utterance(
+        self, text: str, detected_language: str | None = None
+    ) -> None:
         """Wrap on_user_utterance so a crashing LLM turn doesn't kill the task silently."""
         try:
-            await self.on_user_utterance(text)
+            await self.on_user_utterance(text, detected_language=detected_language)
             # Success path: tell the availability plugin so a transient
             # failure that earlier flipped us to DEGRADED gets cleared.
             # Skip if LLM is disabled (noop backend).

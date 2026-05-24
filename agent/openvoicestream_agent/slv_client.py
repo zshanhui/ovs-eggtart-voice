@@ -59,6 +59,11 @@ class ASRFinal(V2VEvent):
     text: str
     session_complete: bool = True
     duplicate_of_streamed: bool = False
+    # Per-utterance detected language as reported by the ASR backend
+    # (e.g. "Chinese", "English"). None when the backend doesn't perform
+    # language ID. Modes (e.g. InterpreterMode) consume this to pick a
+    # translator src language at runtime.
+    language: "str | None" = None
 
 
 @dataclass
@@ -317,6 +322,7 @@ class SLVClient:
                     text=evt.get("text", ""),
                     session_complete=bool(evt.get("session_complete", True)),
                     duplicate_of_streamed=bool(evt.get("duplicate_of_streamed", False)),
+                    language=evt.get("language"),
                 )
             )
         elif t == SERVER_TTS_STARTED:
