@@ -82,10 +82,11 @@ services:
           memory: ${OVS_MEMORY_LIMIT:-6G}
 
   translator:
-    build:
-      context: ..
-      dockerfile: services/translator/Dockerfile
-    image: seeed-local-voice:translator-latest
+    # Jetson Orin slim CUDA image (~580 MB, ct2 built bare-metal on Orin
+    # for sm_87 — see services/translator/BUILD.md). To use the older
+    # CPU-only image instead, override TRANSLATOR_IMAGE to
+    # seeed-local-voice:translator-latest and TRANSLATOR_DEVICE=cpu.
+    image: ${TRANSLATOR_IMAGE:-sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:translator-cuda-jetson-v1}
     runtime: nvidia
     ports:
       - "9001:9001"
@@ -93,8 +94,20 @@ services:
       - TRANSLATOR_DEVICE=${TRANSLATOR_DEVICE:-cuda}
       - TRANSLATOR_DEVICE_INDEX=${TRANSLATOR_DEVICE_INDEX:-0}
       - TRANSLATOR_MODEL_PATH=${TRANSLATOR_MODEL_PATH:-/models/nllb-200-distilled-600m-ct2-int8}
+      # CSV-mode Jetson container runtime: must map /dev/nvmap into the
+      # container or CUDA init fails with "NvRmMemInitNvmap failed".
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      # The slim image relies on host CUDA libs (cudnn / cublas / cudart)
+      # — bind-mounted below; this path puts /usr/local/lib (where the
+      # bare-metal-built libctranslate2.so lives) first, then host CUDA
+      # paths after. See services/translator/BUILD.md.
+      - LD_LIBRARY_PATH=/usr/local/lib:/host-libs:/host-nvidia-libs:/host-cuda
     volumes:
       - translator-models:/models:ro
+      - /usr/local/cuda/lib64:/host-cuda:ro
+      - /usr/lib/aarch64-linux-gnu/nvidia:/host-nvidia-libs:ro
+      - /usr/lib/aarch64-linux-gnu:/host-libs:ro
     restart: unless-stopped
     deploy:
       resources:

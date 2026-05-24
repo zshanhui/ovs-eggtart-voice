@@ -1,6 +1,73 @@
 # Translator service — build notes
 
-Two Docker paths ship side-by-side:
+## TL;DR — running the pinned image on Jetson
+
+A pre-built `linux/arm64` slim CUDA image is published to Seeed's internal
+registry; you do not have to rebuild from source unless the JetPack version
+or model changes.
+
+```bash
+# 1) `docker login sensecraft-missionpack.seeed.cn` if not already done.
+# 2) Compose pulls the right image automatically:
+docker compose -f deploy/docker-compose.yml up -d translator
+
+# Or pull + run manually:
+docker pull sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:translator-cuda-jetson-v1
+docker run -d --name translator --runtime=nvidia -p 9001:9001 \
+  -v translator-models:/models:ro \
+  -v /usr/local/cuda/lib64:/host-cuda:ro \
+  -v /usr/lib/aarch64-linux-gnu/nvidia:/host-nvidia-libs:ro \
+  -v /usr/lib/aarch64-linux-gnu:/host-libs:ro \
+  -e LD_LIBRARY_PATH=/usr/local/lib:/host-libs:/host-nvidia-libs:/host-cuda \
+  -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -e TRANSLATOR_DEVICE=cuda \
+  -e TRANSLATOR_MODEL_PATH=/models/nllb-200-distilled-600m-ct2-int8 \
+  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:translator-cuda-jetson-v1
+
+# 3) Sanity:
+curl -s http://localhost:9001/health
+# {"status":"ok","model":"nllb-200-distilled-600M","device":"cuda"}
+
+curl -s -X POST http://localhost:9001/translate \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"你好世界","src_lang":"zho_Hans","tgt_lang":"eng_Latn"}'
+```
+
+### Pinned image
+
+| Tag | Digest | Size | Built against |
+|---|---|---|---|
+| `translator-cuda-jetson-v1` | `sha256:ee4765c6fc2b0a1e2719aa136ccc0ff59e8b918a4dcd8ac04e312e165927d636` | 579 MB | JetPack 6.x (L4T R36.4.x), CUDA 12.6, cuDNN 9.3, Python 3.10, ct2 v4.7.2 |
+
+### Model
+
+The image expects the NLLB-200 CT2 model at
+`/models/nllb-200-distilled-600m-ct2-int8/` inside the `translator-models`
+named volume. Bring-up on a fresh device:
+
+```bash
+# On a host with HF access (or behind HF mirror via HF_ENDPOINT):
+pip install --user ctranslate2 transformers sentencepiece huggingface_hub torch
+ct2-transformers-converter \
+  --model facebook/nllb-200-distilled-600M \
+  --output_dir /tmp/nllb-200-distilled-600m-ct2-int8 \
+  --quantization int8
+# (sentencepiece.bpe.model is NOT created by the converter — copy it from
+#  the HF cache manually:)
+cp ~/.cache/huggingface/hub/models--facebook--nllb-200-distilled-600M/snapshots/*/sentencepiece.bpe.model \
+   /tmp/nllb-200-distilled-600m-ct2-int8/
+
+# Stage into the named volume:
+docker volume create translator-models
+docker run --rm -v translator-models:/dest -v /tmp/nllb-200-distilled-600m-ct2-int8:/src \
+  alpine cp -r /src /dest/nllb-200-distilled-600m-ct2-int8
+```
+
+The CT2-converted model is ~605 MB on disk.
+
+---
+
+## Two Docker paths ship side-by-side
 
 | File | Image tag | When to use |
 |---|---|---|
@@ -100,6 +167,27 @@ docker build -f Dockerfile.slim -t seeed-local-voice:translator-slim-v2 .
 `ct2-artifacts/` and `wheels/` are intentionally gitignored — they're large
 binaries tied to a specific JetPack version. Rebuild them whenever the host
 CUDA / cuDNN / Python version moves.
+
+## How to publish to the Seeed registry
+
+After a successful build + bench on the Jetson, push the new image so other
+hosts can pull it without rebuilding from source:
+
+```bash
+TAG=translator-cuda-jetson-v1   # bump the v1 suffix per JetPack / CT2 / model update
+REG=sensecraft-missionpack.seeed.cn/solution/seeed-local-voice
+
+docker tag seeed-local-voice:translator-slim-v2 ${REG}:${TAG}
+docker push ${REG}:${TAG}
+# Capture the digest from the push output and record it in:
+#   - this file's "Pinned image" table (TL;DR section)
+#   - deploy/docker-compose.yml (TRANSLATOR_IMAGE default)
+#   - your fleet release notes
+```
+
+Pin a new tag (`-v2`, `-v3`, …) instead of overwriting `-v1` whenever the
+upstream NLLB-200 weights / quantization / Jetson JetPack version changes,
+so older deployments can always pin back to a known-good image.
 
 ## Run
 
