@@ -33,6 +33,13 @@ services:
       - STREAMING_ASR_NUM_THREADS=${STREAMING_ASR_NUM_THREADS:-4}
       - TTS_NUM_THREADS=${TTS_NUM_THREADS:-4}
     restart: unless-stopped
+    # Week 1 hardening: rely on /readyz; /health is deprecated.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8621/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
 volumes:
   speech-models:

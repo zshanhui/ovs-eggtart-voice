@@ -64,6 +64,15 @@ services:
       - /usr/lib/python3.10/dist-packages/tensorrt:/usr/lib/python3.10/dist-packages/tensorrt:ro
       - /usr/src/tensorrt:/usr/src/tensorrt:ro
     restart: unless-stopped
+    # Week 1 hardening: orchestrators should rely on /readyz (backend
+    # READY + capacity + watchdog OK). /health is preserved but
+    # deprecated; see docs/specs/prod-hardening-week1.md Deliverable 3.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     deploy:
       resources:
         limits:
