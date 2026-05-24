@@ -434,3 +434,26 @@ canvas.spark { display: block; }
 .ms-section .voice-select { width: 100%; }
 .ms-section .voice-meta { display: flex; gap: 10px; justify-content: space-between; margin-top: 2px; }
 .ms-section .voice-clone-btn { width: 100%; margin-top: 6px; }
+
+/* Translator card (NLLB Phase 2b) */
+#translatorBackendBadge {
+  margin-left: 8px; padding: 0 6px;
+  background: rgba(100, 100, 100, 0.15); border-radius: 4px;
+  font-weight: 400;
+}
+#translatorBackendBadge.noop { color: #888; }
+#translatorBackendBadge.ctranslate2 { background: rgba(106, 169, 240, 0.25); color: #2266aa; }
+#translatorCard #setTranslatorTgtLang { width: 100%; }
+
+/* Subtitle bubble in chat stream */
+.bubble.subtitle {
+  border-left: 3px solid #6aa9f0;
+  background: rgba(106, 169, 240, 0.05);
+}
+.sub-orig { line-height: 1.4; }
+.sub-trans { line-height: 1.4; font-size: 1.05em; font-weight: 500; margin-top: 2px; }
+.sub-tag {
+  display: inline-block; padding: 0 6px; margin-left: 4px;
+  font-size: 0.75em; background: rgba(100, 100, 100, 0.15);
+  border-radius: 4px; vertical-align: middle;
+}
