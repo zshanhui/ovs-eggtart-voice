@@ -248,3 +248,97 @@ def test_tts_clone_stream_cancelled_during_backend_acquire_releases_slot(
         f"slot leaked on CancelledError during /tts/clone/stream backend "
         f"acquire: limiter.active={sl.active}"
     )
+
+
+# ---------------------------------------------------------------------------
+# MUST-FIX 1 round 3: V2V CancelledError mid-setup must release the slot
+# ---------------------------------------------------------------------------
+
+def test_v2v_stream_cancelled_during_setup_releases_slot(
+    monkeypatch, tmp_path,
+):
+    """If the V2V handler is cancelled (e.g. client disconnect during
+    `ws.receive()` for the initial config frame), the outer
+    `except BaseException` must invoke `_v2v_release_early()` so the
+    session-limiter slot is returned and the active-WS gauge is
+    decremented. Reproduces the round-3 gap where codex flagged that
+    no V2V-specific CancelledError regression existed alongside the
+    /tts/stream + /tts/clone/stream ones.
+    """
+    import asyncio
+
+    monkeypatch.setenv("MODEL_DIR", str(tmp_path))
+    monkeypatch.setenv("LAZY_TTS", "1")
+    monkeypatch.setenv("LANGUAGE_MODE", "disabled")
+    monkeypatch.setenv("OVS_MAX_CONCURRENT_SESSIONS", "2")
+
+    session_limiter.init_limiter({})
+    sl = session_limiter.get_limiter()
+    assert sl is not None and sl.active == 0
+
+    # V2V handler calls get_coordinator() before any try/except, so the
+    # coordinator must be initialised or it raises RuntimeError before
+    # the slot is ever acquired (making the test trivially pass).
+    from app.core import coordinator as _coord_mod
+    _coord_mod.init_coordinator({})
+
+    from app import main as appmod
+    from app.core import api_auth as _api_auth
+    from app.core import session_limiter as _sl_mod
+
+    # Track _v2v_release_early invocation. We can't observe the local
+    # function directly, but we *can* observe its observable side
+    # effect (the slot release on the limiter we control).
+    release_observed = {"called": False}
+
+    real_release = _sl_mod.SessionToken.release
+
+    def _watching_release(self):
+        release_observed["called"] = True
+        return real_release(self)
+
+    monkeypatch.setattr(_sl_mod.SessionToken, "release", _watching_release)
+
+    # Auth bypass.
+    async def _ok(_ws):
+        return True
+    monkeypatch.setattr(_api_auth, "check_ws", _ok)
+
+    # Fake WebSocket: accept() OK, then ws.receive() raises CancelledError
+    # to simulate client disconnect mid-setup.
+    class _FakeWS:
+        def __init__(self):
+            self.headers = {}
+            self.closed = False
+            self.accepted = False
+
+        async def accept(self):
+            self.accepted = True
+
+        async def receive(self):
+            raise asyncio.CancelledError("simulated client disconnect")
+
+        async def receive_text(self):
+            raise asyncio.CancelledError("simulated client disconnect")
+
+        async def send_json(self, _payload):
+            pass
+
+        async def close(self, code=1000):
+            self.closed = True
+
+    fake = _FakeWS()
+
+    with pytest.raises((asyncio.CancelledError, BaseException)):
+        asyncio.run(appmod.v2v_stream(fake))
+
+    # Slot must be back to 0 — if the outer except BaseException didn't
+    # invoke _v2v_release_early(), the token would still be held.
+    assert sl.active == 0, (
+        f"slot leaked on CancelledError during V2V setup: "
+        f"limiter.active={sl.active}"
+    )
+    assert release_observed["called"], (
+        "SessionToken.release() was never called; the outer "
+        "except BaseException did not invoke _v2v_release_early()"
+    )
