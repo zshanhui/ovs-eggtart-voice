@@ -28,6 +28,8 @@ services:
       - /home/cat/project/rknn-matmul-parallel:/opt/rknn-matmul-parallel:ro
     environment:
       - OVS_PROFILE=${OVS_PROFILE:-}
+      # Week 2: structured JSON logs in production.
+      - OVS_LOG_FORMAT=${OVS_LOG_FORMAT:-json}
       # Admin endpoints are loopback-only by default. Set OVS_ADMIN_KEY (in
       # .env or shell) and pass it back as the X-Admin-Key header to enable
       # remote admin. Unset keeps remote admin disabled (403).
