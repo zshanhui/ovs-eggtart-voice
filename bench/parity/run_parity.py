@@ -164,16 +164,45 @@ def fleet_exec_collect(
             "stderr_tail": err[-2000:],
             "stdout_tail": out[-2000:],
         }
-    # Extract the last JSON object printed by the collector.
-    try:
-        start = out.rfind("{")
-        end = out.rfind("}")
-        if start < 0 or end < 0:
-            raise ValueError("no JSON found in stdout")
-        return json.loads(out[start:end + 1])
-    except Exception as e:
-        return {"device": device_id, "error": f"json parse: {e}",
-                "stdout_tail": out[-2000:], "stderr_tail": err[-2000:]}
+    # Extract the JSON object printed by the collector. Look for a
+    # sentinel-prefixed line so nested `{` braces in tracebacks or
+    # platform.platform() text never confuse the parser. The original
+    # `rfind('{') .. rfind('}')` scheme picked up the LAST inner `{`
+    # which sits inside the outer JSON, producing a partial-object
+    # ValueError. Codex Week 3 BLOCKER 3a.
+    sentinel = "__PARITY_RESULT__:"
+    parsed = None
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if not line.startswith(sentinel):
+            continue
+        payload = line[len(sentinel):].strip()
+        try:
+            parsed = json.loads(payload)
+            break
+        except Exception:
+            continue
+    if parsed is None:
+        # Backwards-compatible fallback for collectors that pre-date the
+        # sentinel marker: try line-by-line JSON load on whole-line
+        # candidates. Avoids the nested-brace pitfall of rfind('{').
+        for line in reversed(out.splitlines()):
+            line = line.strip()
+            if not (line.startswith("{") and line.endswith("}")):
+                continue
+            try:
+                parsed = json.loads(line)
+                break
+            except Exception:
+                continue
+    if parsed is None:
+        return {
+            "device": device_id,
+            "error": "no parseable JSON in collector stdout",
+            "stdout_tail": out[-2000:],
+            "stderr_tail": err[-2000:],
+        }
+    return parsed
 
 
 # Minimal in-process collector that runs on the remote device. Uses only
@@ -240,7 +269,18 @@ out["tts"] = {
     "runs": len(ttfas), "clean": len(clean),
     "pcm_present": len(clean) > 0,
 }
-print(json.dumps(out))
+# Codex Week 3 BLOCKER 3b: remote collector intentionally collects only
+# health + TTS smoke right now (each ASR/V2V backend has different
+# streaming semantics, so we punt). Mark the missing sections with a
+# `data_incomplete` flag so the comparator can refuse to silently PASS
+# instead of treating absent fields as "no problems found".
+out["asr"] = {"data_incomplete": True,
+              "reason": "remote collector ships only TTS smoke; "
+                        "operator must run ASR matrix separately"}
+out["v2v"] = {"data_incomplete": True,
+              "reason": "remote collector ships only TTS smoke; "
+                        "operator must run V2V matrix separately"}
+print("__PARITY_RESULT__:" + json.dumps(out))
 """
 
 
@@ -258,6 +298,17 @@ def evaluate_device(report: dict[str, Any], opts: argparse.Namespace) -> dict[st
 
     # ASR
     asr = report.get("asr") or {}
+    # Codex Week 3 BLOCKER 3b: a remote collector that returns
+    # data_incomplete must NOT silently PASS. The fail/flag policy is:
+    #   - data_incomplete + --strict-data → hard fail
+    #   - data_incomplete otherwise        → flag (visible in summary)
+    # The --skip-asr / --skip-v2v switches let operators acknowledge a
+    # device class genuinely can't run that path (e.g. TTS-only device).
+    if asr.get("data_incomplete") and not getattr(opts, "skip_asr", False):
+        reason = asr.get("reason") or "asr data missing"
+        flags.append(f"asr data_incomplete: {reason}")
+        if getattr(opts, "strict_data", False):
+            hard_fail = True
     for lang_key, rate_key in [("zh", "cer"), ("en", "wer")]:
         bucket = asr.get(lang_key)
         if not bucket:
@@ -313,6 +364,11 @@ def evaluate_device(report: dict[str, Any], opts: argparse.Namespace) -> dict[st
 
     # V2V
     v2v = report.get("v2v") or {}
+    if v2v.get("data_incomplete") and not getattr(opts, "skip_v2v", False):
+        reason = v2v.get("reason") or "v2v data missing"
+        flags.append(f"v2v data_incomplete: {reason}")
+        if getattr(opts, "strict_data", False):
+            hard_fail = True
     if v2v:
         if v2v.get("stop_intent_ok") is False:
             flags.append("v2v stop_intent_ok=false")
@@ -542,6 +598,12 @@ def main() -> int:
                     help="ignore ASR flags in evaluation")
     ap.add_argument("--skip-tts", action="store_true",
                     help="ignore TTS flags in evaluation")
+    ap.add_argument("--strict-data", action="store_true",
+                    help="hard-fail when a per-device report is marked "
+                         "data_incomplete (e.g. remote collector only "
+                         "shipped TTS smoke without ASR/V2V coverage). "
+                         "Codex Week 3 BLOCKER 3b: prevents silent PASS "
+                         "on partial data.")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
