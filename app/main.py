@@ -323,6 +323,20 @@ def _default_vad_silence_ms() -> int:
         return 400
     return max(0, value)
 
+@app.on_event("shutdown")
+async def shutdown_watchdog():
+    """Cancel the GPU watchdog background task on app shutdown.
+
+    Best-effort: any errors here are swallowed because the process is
+    going away regardless.
+    """
+    try:
+        from app.core import gpu_watchdog as _gw
+        await _gw.stop()
+    except Exception:
+        logger.debug("gpu_watchdog stop raised during shutdown", exc_info=True)
+
+
 @app.on_event("startup")
 async def startup():
     global _asr_backend
@@ -351,6 +365,14 @@ async def startup():
     # profile does not declare one — matches the previous behaviour.
     from app.core.coordinator import init_coordinator, get_coordinator
     init_coordinator(current_profile().get("execution_policy", {"mode": "concurrent"}))
+
+    # Week 2: launch the GPU/NPU watchdog background task. Failures here
+    # never block startup — the task is purely diagnostic.
+    try:
+        from app.core import gpu_watchdog as _gw
+        await _gw.start()
+    except Exception:
+        logger.exception("gpu_watchdog: start() failed; continuing without watchdog")
 
     # Rockchip userspace runtime is vendored in the RK image. Validate it
     # before importing rkvoice-stream backends so version/hash mismatches fail
@@ -686,18 +708,23 @@ async def readyz():
     elif limiter.available <= 0:
         reasons.append("sessions_full")
 
-    # GPU/NPU watchdog (Week 1 stub always-ok).
+    # GPU/NPU watchdog (Week 2: real background-checked status).
+    wd_detail = None
     try:
         if not _gw_mod.is_ok():
             reasons.append("gpu_watchdog_failed")
+        try:
+            wd_detail = _gw_mod.status()
+        except Exception:
+            wd_detail = None
     except Exception:
         reasons.append("gpu_watchdog_failed")
 
     if reasons:
-        return JSONResponse(
-            {"status": "not_ready", "reasons": reasons},
-            status_code=503,
-        )
+        body = {"status": "not_ready", "reasons": reasons}
+        if wd_detail is not None:
+            body["details"] = {"gpu_watchdog": wd_detail}
+        return JSONResponse(body, status_code=503)
     return JSONResponse({"status": "ready"})
 
 
