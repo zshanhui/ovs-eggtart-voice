@@ -587,6 +587,38 @@ _HEALTH_DEPRECATION_HEADERS = {
 }
 
 
+def _metrics_requires_key() -> bool:
+    """Return True when ``OVS_METRICS_REQUIRE_KEY`` opts into API-key
+    protection for ``/metrics``. Default-off so standard Prometheus
+    scrapes work without auth."""
+    raw = os.environ.get("OVS_METRICS_REQUIRE_KEY", "")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+@app.get("/metrics")
+async def metrics_endpoint(request: Request) -> Response:
+    """Prometheus text exposition.
+
+    Default unprotected (standard Prometheus scrape pattern). Set
+    ``OVS_METRICS_REQUIRE_KEY=true`` to require the same API key used
+    by public voice endpoints — ``Authorization: Bearer <key>``.
+
+    Read-only: never blocks on backend locks, never acquires a session
+    slot, never runs GPU probes. Returns 200 even while ``/readyz`` is
+    503 so operators can scrape during incidents.
+    """
+    if _metrics_requires_key():
+        # Reuse the existing HTTP auth path; it raises 401 (with a
+        # ``ovs_auth_rejected_total{endpoint="/metrics"}`` bump) when
+        # the token is missing or invalid.
+        from app.core.api_auth import check_http
+        check_http(request)
+
+    from app.core import metrics as _metrics_mod
+    body = _metrics_mod.render_prometheus()
+    return Response(content=body, media_type=_metrics_mod.prometheus_content_type())
+
+
 @app.get("/livez")
 async def livez():
     """Process-liveness probe (always 200 while the route is reachable).
@@ -865,6 +897,12 @@ async def _tts_synthesize(req: TTSRequest):
                     language=req.language,
                     **voice_kwargs,
                 )
+        # Week 2: record server-side TTS RTF for /metrics.
+        try:
+            from app.core import metrics as _m
+            _m.record_tts_rtf(getattr(backend, "name", "tts"), float(meta.get("rtf", 0) or 0))
+        except Exception:
+            pass
     else:
         # Manager not initialised (ASR-only or wiring failed at startup) —
         # legacy tts_service path. Kept for ASR-only profiles where the
@@ -880,6 +918,11 @@ async def _tts_synthesize(req: TTSRequest):
                 language=req.language,
                 **voice_kwargs,
             )
+        try:
+            from app.core import metrics as _m
+            _m.record_tts_rtf(tts_service.backend_name() or "tts", float(meta.get("rtf", 0) or 0))
+        except Exception:
+            pass
     return Response(
         content=wav_bytes,
         media_type="audio/wav",
@@ -905,6 +948,7 @@ async def tts_stream(
     """Stream TTS as raw PCM: first 4 bytes = sample_rate (uint32 LE), then int16 PCM chunks."""
     import asyncio
     import struct
+    import time
     from app.core import tts_service
     from app.core.tts_backend import TTSCapability
     from app.core.coordinator import get_coordinator
@@ -1049,6 +1093,11 @@ async def tts_stream(
                             return
                         loop = asyncio.get_event_loop()
                         watcher_task = asyncio.create_task(_disconnect_watcher())
+                        # Week 2: TTFA timer starts after admission (post sr
+                        # header), observed once when the first real PCM
+                        # chunk passes the boundary.
+                        _ttfa_t0 = time.perf_counter()
+                        _ttfa_recorded = False
 
                         # Pipeline window: max sentences in flight at once.
                         # Capped by the TTS stream executor size so we never
@@ -1152,6 +1201,16 @@ async def tts_stream(
                                 if not first_chunk_seen:
                                     _maybe_prefetch()
                                     first_chunk_seen = True
+                                    if not _ttfa_recorded:
+                                        try:
+                                            from app.core import metrics as _m2
+                                            _m2.record_tts_ttfa(
+                                                getattr(backend, "name", "tts"),
+                                                time.perf_counter() - _ttfa_t0,
+                                            )
+                                        except Exception:
+                                            pass
+                                        _ttfa_recorded = True
                                 yield chunk
                             # Also try after sentence completes, in case it
                             # produced zero chunks (degenerate path).
@@ -1542,6 +1601,7 @@ async def asr(
 
 
 async def _asr_impl(file: UploadFile, language: str):
+    import time as _time
     audio_bytes = await file.read()
 
     from app.core.coordinator import get_coordinator
@@ -1549,7 +1609,13 @@ async def _asr_impl(file: UploadFile, language: str):
     if mgr is not None:
         async with mgr.acquire() as asr_be:
             async with get_coordinator().acquire("asr"):
+                _t0 = _time.perf_counter()
                 result = asr_be.transcribe(audio_bytes, language=language)
+                try:
+                    from app.core import metrics as _m
+                    _m.record_asr_decode_duration(asr_be.name, _time.perf_counter() - _t0)
+                except Exception:
+                    pass
             return {
                 "text": result.text,
                 "language": result.language,
@@ -1559,7 +1625,13 @@ async def _asr_impl(file: UploadFile, language: str):
     asr_be = _get_asr_backend()
     if asr_be and asr_be.is_ready():
         async with get_coordinator().acquire("asr"):
+            _t0 = _time.perf_counter()
             result = asr_be.transcribe(audio_bytes, language=language)
+            try:
+                from app.core import metrics as _m
+                _m.record_asr_decode_duration(asr_be.name, _time.perf_counter() - _t0)
+            except Exception:
+                pass
         return {
             "text": result.text,
             "language": result.language,
@@ -1612,6 +1684,15 @@ async def asr_stream(
     if _session_token is None:
         return
 
+    # Week 2: track active streaming WS for /metrics. Paired decrement
+    # lives in the finally block at the bottom of this handler.
+    try:
+        from app.core import metrics as _m_ws
+        _m_ws.inc_active_ws_sessions()
+        _ws_metric_taken = True
+    except Exception:
+        _ws_metric_taken = False
+
     # Register this WS session with the BackendManager (if available) so a
     # subsequent /admin/backend/reload can force-close it (code 1012) and
     # cancel the handler task instead of waiting forever for drain.
@@ -1657,6 +1738,12 @@ async def asr_stream(
             _asr_mgr.unregister_ws(_ws_handle)
         if _session_token is not None:
             _session_token.release()
+        if _ws_metric_taken:
+            try:
+                from app.core import metrics as _m_ws
+                _m_ws.dec_active_ws_sessions()
+            except Exception:
+                pass
 
 
 async def _asr_stream_backend(
@@ -1861,6 +1948,15 @@ async def v2v_stream(ws: WebSocket):
     if _v2v_session_token is None:
         return
 
+    # Week 2: active WS gauge increment. Paired decrement is in both the
+    # early-exit helper (_v2v_release_early) and the final cleanup block.
+    try:
+        from app.core import metrics as _m_v2v
+        _m_v2v.inc_active_ws_sessions()
+        _v2v_ws_metric_taken = True
+    except Exception:
+        _v2v_ws_metric_taken = False
+
     # Register this v2v session with whichever BackendManager(s) are
     # available so /admin/backend/reload of either kind can hard-close
     # the WS (code 1012) instead of letting the connection linger.
@@ -1881,6 +1977,12 @@ async def v2v_stream(ws: WebSocket):
             _v2v_tts_mgr.unregister_ws(_v2v_handle)
         if _v2v_session_token is not None:
             _v2v_session_token.release()
+        if _v2v_ws_metric_taken:
+            try:
+                from app.core import metrics as _m_v2v
+                _m_v2v.dec_active_ws_sessions()
+            except Exception:
+                pass
 
     # ── Stage 1: receive initial config ─────────────────────────────
     try:
@@ -2503,6 +2605,13 @@ async def v2v_stream(ws: WebSocket):
             _v2v_tts_mgr.unregister_ws(_v2v_handle)
         if _v2v_session_token is not None:
             _v2v_session_token.release()
+        if _v2v_ws_metric_taken:
+            try:
+                from app.core import metrics as _m_v2v
+                _m_v2v.dec_active_ws_sessions()
+                _v2v_ws_metric_taken = False
+            except Exception:
+                pass
         logger.info("v2v stream closed")
 
 

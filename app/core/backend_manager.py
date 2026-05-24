@@ -46,6 +46,27 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+def _emit_state(manager_name: str, state: "BackendState") -> None:
+    """Defensive helper: update ``ovs_backend_state`` for this manager.
+
+    Imported lazily and wrapped in try/except so an early import failure
+    can never break the BackendManager state machine.
+    """
+    try:
+        from app.core import metrics as _m
+        _m.set_backend_state(manager_name, state.value)
+    except Exception:  # pragma: no cover - never block reload on metrics
+        pass
+
+
+def _emit_reload(result: str) -> None:
+    try:
+        from app.core import metrics as _m
+        _m.record_backend_reload(result)
+    except Exception:  # pragma: no cover
+        pass
+
+
 class BackendState(str, Enum):
     INIT = "init"
     READY = "ready"
@@ -110,6 +131,7 @@ class BackendManager(Generic[T]):
         self._initial_profile_ref: str | None = initial_profile_ref
 
         self._state: BackendState = BackendState.INIT
+        _emit_state(self.name, self._state)
         self._current: T | None = None
         self._inflight_http: int = 0
         # FIX_4: remember the *original* profile reference (could be a name or a
@@ -137,6 +159,7 @@ class BackendManager(Generic[T]):
             self._preloader(backend)
         except Exception:
             self._state = BackendState.FAILED
+            _emit_state(self.name, self._state)
             logger.exception("BackendManager[%s] start failed", self.name)
             raise
         self._current = backend
@@ -149,12 +172,14 @@ class BackendManager(Generic[T]):
             self._last_profile_ref = self._initial_profile_ref
         async with self._state_lock:
             self._state = BackendState.READY
+        _emit_state(self.name, self._state)
         logger.info("BackendManager[%s] ready (%s)", self.name, _backend_name_of(backend))
 
     async def shutdown(self) -> None:
         """Tear down the current backend. Intended for tests/fixtures."""
         async with self._state_lock:
             self._state = BackendState.DRAINING
+        _emit_state(self.name, self._state)
         if self._current is not None:
             try:
                 self._unloader(self._current)
@@ -163,6 +188,7 @@ class BackendManager(Generic[T]):
         self._current = None
         async with self._state_lock:
             self._state = BackendState.FAILED  # not-serving sentinel; caller usually discards
+        _emit_state(self.name, self._state)
 
     # ------------------------------------------------------------------- query
 
@@ -374,6 +400,7 @@ class BackendManager(Generic[T]):
             # 4. Drain ---------------------------------------------------------
             async with self._state_lock:
                 self._state = BackendState.DRAINING
+            _emit_state(self.name, self._state)
 
             await self._force_close_ws_sessions()
             drained = await self._wait_for_http_drain(self._drain_timeout_s)
@@ -386,6 +413,7 @@ class BackendManager(Generic[T]):
             # 5. Reload --------------------------------------------------------
             async with self._state_lock:
                 self._state = BackendState.RELOADING
+            _emit_state(self.name, self._state)
             self._current = None
 
             new_backend: T | None = None
@@ -410,6 +438,8 @@ class BackendManager(Generic[T]):
                     self._last_profile_ref = profile_ref
                 async with self._state_lock:
                     self._state = BackendState.READY
+                _emit_state(self.name, self._state)
+                _emit_reload("success")
 
                 logger.info(
                     "BackendManager[%s] reloaded (reason=%s) %s → %s",
@@ -431,6 +461,7 @@ class BackendManager(Generic[T]):
                 }
 
             except Exception as exc:
+                _emit_reload("fail")
                 logger.exception("BackendManager[%s] reload failed; rolling back", self.name)
                 # Unload the partially-constructed NEW backend so the factory's
                 # module-level cache (main.py _asr_backend / _tts_service_mod._backend)
@@ -462,6 +493,8 @@ class BackendManager(Generic[T]):
                     self._current = restored
                     async with self._state_lock:
                         self._state = BackendState.READY
+                    _emit_state(self.name, self._state)
+                    _emit_reload("rollback")
                     return {
                         "status": "rolled_back",
                         "kind": self.name,
@@ -476,6 +509,7 @@ class BackendManager(Generic[T]):
                     self._current = None
                     async with self._state_lock:
                         self._state = BackendState.FAILED
+                    _emit_state(self.name, self._state)
                     raise HTTPException(
                         status_code=500,
                         detail={
