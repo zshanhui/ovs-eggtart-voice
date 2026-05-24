@@ -440,6 +440,20 @@ def _get_asr_executor() -> ThreadPoolExecutor:
     return _asr_executor
 
 
+def _unpack_finalize_result(raw):
+    """Normalise ``ASRStream.finalize()`` return to ``(text, language)``.
+
+    Backends return ``(text, language)`` tuples post the language-pipeline
+    migration. Tolerate legacy bare-string returns so a missed migration
+    surfaces as ``(text, None)`` rather than a TypeError on subscript.
+    """
+    if isinstance(raw, tuple):
+        text = raw[0] if len(raw) > 0 else ""
+        lang = raw[1] if len(raw) > 1 else None
+        return text or "", lang
+    return raw or "", None
+
+
 def _default_vad_backend() -> str:
     return (
         os.environ.get("OVS_VAD_BACKEND")
@@ -1972,10 +1986,18 @@ async def asr_stream(
             await ws.send_json({"error": "no streaming ASR available"})
             await ws.close()
     finally:
+        # best-effort cleanup: if unregister_ws raises, _session_token.release()
+        # must still run (slot leak guard symmetric to /tts/stream pattern).
         if _asr_mgr is not None:
-            _asr_mgr.unregister_ws(_ws_handle)
+            try:
+                _asr_mgr.unregister_ws(_ws_handle)
+            except BaseException:
+                pass
         if _session_token is not None:
-            _session_token.release()
+            try:
+                _session_token.release()
+            except BaseException:
+                pass
         if _ws_metric_taken:
             try:
                 from app.core import metrics as _m_ws
@@ -2030,15 +2052,20 @@ async def _asr_stream_backend(
                     force_endpoint = getattr(stream, "force_endpoint", None)
                     if force_endpoint is not None:
                         final_text = await _loop.run_in_executor(_get_asr_executor(), force_endpoint)
+                        detected_language = None
                     else:
                         await _loop.run_in_executor(_get_asr_executor(), stream.prepare_finalize)
-                        final_text = await _loop.run_in_executor(_get_asr_executor(), stream.finalize)
-                    await ws.send_json({
+                        raw_final = await _loop.run_in_executor(_get_asr_executor(), stream.finalize)
+                        final_text, detected_language = _unpack_finalize_result(raw_final)
+                    payload = {
                         "type": "final",
                         "text": final_text,
                         "is_final": True,
                         "is_stable": True,
-                    })
+                    }
+                    if detected_language:
+                        payload["language"] = detected_language
+                    await ws.send_json(payload)
                     logger.debug("ASR utterance endpoint forced (backend=%s)", asr_be.name)
                 continue
 
@@ -2052,13 +2079,17 @@ async def _asr_stream_backend(
                 # End of audio — pre-encode tail, then decode
                 _loop = asyncio.get_event_loop()
                 await _loop.run_in_executor(_get_asr_executor(), stream.prepare_finalize)
-                final_text = await _loop.run_in_executor(_get_asr_executor(), stream.finalize)
-                await ws.send_json({
+                raw_final = await _loop.run_in_executor(_get_asr_executor(), stream.finalize)
+                final_text, detected_language = _unpack_finalize_result(raw_final)
+                payload = {
                     "type": "final",
                     "text": final_text,
                     "is_final": True,
                     "is_stable": True,
-                })
+                }
+                if detected_language:
+                    payload["language"] = detected_language
+                await ws.send_json(payload)
                 break
 
             # Buffer audio (run in thread to avoid blocking event loop)
