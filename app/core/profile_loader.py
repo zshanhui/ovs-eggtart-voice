@@ -146,6 +146,34 @@ def current_profile() -> dict:
         return _CURRENT_PROFILE
 
 
+def get_max_concurrent_sessions() -> int | None:
+    """Return the profile's top-level ``max_concurrent_sessions`` (if set).
+
+    Week 1 production hardening: profiles MAY declare a session limit as
+    a top-level integer (not under ``env``); env override
+    ``OVS_MAX_CONCURRENT_SESSIONS`` always wins. See
+    ``docs/specs/prod-hardening-week1.md`` Deliverable 2.
+
+    Returns ``None`` when the profile does not set the field. Raises
+    ``ValueError`` if the value is present but not a positive integer.
+    """
+    with _PROFILE_LOCK:
+        raw = _CURRENT_PROFILE.get("max_concurrent_sessions")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"profile.max_concurrent_sessions must be an integer, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            f"profile.max_concurrent_sessions must be > 0, got {value}"
+        )
+    return value
+
+
 def get_applied_keys() -> frozenset[str]:
     """Return a snapshot of env keys written by the most recent ``apply_profile``."""
     with _PROFILE_LOCK:
