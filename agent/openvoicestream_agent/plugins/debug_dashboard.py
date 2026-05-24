@@ -1032,23 +1032,41 @@ class DebugDashboardPlugin(Plugin):
             )
         old = getattr(cfg, "translator_tgt_lang", None)
         cfg.translator_tgt_lang = tgt
-        # TODO persist: dashboard mutation lives only in-process for now.
-        # Persisting to YAML needs a decision on where translator settings
-        # belong in the on-disk config schema (Phase 2b). Until then, a
-        # process restart will revert to the YAML-declared value.
-        logger.warning(
-            "translator_tgt_lang switched at runtime: %r → %r "
-            "(TODO persist to YAML)", old, tgt,
+        # Persist to YAML if we have a source path (same pattern as
+        # _api_agent_settings_post). Restart-survives the runtime swap.
+        persisted = False
+        persist_error: str | None = None
+        src = getattr(cfg, "_source_path", None)
+        if src is not None and old != tgt:
+            try:
+                self._persist_agent_settings_to_yaml(
+                    Path(src), {"translator_tgt_lang": tgt}
+                )
+                persisted = True
+            except Exception as e:  # pragma: no cover - defensive
+                persist_error = str(e)
+                logger.exception("persist translator_tgt_lang failed")
+        logger.info(
+            "translator_tgt_lang switched: %r → %r (persisted=%s)",
+            old, tgt, persisted,
         )
         # Broadcast so any subscribed dashboard reflects the change live.
+        bcast_payload: dict[str, Any] = {
+            **self._build_translator_runtime_payload(),
+            "persisted": persisted,
+        }
+        if persist_error is not None:
+            bcast_payload["persist_error"] = persist_error
         try:
             await self.app.broadcast(
-                "on_translator_runtime_change",
-                self._build_translator_runtime_payload(),
+                "on_translator_runtime_change", bcast_payload
             )
         except Exception:
             logger.exception("on_translator_runtime_change broadcast failed")
-        return web.json_response({"ok": True, "tgt_lang": tgt})
+        resp = {"ok": True, "tgt_lang": tgt, "persisted": persisted}
+        if persist_error is not None:
+            resp["persist_error"] = persist_error
+        return web.json_response(resp)
 
     async def _api_session_history(self, request):  # noqa: ANN001
         from aiohttp import web

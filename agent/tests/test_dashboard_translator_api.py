@@ -106,7 +106,10 @@ async def test_translator_runtime_patch_updates_target_language(unused_tcp_port)
             )
             assert r.status == 200
             data = await r.json()
-        assert data == {"ok": True, "tgt_lang": "jpn_Jpan"}
+        assert data["ok"] is True
+        assert data["tgt_lang"] == "jpn_Jpan"
+        # No _source_path on this in-memory config → persistence skipped.
+        assert data["persisted"] is False
         # Live config mutated.
         assert cfg.translator_tgt_lang == "jpn_Jpan"
         # Broadcast fired with the runtime payload.
@@ -114,6 +117,56 @@ async def test_translator_runtime_patch_updates_target_language(unused_tcp_port)
         evt_name, evt_payload = app.broadcast.await_args.args
         assert evt_name == "on_translator_runtime_change"
         assert evt_payload["tgt_lang"] == "jpn_Jpan"
+        assert evt_payload["persisted"] is False
+    finally:
+        await plugin.stop()
+
+
+@pytest.mark.asyncio
+async def test_translator_runtime_patch_persists_to_yaml(unused_tcp_port, tmp_path):
+    """When config has a _source_path, PATCH writes the new tgt_lang back."""
+    import yaml
+
+    yaml_path = tmp_path / "config.yaml"
+    yaml_path.write_text(
+        yaml.safe_dump(
+            {
+                "translator_backend": "ctranslate2",
+                "translator_url": "http://localhost:9001",
+                "translator_src_lang": "zho_Hans",
+                "translator_tgt_lang": "eng_Latn",
+                "translator_timeout_s": 5.0,
+                "pipeline_mode": "always_on",
+            },
+            default_flow_style=False,
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    cfg = _cfg(unused_tcp_port)
+    cfg._source_path = str(yaml_path)
+    app = _mk_app(unused_tcp_port, cfg)
+    plugin = DebugDashboardPlugin(app)
+    plugin.setup()
+    await plugin.start()
+    try:
+        base = f"http://127.0.0.1:{unused_tcp_port}"
+        async with aiohttp.ClientSession() as s:
+            r = await s.patch(
+                base + "/api/translator/runtime",
+                json={"tgt_lang": "jpn_Jpan"},
+            )
+            assert r.status == 200
+            data = await r.json()
+        assert data["ok"] is True
+        assert data["persisted"] is True
+        # YAML file actually updated on disk.
+        on_disk = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        assert on_disk["translator_tgt_lang"] == "jpn_Jpan"
+        # Other keys preserved.
+        assert on_disk["translator_backend"] == "ctranslate2"
+        assert on_disk["pipeline_mode"] == "always_on"
     finally:
         await plugin.stop()
 
@@ -184,5 +237,86 @@ async def test_translator_runtime_patch_rejects_missing_field(unused_tcp_port):
             data = await r.json()
         assert data["ok"] is False
         assert "tgt_lang" in data["error"]
+    finally:
+        await plugin.stop()
+
+
+@pytest.mark.asyncio
+async def test_translator_runtime_patch_unwritable_yaml_returns_persist_error(
+    unused_tcp_port, tmp_path,
+):
+    """When the yaml file can't be written, runtime change still succeeds
+    but persisted=False + persist_error is surfaced in both HTTP response
+    and the broadcast payload."""
+    bad_path = tmp_path / "does" / "not" / "exist" / "config.yaml"
+    cfg = _cfg(unused_tcp_port)
+    cfg._source_path = str(bad_path)
+    app = _mk_app(unused_tcp_port, cfg)
+    plugin = DebugDashboardPlugin(app)
+    plugin.setup()
+    await plugin.start()
+    try:
+        base = f"http://127.0.0.1:{unused_tcp_port}"
+        async with aiohttp.ClientSession() as s:
+            r = await s.patch(
+                base + "/api/translator/runtime",
+                json={"tgt_lang": "jpn_Jpan"},
+            )
+            assert r.status == 200
+            data = await r.json()
+        assert data["ok"] is True
+        assert data["persisted"] is False
+        assert "persist_error" in data
+        # Runtime config still mutated despite persist failure.
+        assert cfg.translator_tgt_lang == "jpn_Jpan"
+        # Broadcast payload also carries persist_error so WS subscribers
+        # can react to the failure without polling the HTTP endpoint.
+        evt_name, evt_payload = app.broadcast.await_args.args
+        assert evt_name == "on_translator_runtime_change"
+        assert evt_payload["persisted"] is False
+        assert "persist_error" in evt_payload
+    finally:
+        await plugin.stop()
+
+
+@pytest.mark.asyncio
+async def test_translator_runtime_patch_same_value_skips_persist(
+    unused_tcp_port, tmp_path,
+):
+    """PATCHing the current value is not a noop (still broadcasts) but
+    skips the disk write to avoid spurious yaml churn."""
+    import yaml
+
+    yaml_path = tmp_path / "config.yaml"
+    yaml_path.write_text(
+        yaml.safe_dump(
+            {"translator_tgt_lang": "eng_Latn"},
+            default_flow_style=False,
+        ),
+        encoding="utf-8",
+    )
+    mtime_before = yaml_path.stat().st_mtime_ns
+    cfg = _cfg(unused_tcp_port)  # already has translator_tgt_lang="eng_Latn"
+    cfg._source_path = str(yaml_path)
+    app = _mk_app(unused_tcp_port, cfg)
+    plugin = DebugDashboardPlugin(app)
+    plugin.setup()
+    await plugin.start()
+    try:
+        base = f"http://127.0.0.1:{unused_tcp_port}"
+        async with aiohttp.ClientSession() as s:
+            r = await s.patch(
+                base + "/api/translator/runtime",
+                json={"tgt_lang": "eng_Latn"},
+            )
+            assert r.status == 200
+            data = await r.json()
+        assert data["ok"] is True
+        # Same value → not persisted (avoid spurious yaml churn).
+        assert data["persisted"] is False
+        # File on disk was NOT touched (mtime unchanged).
+        assert yaml_path.stat().st_mtime_ns == mtime_before
+        # Broadcast still fired so other tabs reflect the (no-op) state.
+        app.broadcast.assert_awaited()
     finally:
         await plugin.stop()

@@ -469,7 +469,10 @@
         throw new Error(msg);
       }
       const data = await r.json();
-      showToast("已切换到 " + (data.tgt_lang || tgt), "success");
+      const label = data.tgt_lang || tgt;
+      const note = data.persisted ? "已写入 yaml" : "运行时已生效，未持久化";
+      showToast("已切换到 " + label + "（" + note + "）", "success");
+      if (data.persist_error) showToast("持久化失败: " + data.persist_error, "error");
     } catch (e) {
       showToast("保存翻译设置失败: " + e.message, "error");
     }

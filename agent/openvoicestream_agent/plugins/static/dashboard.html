@@ -224,7 +224,7 @@
           源语种自动来自 ASR 识别结果；当前默认 fallback: <span id="translatorSrcLangText">–</span>
         </div>
         <div class="settings-warn muted small">
-          ⚠ 仅在 interpreter 模式下生效；目前只热生效，未持久化到 yaml（重启后失效）。
+          仅在 interpreter 模式下生效；保存会尝试写入 yaml（启动时通过 yaml 加载的 config 才能持久化），下次重启保留。
         </div>
         <div class="ms-actions">
           <button id="btnTranslatorSave" class="ctl-btn primary">保存</button>
