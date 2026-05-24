@@ -1043,17 +1043,26 @@ async def tts_stream(
     # FIX_1+FIX_3: prefer the BackendManager path so /admin/backend/reload's
     # drain logic sees streaming requests in flight. Fall back to the legacy
     # tts_service path only when the manager isn't initialised (ASR-only).
-    mgr = await _ensure_tts_manager_started()
+    #
+    # Codex MUST-FIX 1: this lazy-start await can raise (manager FAILED /
+    # DRAINING / init exception). The session slot was acquired just above
+    # and must NOT leak when an exception propagates before we hand it off
+    # to the StreamingResponse generator.
+    try:
+        mgr = await _ensure_tts_manager_started()
 
-    # Capability gate uses tts_service so the response shape stays consistent
-    # — both paths read the same underlying backend.
-    if not tts_service.has_capability(TTSCapability.STREAMING):
+        # Capability gate uses tts_service so the response shape stays
+        # consistent — both paths read the same underlying backend.
+        if not tts_service.has_capability(TTSCapability.STREAMING):
+            _release_session()
+            return JSONResponse(
+                {"error": "Streaming not supported by current backend",
+                 "required_capability": "streaming"},
+                status_code=501,
+            )
+    except Exception:
         _release_session()
-        return JSONResponse(
-            {"error": "Streaming not supported by current backend",
-             "required_capability": "streaming"},
-            status_code=501,
-        )
+        raise
 
     # Sentence-level streaming: split the request text into sentences (via
     # pysbd when the language is supported, regex fallback otherwise) and
@@ -1579,7 +1588,14 @@ async def tts_clone_stream(
 
     # FIX_1: enter manager.acquire() at endpoint scope so reload drain
     # observes the inflight streaming request immediately.
-    mgr = await _ensure_tts_manager_started()
+    #
+    # Codex MUST-FIX 1: lazy-start can raise — release the just-acquired
+    # session slot rather than leaking it on FAILED/DRAINING manager.
+    try:
+        mgr = await _ensure_tts_manager_started()
+    except Exception:
+        _release_session()
+        raise
     if mgr is not None:
         acquire_cm = mgr.acquire()
         backend = await acquire_cm.__aenter__()
@@ -2080,40 +2096,59 @@ async def v2v_stream(ws: WebSocket):
                             "error": "first message must be a config frame"})
         await ws.close(code=1003); _v2v_release_early(); return
 
-    asr_language    = cfg.get("asr_language")  # e.g. "zh" / "Chinese" / "en" / "auto" / None
-    tts_language    = cfg.get("tts_language")  # truthy = enable TTS; "auto" = let backend detect
-    # "auto" enables TTS but tells downstream (sentence buffer + backend) to
-    # not assume a language — backends with auto-detect (e.g. qwen3) will pick
-    # one from the text content; SentenceBuffer falls back to a regex splitter.
-    tts_language_norm = None if tts_language == "auto" else tts_language
-    # Normalize common client-supplied aliases to the lowercase full names
-    # qwen3 TTS expects ("chinese"/"english"/...). Sherpa TTS ignores the
-    # value entirely, so this is a no-op there.
-    if tts_language_norm:
-        _TTS_LANG_ALIAS = {
-            "zh": "chinese", "zh-cn": "chinese", "zh-hans": "chinese",
-            "en": "english", "en-us": "english", "en-gb": "english",
-            "ja": "japanese", "jp": "japanese",
-            "ko": "korean", "kr": "korean",
-        }
-        key = tts_language_norm.strip().lower()
-        tts_language_norm = _TTS_LANG_ALIAS.get(key, key)
-    tts_voice       = cfg.get("tts_voice")
-    tts_speaker_id = cfg.get("tts_speaker_id")
-    tts_speed       = cfg.get("tts_speed")
-    # Resolve speaker once at config time — avoids mid-session changes
-    # (e.g. unregister) affecting later sentences in the same session.
-    tts_speaker_kwargs: dict = {}
-    if tts_speaker_id is not None and tts_language:
-        from app.core.tts_speakers import speaker_kwargs_for_id
-        if tts_service.is_ready():
-            tts_speaker_kwargs = speaker_kwargs_for_id(
-                int(tts_speaker_id), tts_service.get_backend().model_id
-            )
-    sample_rate     = int(cfg.get("sample_rate", 16000))
-    vad_backend     = cfg.get("vad", _default_vad_backend() if asr_language else "none")
-    vad_silence_ms  = int(cfg.get("vad_silence_ms", _default_vad_silence_ms()))
-    multi_utterance = bool(cfg.get("multi_utterance", False))
+    # Codex MUST-FIX 1: config parsing below can raise ValueError/TypeError
+    # on bad client input (e.g. non-int sample_rate). Without this guard,
+    # the exception escapes the slot-acquired region without releasing the
+    # session token / decrementing the active-WS gauge / unregistering from
+    # BackendManagers.
+    try:
+        asr_language    = cfg.get("asr_language")  # e.g. "zh" / "Chinese" / "en" / "auto" / None
+        tts_language    = cfg.get("tts_language")  # truthy = enable TTS; "auto" = let backend detect
+        # "auto" enables TTS but tells downstream (sentence buffer + backend) to
+        # not assume a language — backends with auto-detect (e.g. qwen3) will pick
+        # one from the text content; SentenceBuffer falls back to a regex splitter.
+        tts_language_norm = None if tts_language == "auto" else tts_language
+        # Normalize common client-supplied aliases to the lowercase full names
+        # qwen3 TTS expects ("chinese"/"english"/...). Sherpa TTS ignores the
+        # value entirely, so this is a no-op there.
+        if tts_language_norm:
+            _TTS_LANG_ALIAS = {
+                "zh": "chinese", "zh-cn": "chinese", "zh-hans": "chinese",
+                "en": "english", "en-us": "english", "en-gb": "english",
+                "ja": "japanese", "jp": "japanese",
+                "ko": "korean", "kr": "korean",
+            }
+            key = tts_language_norm.strip().lower()
+            tts_language_norm = _TTS_LANG_ALIAS.get(key, key)
+        tts_voice       = cfg.get("tts_voice")
+        tts_speaker_id = cfg.get("tts_speaker_id")
+        tts_speed       = cfg.get("tts_speed")
+        # Resolve speaker once at config time — avoids mid-session changes
+        # (e.g. unregister) affecting later sentences in the same session.
+        tts_speaker_kwargs: dict = {}
+        if tts_speaker_id is not None and tts_language:
+            from app.core.tts_speakers import speaker_kwargs_for_id
+            if tts_service.is_ready():
+                tts_speaker_kwargs = speaker_kwargs_for_id(
+                    int(tts_speaker_id), tts_service.get_backend().model_id
+                )
+        sample_rate     = int(cfg.get("sample_rate", 16000))
+        vad_backend     = cfg.get("vad", _default_vad_backend() if asr_language else "none")
+        vad_silence_ms  = int(cfg.get("vad_silence_ms", _default_vad_silence_ms()))
+        multi_utterance = bool(cfg.get("multi_utterance", False))
+    except (ValueError, TypeError) as _cfg_exc:
+        try:
+            await ws.send_json({"type": v2v_proto.SERVER_ERROR,
+                                "error": f"invalid config field: {_cfg_exc}"})
+        except Exception:
+            pass
+        try:
+            await ws.close(code=1003)
+        except Exception:
+            pass
+        _v2v_release_early()
+        reset_request_context(_v2v_ctx_tokens)
+        return
 
     if not asr_language and not tts_language:
         await ws.send_json({"type": v2v_proto.SERVER_ERROR,
