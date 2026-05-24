@@ -26,13 +26,50 @@ class _WSHandle:
         self.task = task
 from typing import Literal, Optional
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+# Week 2: configure logging (JSON or text) from OVS_LOG_FORMAT before
+# any other module emits a startup log. Falls back gracefully to the
+# legacy text format if the env var is unset/invalid.
+from app.core.logging_config import (  # noqa: E402  (must precede app creation)
+    setup_logging,
+    set_request_context,
+    reset_request_context,
+    request_id_from_headers,
+    generate_request_id,
+    mask_url_query,
 )
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Jetson Speech Service", version="2.0.0")
+
+
+# Week 2: HTTP middleware injects/propagates X-Request-ID and stores it
+# in the request_id contextvar so every log line from the handler can
+# include it. Never reads request body. Probes (/livez /readyz /health
+# /metrics) are NOT skipped because we still want the response header.
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    inbound = request_id_from_headers(request.headers)
+    request_id = inbound or generate_request_id()
+    tokens = set_request_context(request_id=request_id)
+    try:
+        try:
+            response = await call_next(request)
+        except Exception:
+            # Make sure the request_id is visible in the exception log
+            # before we propagate so operators can correlate.
+            logger.exception(
+                "unhandled exception in request: %s",
+                mask_url_query(str(request.url)),
+            )
+            raise
+        # Add the response header. Streaming responses are passed through
+        # unchanged; the generator captures its own context.
+        response.headers["X-Request-ID"] = request_id
+        return response
+    finally:
+        reset_request_context(tokens)
 
 
 # Week 1 production hardening: optional API-key auth for public voice
@@ -1704,11 +1741,17 @@ async def asr_stream(
     if not await check_ws(ws):
         return
 
+    # Week 2: capture/generate request id before accept so the very
+    # first WS log line carries the same correlator as later logs.
+    _ws_request_id = request_id_from_headers(ws.headers) or generate_request_id()
+    _ws_ctx_tokens = set_request_context(request_id=_ws_request_id)
+
     await ws.accept()
 
     # Reject-not-queue admission gate.
     _session_token = await try_acquire_ws(ws, "/asr/stream")
     if _session_token is None:
+        reset_request_context(_ws_ctx_tokens)
         return
 
     # Week 2: track active streaming WS for /metrics. Paired decrement
@@ -1771,6 +1814,7 @@ async def asr_stream(
                 _m_ws.dec_active_ws_sessions()
             except Exception:
                 pass
+        reset_request_context(_ws_ctx_tokens)
 
 
 async def _asr_stream_backend(
@@ -1968,11 +2012,16 @@ async def v2v_stream(ws: WebSocket):
     if not await check_ws(ws):
         return
 
+    # Week 2: request id context for V2V WS.
+    _v2v_request_id = request_id_from_headers(ws.headers) or generate_request_id()
+    _v2v_ctx_tokens = set_request_context(request_id=_v2v_request_id)
+
     await ws.accept()
 
     # Reject-not-queue admission gate.
     _v2v_session_token = await try_acquire_ws(ws, "/v2v/stream")
     if _v2v_session_token is None:
+        reset_request_context(_v2v_ctx_tokens)
         return
 
     # Week 2: active WS gauge increment. Paired decrement is in both the
@@ -2010,6 +2059,9 @@ async def v2v_stream(ws: WebSocket):
                 _m_v2v.dec_active_ws_sessions()
             except Exception:
                 pass
+        # Note: do not reset_request_context here because the early-exit
+        # helper may be called inside try/finally that itself resets;
+        # caller is responsible for context cleanup.
 
     # ── Stage 1: receive initial config ─────────────────────────────
     try:
@@ -2639,6 +2691,7 @@ async def v2v_stream(ws: WebSocket):
                 _v2v_ws_metric_taken = False
             except Exception:
                 pass
+        reset_request_context(_v2v_ctx_tokens)
         logger.info("v2v stream closed")
 
 
