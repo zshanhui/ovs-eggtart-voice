@@ -14,6 +14,7 @@ see the new value.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import os
@@ -86,13 +87,23 @@ def _extract_bearer(authorization: str | None) -> str | None:
 def mask_key(value: str | None) -> str:
     """Return a log-safe mask of a key/token value.
 
-    First up to 8 chars + ``...``; shorter values use whatever prefix
-    exists. ``None`` or empty becomes ``<missing>``.
+    Never exposes any prefix of the raw token. Format:
+      - ``None`` or empty (incl. whitespace-only)  → ``"<missing>"``
+      - non-empty → ``"<masked:" + sha256(value)[:6] + ">"``
+
+    The 6-hex-digit truncated SHA-256 is one-way but stable for the same
+    input, so operators can still correlate auth-rejection log lines
+    across a single rotation window without ever seeing the raw key.
+    See codex MUST-FIX 3.
     """
-    if not value:
+    if value is None:
         return "<missing>"
-    prefix = value[:8]
-    return f"{prefix}..."
+    # Treat whitespace-only or empty as missing too.
+    s = value if isinstance(value, str) else str(value)
+    if not s.strip():
+        return "<missing>"
+    digest = hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()[:6]
+    return f"<masked:{digest}>"
 
 
 # ---------------------------------------------------------------------------

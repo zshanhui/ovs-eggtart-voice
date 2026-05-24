@@ -146,22 +146,25 @@ _TOKEN_RE = re.compile(r"(token=)([^&\s]+)", re.IGNORECASE)
 
 
 def mask_sensitive_value(value: str | None) -> str:
-    """Mask a secret-ish value to a short prefix + ellipsis."""
-    if not value:
-        return "<missing>"
-    return f"{value[:8]}..."
+    """Mask a secret-ish value.
+
+    Delegates to :func:`app.core.api_auth.mask_key` so HTTP, WS, and log
+    masking share a single non-reversible representation (sha256 prefix
+    placeholder). See codex MUST-FIX 3.
+    """
+    from app.core.api_auth import mask_key
+    return mask_key(value)
 
 
 def mask_url_query(url: str) -> str:
     """Mask ``token=...`` (any number of occurrences) in a URL or query string."""
     if not url:
         return url
+    from app.core.api_auth import mask_key
 
     def _sub(m: re.Match) -> str:
         prefix, val = m.group(1), m.group(2)
-        if not val:
-            return f"{prefix}<missing>"
-        return f"{prefix}<masked>"
+        return f"{prefix}{mask_key(val)}"
 
     return _TOKEN_RE.sub(_sub, url)
 

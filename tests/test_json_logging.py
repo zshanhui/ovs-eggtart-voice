@@ -133,20 +133,23 @@ def test_mask_sensitive_value_default_missing():
     assert lc.mask_sensitive_value("") == "<missing>"
 
 
-def test_mask_sensitive_value_shows_prefix():
-    assert lc.mask_sensitive_value("abcdefghij") == "abcdefgh..."
+def test_mask_sensitive_value_never_exposes_prefix():
+    raw = "abcdefghij"
+    out = lc.mask_sensitive_value(raw)
+    assert raw[:3] not in out and raw[:8] not in out
+    assert out.startswith("<masked:") and out.endswith(">")
 
 
 def test_mask_url_query_single_token():
     masked = lc.mask_url_query("/ws?foo=bar&token=secret-key&x=1")
     assert "secret-key" not in masked
-    assert "token=<masked>" in masked
+    assert "token=<masked:" in masked
     assert "foo=bar" in masked
 
 
 def test_mask_url_query_multiple_tokens():
     masked = lc.mask_url_query("/ws?token=alpha&token=beta")
-    assert masked.count("<masked>") == 2
+    assert masked.count("<masked:") == 2
     assert "alpha" not in masked
     assert "beta" not in masked
 

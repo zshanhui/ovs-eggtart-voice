@@ -55,12 +55,52 @@ def test_extract_bearer():
 
 
 def test_mask_key():
+    import hashlib
     assert api_auth.mask_key(None) == "<missing>"
     assert api_auth.mask_key("") == "<missing>"
-    assert api_auth.mask_key("short") == "short..."
-    # Never returns the raw long key (>8 chars truncated).
-    assert api_auth.mask_key("supersecretkey1234567") == "supersec..."
-    assert "1234567" not in api_auth.mask_key("supersecretkey1234567")
+    # Whitespace-only is also treated as missing.
+    assert api_auth.mask_key("   ") == "<missing>"
+    # Non-empty: never exposes any prefix of the raw token.
+    out_short = api_auth.mask_key("short")
+    assert out_short.startswith("<masked:") and out_short.endswith(">")
+    assert "short" not in out_short
+
+    raw = "supersecretkey1234567"
+    out = api_auth.mask_key(raw)
+    # No raw substring ever leaks.
+    for n in range(3, len(raw) + 1):
+        assert raw[:n] not in out
+    assert "1234567" not in out
+    # Stable: same input → same masked output.
+    assert api_auth.mask_key(raw) == out
+    # Deterministic hash check.
+    expected = hashlib.sha256(raw.encode()).hexdigest()[:6]
+    assert out == f"<masked:{expected}>"
+
+
+def test_mask_key_does_not_expose_token_prefix():
+    """Codex MUST-FIX 3: mask_key must never return a multi-char prefix of raw."""
+    raw = "secret123abcdef"
+    masked = api_auth.mask_key(raw)
+    # Walk prefixes of length 2+ — single-char "s" can incidentally appear
+    # in the literal "<masked:...>" format, which is fine.
+    for n in range(2, len(raw) + 1):
+        assert raw[:n] not in masked, (
+            f"mask_key leaked prefix {raw[:n]!r} via output {masked!r}"
+        )
+    assert "secret" not in masked
+    assert "secret123" not in masked
+    assert "abcdef" not in masked
+    # And the format is the fixed placeholder, never resembling the raw.
+    assert masked.startswith("<masked:") and masked.endswith(">")
+
+
+def test_mask_key_consistent_hash():
+    """Same token → same masked output (operator log correlation)."""
+    raw = "another-very-long-api-key-zz"
+    assert api_auth.mask_key(raw) == api_auth.mask_key(raw)
+    # Different token → different masked output (overwhelmingly likely).
+    assert api_auth.mask_key(raw) != api_auth.mask_key(raw + "x")
 
 
 def test_matches_constant_time():
