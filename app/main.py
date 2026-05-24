@@ -35,6 +35,14 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Jetson Speech Service", version="2.0.0")
 
 
+# Week 1 production hardening: optional API-key auth for public voice
+# endpoints. Disabled when OVS_API_KEYS is unset/empty. See
+# docs/specs/prod-hardening-week1.md Deliverable 1.
+def _require_api_key(request: Request) -> None:
+    from app.core.api_auth import check_http
+    check_http(request)
+
+
 class TTSRequest(BaseModel):
     text: str
     sid: int | None = None
@@ -326,6 +334,18 @@ async def startup():
         logger.error("Failed to apply OpenVoiceStream profile: %s", exc)
         raise
 
+    # Week 1 production hardening: initialise the global session limiter
+    # immediately after profile application, BEFORE model downloads and
+    # backend preload. A bad limit value (zero/negative/non-int env) MUST
+    # fail startup early. See docs/specs/prod-hardening-week1.md
+    # Deliverable 2.
+    try:
+        from app.core.session_limiter import init_limiter
+        init_limiter(current_profile())
+    except Exception as exc:
+        logger.error("SessionLimiter init failed: %s", exc)
+        raise
+
     # Initialise the execution coordinator from the loaded profile's
     # execution_policy block. Default to concurrent (no lock) when the
     # profile does not declare one — matches the previous behaviour.
@@ -560,6 +580,95 @@ async def startup():
 
 # ── Health & Capabilities ────────────────────────────────────────
 
+# RFC 8594 deprecation hint pointing /health users at /readyz.
+_HEALTH_DEPRECATION_HEADERS = {
+    "Deprecation": "true",
+    "Link": '</readyz>; rel="successor-version"',
+}
+
+
+@app.get("/livez")
+async def livez():
+    """Process-liveness probe (always 200 while the route is reachable).
+
+    No backend / GPU / model / profile dependency. Use this for
+    orchestrator liveness restart policy; ``/readyz`` controls traffic
+    admission instead.
+    """
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/readyz")
+async def readyz():
+    """Readiness probe: 200 only when the service should receive traffic.
+
+    Ready iff:
+      * Required BackendManager(s) report READY (ASR always; TTS unless
+        the profile is ASR-only or ``LAZY_TTS=1``).
+      * The global session limiter has free capacity.
+      * ``gpu_watchdog.is_ok()`` returns True.
+
+    Read-only: never acquires a session slot, never mutates limiter
+    state. Returns 503 with stable ``reasons[]`` otherwise (see spec
+    Deliverable 3).
+    """
+    from app.core import backend_manager as _bm_mod
+    from app.core import session_limiter as _sl_mod
+    from app.core import gpu_watchdog as _gw_mod
+    from app.core import tts_service
+
+    reasons: list[str] = []
+
+    # BackendManager readiness — only managers that are *required* for
+    # the active profile.
+    try:
+        asr_mgr = _bm_mod.asr_manager()
+    except Exception:
+        asr_mgr = None
+    try:
+        tts_mgr = _bm_mod.tts_manager()
+    except Exception:
+        tts_mgr = None
+
+    asr_required = _get_asr_backend() is not None
+    lazy_tts = os.environ.get("LAZY_TTS", "").lower() in ("1", "true", "yes")
+    tts_required = tts_service.is_configured() and not lazy_tts
+
+    if asr_required:
+        if asr_mgr is None:
+            reasons.append("backend_manager_unavailable")
+        elif not asr_mgr.is_ready():
+            reasons.append("backend_not_ready")
+    if tts_required:
+        if tts_mgr is None:
+            if "backend_manager_unavailable" not in reasons:
+                reasons.append("backend_manager_unavailable")
+        elif not tts_mgr.is_ready():
+            if "backend_not_ready" not in reasons:
+                reasons.append("backend_not_ready")
+
+    # Session capacity.
+    limiter = _sl_mod.get_limiter()
+    if limiter is None:
+        reasons.append("session_limiter_unavailable")
+    elif limiter.available <= 0:
+        reasons.append("sessions_full")
+
+    # GPU/NPU watchdog (Week 1 stub always-ok).
+    try:
+        if not _gw_mod.is_ok():
+            reasons.append("gpu_watchdog_failed")
+    except Exception:
+        reasons.append("gpu_watchdog_failed")
+
+    if reasons:
+        return JSONResponse(
+            {"status": "not_ready", "reasons": reasons},
+            status_code=503,
+        )
+    return JSONResponse({"status": "ready"})
+
+
 @app.get("/health")
 async def health():
     from app.core import tts_service
@@ -593,11 +702,13 @@ async def health():
         result["asr_backend"] = None
         result["asr_capabilities"] = []
 
-    return result
+    # /health is preserved for backward-compat but deprecated; orchestrators
+    # should migrate to /readyz (RFC 8594 Deprecation hint).
+    return JSONResponse(result, headers=_HEALTH_DEPRECATION_HEADERS)
 
 
 @app.get("/asr/capabilities")
-async def asr_capabilities():
+async def asr_capabilities(_: None = Depends(_require_api_key)):
     """Return ASR backend info and supported capabilities."""
     asr_be = _get_asr_backend()
     if not asr_be or not asr_be.is_ready():
@@ -613,7 +724,7 @@ async def asr_capabilities():
 
 
 @app.get("/tts/capabilities")
-async def tts_capabilities():
+async def tts_capabilities(_: None = Depends(_require_api_key)):
     """Return TTS backend info and supported capabilities."""
     from app.core import tts_service
     from app.core.tts_speakers import available_speakers
@@ -639,7 +750,7 @@ class RegisterSpeakerRequest(BaseModel):
 
 
 @app.get("/tts/speakers")
-async def tts_speakers_list():
+async def tts_speakers_list(_: None = Depends(_require_api_key)):
     """List all speakers registered for the active TTS model."""
     from app.core import tts_service
     from app.core.tts_speakers import available_speakers, default_speaker_id
@@ -654,7 +765,10 @@ async def tts_speakers_list():
 
 
 @app.post("/tts/speakers/register")
-async def tts_speakers_register(req: RegisterSpeakerRequest):
+async def tts_speakers_register(
+    req: RegisterSpeakerRequest,
+    _: None = Depends(_require_api_key),
+):
     """Register a voice-clone embedding as a persistent speaker.
 
     Accepts a base64-encoded speaker embedding (from /tts/clone/embedding)
@@ -699,7 +813,10 @@ async def tts_speakers_register(req: RegisterSpeakerRequest):
 
 
 @app.delete("/tts/speakers/{speaker_id}")
-async def tts_speakers_delete(speaker_id: int):
+async def tts_speakers_delete(
+    speaker_id: int,
+    _: None = Depends(_require_api_key),
+):
     """Delete a registered embedding speaker. Preset speakers cannot be deleted."""
     from app.core import tts_service
     from app.core.tts_speakers import unregister_speaker
@@ -720,7 +837,16 @@ async def tts_speakers_delete(speaker_id: int):
 # ── TTS ──────────────────────────────────────────────────────────
 
 @app.post("/tts")
-async def tts(req: TTSRequest):
+async def tts(req: TTSRequest, _: None = Depends(_require_api_key)):
+    from app.core import tts_service
+    from app.core.coordinator import get_coordinator
+    from app.core.session_limiter import acquire_http
+
+    async with acquire_http("/tts"):
+        return await _tts_synthesize(req)
+
+
+async def _tts_synthesize(req: TTSRequest):
     from app.core import tts_service
     from app.core.coordinator import get_coordinator
 
@@ -771,13 +897,40 @@ async def tts_stream_options():
 
 
 @app.post("/tts/stream")
-async def tts_stream(req: TTSRequest, request: Request):
+async def tts_stream(
+    req: TTSRequest,
+    request: Request,
+    _: None = Depends(_require_api_key),
+):
     """Stream TTS as raw PCM: first 4 bytes = sample_rate (uint32 LE), then int16 PCM chunks."""
     import asyncio
     import struct
     from app.core import tts_service
     from app.core.tts_backend import TTSCapability
     from app.core.coordinator import get_coordinator
+    from app.core.session_limiter import get_limiter
+    from app.core import metrics as _metrics
+
+    # Reject-not-queue: acquire session slot BEFORE setup work. Slot
+    # ownership is handed to the StreamingResponse generator's finally
+    # block so it releases on disconnect / exception / normal end.
+    _sl = get_limiter()
+    _session_token = None
+    if _sl is not None:
+        _session_token = _sl.try_acquire()
+        if _session_token is None:
+            snap = _sl.snapshot()
+            _metrics.inc_sessions_rejected("http")
+            return JSONResponse(
+                {"error": "too_many_sessions",
+                 "current": snap["active"], "limit": snap["limit"]},
+                status_code=429,
+                headers={"Retry-After": "5"},
+            )
+
+    def _release_session():
+        if _session_token is not None:
+            _session_token.release()
 
     # FIX_1+FIX_3: prefer the BackendManager path so /admin/backend/reload's
     # drain logic sees streaming requests in flight. Fall back to the legacy
@@ -787,6 +940,7 @@ async def tts_stream(req: TTSRequest, request: Request):
     # Capability gate uses tts_service so the response shape stays consistent
     # — both paths read the same underlying backend.
     if not tts_service.has_capability(TTSCapability.STREAMING):
+        _release_session()
         return JSONResponse(
             {"error": "Streaming not supported by current backend",
              "required_capability": "streaming"},
@@ -811,6 +965,7 @@ async def tts_stream(req: TTSRequest, request: Request):
                 voice_kwargs = _request_voice_kwargs(req, backend=backend)
             except ValueError as exc:
                 await acquire_cm.__aexit__(None, None, None)
+                _release_session()
                 return JSONResponse({"error": str(exc)}, status_code=400)
             sr = backend.sample_rate
 
@@ -1009,10 +1164,12 @@ async def tts_stream(req: TTSRequest, request: Request):
                         except (asyncio.CancelledError, Exception):
                             pass
                     await acquire_cm.__aexit__(None, None, None)
+                    _release_session()
 
             return StreamingResponse(stream(), media_type="application/octet-stream")
         except Exception:
             await acquire_cm.__aexit__(None, None, None)
+            _release_session()
             raise
 
     # Manager not initialised — legacy direct-backend path.
@@ -1021,12 +1178,16 @@ async def tts_stream(req: TTSRequest, request: Request):
     try:
         voice_kwargs = _request_voice_kwargs(req, backend=backend)
     except ValueError as exc:
+        _release_session()
         return JSONResponse({"error": str(exc)}, status_code=400)
 
     if not sentences:
         async def empty():
-            async with get_coordinator().acquire("tts"):
-                yield struct.pack("<I", sr)
+            try:
+                async with get_coordinator().acquire("tts"):
+                    yield struct.pack("<I", sr)
+            finally:
+                _release_session()
         return StreamingResponse(empty(), media_type="application/octet-stream")
 
     async def stream_legacy():
@@ -1121,6 +1282,7 @@ async def tts_stream(req: TTSRequest, request: Request):
                     await watcher_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            _release_session()
 
     return StreamingResponse(stream_legacy(), media_type="application/octet-stream")
 
@@ -1128,8 +1290,19 @@ async def tts_stream(req: TTSRequest, request: Request):
 # ── Voice Clone ───��──────────────────────────────────────────────
 
 @app.post("/tts/clone")
-async def tts_clone(req: CloneRequest):
+async def tts_clone(req: CloneRequest, _: None = Depends(_require_api_key)):
     """Synthesize with voice cloning. Requires voice_clone capability."""
+    import base64
+    from app.core import tts_service
+    from app.core.tts_backend import TTSCapability
+    from app.core.coordinator import get_coordinator
+    from app.core.session_limiter import acquire_http
+
+    async with acquire_http("/tts/clone"):
+        return await _tts_clone_impl(req)
+
+
+async def _tts_clone_impl(req: CloneRequest):
     import base64
     from app.core import tts_service
     from app.core.tts_backend import TTSCapability
@@ -1177,7 +1350,10 @@ async def tts_clone(req: CloneRequest):
 
 
 @app.post("/tts/clone/embedding")
-async def tts_extract_embedding(file: UploadFile = File(...)):
+async def tts_extract_embedding(
+    file: UploadFile = File(...),
+    _: None = Depends(_require_api_key),
+):
     """Extract speaker embedding from reference audio WAV.
 
     Returns base64-encoded speaker embedding that can be reused
@@ -1186,6 +1362,7 @@ async def tts_extract_embedding(file: UploadFile = File(...)):
     import base64
     from app.core import tts_service
     from app.core.tts_backend import TTSCapability
+    from app.core.session_limiter import acquire_http
 
     if not tts_service.has_capability(TTSCapability.VOICE_CLONE):
         return JSONResponse(
@@ -1195,18 +1372,22 @@ async def tts_extract_embedding(file: UploadFile = File(...)):
             status_code=501,
         )
 
-    audio_bytes = await file.read()
-    from app.core.coordinator import get_coordinator
-    async with get_coordinator().acquire("tts"):
-        embedding = tts_service.extract_speaker_embedding(audio_bytes)
-    return {
-        "speaker_embedding_b64": base64.b64encode(embedding).decode(),
-        "embedding_size": len(embedding),
-    }
+    async with acquire_http("/tts/clone/embedding"):
+        audio_bytes = await file.read()
+        from app.core.coordinator import get_coordinator
+        async with get_coordinator().acquire("tts"):
+            embedding = tts_service.extract_speaker_embedding(audio_bytes)
+        return {
+            "speaker_embedding_b64": base64.b64encode(embedding).decode(),
+            "embedding_size": len(embedding),
+        }
 
 
 @app.post("/tts/clone/stream")
-async def tts_clone_stream(req: CloneStreamRequest):
+async def tts_clone_stream(
+    req: CloneStreamRequest,
+    _: None = Depends(_require_api_key),
+):
     """Stream TTS with voice cloning.
 
     Returns raw PCM: first 4 bytes = sample_rate (uint32 LE), then int16 PCM chunks.
@@ -1217,6 +1398,8 @@ async def tts_clone_stream(req: CloneStreamRequest):
     import base64
     from app.core import tts_service
     from app.core.tts_backend import TTSCapability
+    from app.core.session_limiter import get_limiter
+    from app.core import metrics as _metrics
 
     if not tts_service.has_capability(TTSCapability.VOICE_CLONE):
         return JSONResponse(
@@ -1237,6 +1420,26 @@ async def tts_clone_stream(req: CloneStreamRequest):
         speaker_embedding = base64.b64decode(req.speaker_embedding_b64)
     except Exception:
         return JSONResponse({"error": "Invalid base64 speaker_embedding_b64"}, status_code=400)
+
+    # Reject-not-queue admission gate. Slot lifetime spans the entire
+    # streaming response — release happens in the generator finally.
+    _sl = get_limiter()
+    _session_token = None
+    if _sl is not None:
+        _session_token = _sl.try_acquire()
+        if _session_token is None:
+            snap = _sl.snapshot()
+            _metrics.inc_sessions_rejected("http")
+            return JSONResponse(
+                {"error": "too_many_sessions",
+                 "current": snap["active"], "limit": snap["limit"]},
+                status_code=429,
+                headers={"Retry-After": "5"},
+            )
+
+    def _release_session():
+        if _session_token is not None:
+            _session_token.release()
 
     from app.core.coordinator import get_coordinator
 
@@ -1284,10 +1487,12 @@ async def tts_clone_stream(req: CloneStreamRequest):
                             yield chunk
                 finally:
                     await acquire_cm.__aexit__(None, None, None)
+                    _release_session()
 
             return StreamingResponse(stream(), media_type="application/octet-stream")
         except Exception:
             await acquire_cm.__aexit__(None, None, None)
+            _release_session()
             raise
 
     # Legacy fallback (manager not initialised).
@@ -1295,27 +1500,30 @@ async def tts_clone_stream(req: CloneStreamRequest):
     backend = tts_service.get_backend()
 
     async def stream_legacy():
-        async with get_coordinator().acquire("tts"):
-            yield struct.pack("<I", sr)
-            loop = asyncio.get_event_loop()
-            queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        try:
+            async with get_coordinator().acquire("tts"):
+                yield struct.pack("<I", sr)
+                loop = asyncio.get_event_loop()
+                queue: asyncio.Queue[bytes | None] = asyncio.Queue()
 
-            def _run():
-                try:
-                    for chunk in backend.generate_streaming(req.text, **stream_kwargs):
-                        loop.call_soon_threadsafe(queue.put_nowait, chunk)
-                except Exception:
-                    logger.exception("tts/clone/stream synthesis failed")
-                finally:
-                    loop.call_soon_threadsafe(queue.put_nowait, None)
+                def _run():
+                    try:
+                        for chunk in backend.generate_streaming(req.text, **stream_kwargs):
+                            loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                    except Exception:
+                        logger.exception("tts/clone/stream synthesis failed")
+                    finally:
+                        loop.call_soon_threadsafe(queue.put_nowait, None)
 
-            loop.run_in_executor(_get_tts_stream_executor(), _run)
+                loop.run_in_executor(_get_tts_stream_executor(), _run)
 
-            while True:
-                chunk = await queue.get()
-                if chunk is None:
-                    break
-                yield chunk
+                while True:
+                    chunk = await queue.get()
+                    if chunk is None:
+                        break
+                    yield chunk
+        finally:
+            _release_session()
 
     return StreamingResponse(stream_legacy(), media_type="application/octet-stream")
 
@@ -1326,7 +1534,14 @@ async def tts_clone_stream(req: CloneStreamRequest):
 async def asr(
     file: UploadFile = File(...),
     language: str = Query("auto"),
+    _: None = Depends(_require_api_key),
 ):
+    from app.core.session_limiter import acquire_http
+    async with acquire_http("/asr"):
+        return await _asr_impl(file, language)
+
+
+async def _asr_impl(file: UploadFile, language: str):
     audio_bytes = await file.read()
 
     from app.core.coordinator import get_coordinator
@@ -1382,8 +1597,20 @@ async def asr_stream(
     import asyncio
     import numpy as np
     from app.core.asr_backend import ASRCapability
+    from app.core.api_auth import check_ws
+    from app.core.session_limiter import try_acquire_ws
+
+    # Auth runs BEFORE accept (when possible). check_ws() accepts+closes
+    # 4401 on failure so the WS hand-off is deterministic.
+    if not await check_ws(ws):
+        return
 
     await ws.accept()
+
+    # Reject-not-queue admission gate.
+    _session_token = await try_acquire_ws(ws, "/asr/stream")
+    if _session_token is None:
+        return
 
     # Register this WS session with the BackendManager (if available) so a
     # subsequent /admin/backend/reload can force-close it (code 1012) and
@@ -1428,6 +1655,8 @@ async def asr_stream(
     finally:
         if _asr_mgr is not None:
             _asr_mgr.unregister_ws(_ws_handle)
+        if _session_token is not None:
+            _session_token.release()
 
 
 async def _asr_stream_backend(
@@ -1618,7 +1847,19 @@ async def v2v_stream(ws: WebSocket):
 
     coord = get_coordinator()
 
+    from app.core.api_auth import check_ws
+    from app.core.session_limiter import try_acquire_ws
+
+    # Auth before accept; deterministic 4401 close on failure.
+    if not await check_ws(ws):
+        return
+
     await ws.accept()
+
+    # Reject-not-queue admission gate.
+    _v2v_session_token = await try_acquire_ws(ws, "/v2v/stream")
+    if _v2v_session_token is None:
+        return
 
     # Register this v2v session with whichever BackendManager(s) are
     # available so /admin/backend/reload of either kind can hard-close
@@ -1631,22 +1872,32 @@ async def v2v_stream(ws: WebSocket):
     if _v2v_tts_mgr is not None:
         _v2v_tts_mgr.register_ws(_v2v_handle)
 
+    def _v2v_release_early():
+        # Release admission resources for early-exit paths that bypass
+        # the main try/finally below.
+        if _v2v_asr_mgr is not None:
+            _v2v_asr_mgr.unregister_ws(_v2v_handle)
+        if _v2v_tts_mgr is not None:
+            _v2v_tts_mgr.unregister_ws(_v2v_handle)
+        if _v2v_session_token is not None:
+            _v2v_session_token.release()
+
     # ── Stage 1: receive initial config ─────────────────────────────
     try:
         first_msg = await ws.receive()
     except WebSocketDisconnect:
-        return
+        _v2v_release_early(); return
     cfg_text = first_msg.get("text", "")
     if not cfg_text:
-        await ws.close(code=1003); return
+        await ws.close(code=1003); _v2v_release_early(); return
     try:
         cfg = _json.loads(cfg_text)
     except (ValueError, TypeError):
-        await ws.close(code=1003); return
+        await ws.close(code=1003); _v2v_release_early(); return
     if cfg.get("type") != v2v_proto.CLIENT_CONFIG:
         await ws.send_json({"type": v2v_proto.SERVER_ERROR,
                             "error": "first message must be a config frame"})
-        await ws.close(code=1003); return
+        await ws.close(code=1003); _v2v_release_early(); return
 
     asr_language    = cfg.get("asr_language")  # e.g. "zh" / "Chinese" / "en" / "auto" / None
     tts_language    = cfg.get("tts_language")  # truthy = enable TTS; "auto" = let backend detect
@@ -1686,7 +1937,7 @@ async def v2v_stream(ws: WebSocket):
     if not asr_language and not tts_language:
         await ws.send_json({"type": v2v_proto.SERVER_ERROR,
                             "error": "config must enable asr_language and/or tts_language"})
-        await ws.close(code=1003); return
+        await ws.close(code=1003); _v2v_release_early(); return
 
     # ── Stage 2: bring up the backends ──────────────────────────────
     asr_be = None
@@ -1698,7 +1949,7 @@ async def v2v_stream(ws: WebSocket):
         if asr_be is None or not asr_be.is_ready() or not asr_be.has_capability(ASRCapability.STREAMING):
             await ws.send_json({"type": v2v_proto.SERVER_ERROR,
                                 "error": "asr_language requested but no streaming ASR backend ready"})
-            await ws.close(code=1011); return
+            await ws.close(code=1011); _v2v_release_early(); return
         # Defer stream creation until first speech-start (or first audio
         # without VAD) — the manager creates a fresh stream per utterance.
         from app.core.asr_session_manager import ASRSessionManager
@@ -1721,7 +1972,7 @@ async def v2v_stream(ws: WebSocket):
             )
         except ValueError as e:
             await ws.send_json({"type": v2v_proto.SERVER_ERROR, "error": f"VAD config: {e}"})
-            await ws.close(code=1003); return
+            await ws.close(code=1003); _v2v_release_early(); return
         except Exception as e:
             logger.warning("v2v VAD init (%s) failed: %s — running without VAD", vad_backend, e)
             vad = None
@@ -1732,7 +1983,7 @@ async def v2v_stream(ws: WebSocket):
         if not tts_service.is_ready() or not tts_service.has_capability(TTSCapability.STREAMING):
             await ws.send_json({"type": v2v_proto.SERVER_ERROR,
                                 "error": "tts_language requested but no streaming TTS backend ready"})
-            await ws.close(code=1011); return
+            await ws.close(code=1011); _v2v_release_early(); return
         tts_be = tts_service.get_backend()
         low_latency_tts = os.environ.get("OVS_TTS_LOW_LATENCY_CHUNKING", "1").lower() not in (
             "0",
@@ -2250,6 +2501,8 @@ async def v2v_stream(ws: WebSocket):
             _v2v_asr_mgr.unregister_ws(_v2v_handle)
         if _v2v_tts_mgr is not None:
             _v2v_tts_mgr.unregister_ws(_v2v_handle)
+        if _v2v_session_token is not None:
+            _v2v_session_token.release()
         logger.info("v2v stream closed")
 
 
