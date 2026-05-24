@@ -138,6 +138,12 @@ class DebugDashboardPlugin(Plugin):
         web_app.router.add_get("/api/agent/settings", self._api_agent_settings_get)
         web_app.router.add_post("/api/agent/settings", self._api_agent_settings_post)
         web_app.router.add_post("/api/llm/probe", self._api_llm_probe)
+        web_app.router.add_get(
+            "/api/translator/runtime", self._api_translator_runtime_get
+        )
+        web_app.router.add_patch(
+            "/api/translator/runtime", self._api_translator_runtime_patch
+        )
 
         # Static assets (css/js).
         if _STATIC_DIR.exists():
@@ -940,6 +946,109 @@ class DebugDashboardPlugin(Plugin):
                 default_flow_style=False, allow_unicode=True, sort_keys=False,
             )
         tmp.replace(path)
+
+    # ── translator runtime endpoints (Phase 2a) ──────────────────
+    #
+    # GET  /api/translator/runtime   → current backend / src / tgt + the
+    #                                  full list of supported FLORES
+    #                                  targets (from translator/lang_map).
+    # PATCH /api/translator/runtime  → mutate target language at runtime.
+    #
+    # Only ``tgt_lang`` is mutable today. ``src_lang`` is decided
+    # per-utterance from the ASR-detected language (with the config
+    # default as fallback). ``backend`` / ``url`` / ``timeout_s`` are
+    # set at process start and not hot-swappable here.
+
+    def _build_translator_runtime_payload(self) -> dict[str, Any]:
+        from ..translator.lang_map import supported_target_languages
+        cfg = getattr(self.app, "config", None)
+        backend = "noop"
+        src_lang = "zho_Hans"
+        tgt_lang = "eng_Latn"
+        url = "http://localhost:9001"
+        timeout_s = 5.0
+        if cfg is not None:
+            backend = str(getattr(cfg, "translator_backend", backend))
+            src_lang = str(getattr(cfg, "translator_src_lang", src_lang))
+            tgt_lang = str(getattr(cfg, "translator_tgt_lang", tgt_lang))
+            url = str(getattr(cfg, "translator_url", url))
+            try:
+                timeout_s = float(getattr(cfg, "translator_timeout_s", timeout_s))
+            except Exception:
+                timeout_s = 5.0
+        return {
+            "backend": backend,
+            "src_lang": src_lang,
+            "tgt_lang": tgt_lang,
+            "url": url,
+            "timeout_s": timeout_s,
+            "supported_targets": supported_target_languages(),
+        }
+
+    async def _api_translator_runtime_get(self, request):  # noqa: ANN001
+        from aiohttp import web
+        return web.json_response(self._build_translator_runtime_payload())
+
+    async def _api_translator_runtime_patch(self, request):  # noqa: ANN001
+        import re
+
+        from aiohttp import web
+
+        from ..translator.lang_map import FLORES_DISPLAY_NAMES
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "bad json"}, status=400
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"ok": False, "error": "body must be object"}, status=400
+            )
+        if "tgt_lang" not in body:
+            return web.json_response(
+                {"ok": False, "error": "tgt_lang is required"}, status=400
+            )
+        tgt = body["tgt_lang"]
+        if not isinstance(tgt, str) or not re.match(
+            r"^[a-z]{3}_[A-Z][a-z]{3}$", tgt
+        ):
+            return web.json_response(
+                {"ok": False,
+                 "error": "tgt_lang must match NLLB format (e.g. 'eng_Latn')"},
+                status=400,
+            )
+        if tgt not in FLORES_DISPLAY_NAMES:
+            return web.json_response(
+                {"ok": False,
+                 "error": f"tgt_lang {tgt!r} not in supported targets"},
+                status=400,
+            )
+        cfg = getattr(self.app, "config", None)
+        if cfg is None:
+            return web.json_response(
+                {"ok": False, "error": "no config"}, status=500
+            )
+        old = getattr(cfg, "translator_tgt_lang", None)
+        cfg.translator_tgt_lang = tgt
+        # TODO persist: dashboard mutation lives only in-process for now.
+        # Persisting to YAML needs a decision on where translator settings
+        # belong in the on-disk config schema (Phase 2b). Until then, a
+        # process restart will revert to the YAML-declared value.
+        logger.warning(
+            "translator_tgt_lang switched at runtime: %r → %r "
+            "(TODO persist to YAML)", old, tgt,
+        )
+        # Broadcast so any subscribed dashboard reflects the change live.
+        try:
+            await self.app.broadcast(
+                "on_translator_runtime_change",
+                self._build_translator_runtime_payload(),
+            )
+        except Exception:
+            logger.exception("on_translator_runtime_change broadcast failed")
+        return web.json_response({"ok": True, "tgt_lang": tgt})
 
     async def _api_session_history(self, request):  # noqa: ANN001
         from aiohttp import web
