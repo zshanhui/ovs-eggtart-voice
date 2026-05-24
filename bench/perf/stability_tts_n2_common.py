@@ -320,11 +320,19 @@ def run_gate(cfg: GateConfig) -> dict[str, Any]:
 
     print(f"[{cfg.backend_label}] base_url={cfg.base_url}", flush=True)
     print(f"[{cfg.backend_label}] tts_backend={detected_backend}", flush=True)
+    # Codex Week 3 BLOCKER 2: backend mismatch must HARD-FAIL the gate
+    # (exit 2) — silent warning let kokoro-labelled runs proceed against a
+    # qwen3 server and "pass" without exercising the kokoro code path.
     if detected_backend and cfg.expected_backend_substr:
         if not any(sub in (detected_backend or "") for sub in cfg.expected_backend_substr):
-            print(
-                f"WARNING: expected backend like {cfg.expected_backend_substr}, "
-                f"got {detected_backend!r}", flush=True,
+            reason = (
+                f"backend_mismatch: expected one of {list(cfg.expected_backend_substr)}, "
+                f"got {detected_backend!r}"
+            )
+            print(f"ERROR: {reason}", flush=True)
+            return _build_failure_report(
+                cfg, started_iso, detected_backend,
+                n1_ttfas=[], n1_errors=0, reason=reason,
             )
 
     session = requests.Session()
