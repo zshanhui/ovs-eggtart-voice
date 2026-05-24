@@ -2106,15 +2106,19 @@ async def _asr_stream_backend(
                     # VAD silence-wait from ASR compute time.
                     await ws.send_json({"type": "vad_endpoint"})
                     await _loop.run_in_executor(_get_asr_executor(), stream.prepare_finalize)
-                    final_text = await _loop.run_in_executor(_get_asr_executor(), stream.finalize)
+                    raw_final = await _loop.run_in_executor(_get_asr_executor(), stream.finalize)
+                    final_text, detected_language = _unpack_finalize_result(raw_final)
                     try:
-                        await ws.send_json({
+                        payload = {
                             "type": "final",
                             "text": final_text,
                             "is_final": True,
                             "is_stable": True,
                             "endpoint": "vad",
-                        })
+                        }
+                        if detected_language:
+                            payload["language"] = detected_language
+                        await ws.send_json(payload)
                     except Exception:
                         # Client may have disconnected during a slow finalize
                         # (e.g. TRT-EdgeLLM on Jetson). Nothing to send to.
@@ -2220,7 +2224,10 @@ async def v2v_stream(ws: WebSocket):
     # Reject-not-queue admission gate.
     _v2v_session_token = await try_acquire_ws(ws, "/v2v/stream")
     if _v2v_session_token is None:
-        reset_request_context(_v2v_ctx_tokens)
+        try:
+            reset_request_context(_v2v_ctx_tokens)
+        except BaseException:
+            pass
         return
 
     # Week 2: active WS gauge increment. Paired decrement is in both the
@@ -2353,7 +2360,10 @@ async def v2v_stream(ws: WebSocket):
             except Exception:
                 pass
             _v2v_release_early()
-            reset_request_context(_v2v_ctx_tokens)
+            try:
+                reset_request_context(_v2v_ctx_tokens)
+            except BaseException:
+                pass
             return
     
         if not asr_language and not tts_language:
@@ -2690,7 +2700,7 @@ async def v2v_stream(ws: WebSocket):
                     if state["asr_active"]:
                         finalize_gen = state["asr_active_gen"]
                         async with coord.acquire("asr"):
-                            ran_gen, final_text, finalize_accepted = (
+                            ran_gen, final_text, finalize_accepted, detected_language = (
                                 await asr_manager.finalize_with_status(
                                     endpoint_reason or "backend_endpoint"
                                 )
@@ -2706,7 +2716,8 @@ async def v2v_stream(ws: WebSocket):
                         final_text = ""
                         ran_gen = state["asr_active_gen"]
                         finalize_accepted = True
-    
+                        detected_language = None
+
                     if not finalize_accepted:
                         logger.info(
                             "suppressing discarded asr_final from gen=%s current_gen=%s reason=%s",
@@ -2715,7 +2726,7 @@ async def v2v_stream(ws: WebSocket):
                             endpoint_reason or "backend_endpoint",
                         )
                         continue
-    
+
                     # Multi-utterance: mid-session finals carry
                     # session_complete=False; close-out final on
                     # asr_session_closed carries True.
@@ -2723,24 +2734,35 @@ async def v2v_stream(ws: WebSocket):
                         is_closing = state["asr_session_closed"]
                         if is_closing:
                             duplicate = (final_text or "") == (last_streamed_final or "")
-                            await send_json({
+                            final_payload = {
                                 "type": v2v_proto.SERVER_ASR_FINAL,
                                 "text": final_text or "",
                                 "session_complete": True,
                                 "duplicate_of_streamed": duplicate,
-                            })
+                            }
+                            if detected_language:
+                                final_payload["language"] = detected_language
+                            await send_json(final_payload)
                             return
                         else:
-                            await send_json({
+                            final_payload = {
                                 "type": v2v_proto.SERVER_ASR_FINAL,
                                 "text": final_text or "",
                                 "session_complete": False,
-                            })
+                            }
+                            if detected_language:
+                                final_payload["language"] = detected_language
+                            await send_json(final_payload)
                             last_streamed_final = final_text or ""
                             # keep the loop running for the next utterance
                     else:
-                        await send_json({"type": v2v_proto.SERVER_ASR_FINAL,
-                                         "text": final_text or ""})
+                        final_payload = {
+                            "type": v2v_proto.SERVER_ASR_FINAL,
+                            "text": final_text or "",
+                        }
+                        if detected_language:
+                            final_payload["language"] = detected_language
+                        await send_json(final_payload)
                         return
     
                 # Exit only when the session is closed and there's nothing
@@ -2943,11 +2965,20 @@ async def v2v_stream(ws: WebSocket):
             except Exception:
                 pass
             if _v2v_asr_mgr is not None:
-                _v2v_asr_mgr.unregister_ws(_v2v_handle)
+                try:
+                    _v2v_asr_mgr.unregister_ws(_v2v_handle)
+                except BaseException:
+                    pass
             if _v2v_tts_mgr is not None:
-                _v2v_tts_mgr.unregister_ws(_v2v_handle)
+                try:
+                    _v2v_tts_mgr.unregister_ws(_v2v_handle)
+                except BaseException:
+                    pass
             if _v2v_session_token is not None:
-                _v2v_session_token.release()
+                try:
+                    _v2v_session_token.release()
+                except BaseException:
+                    pass
             if _v2v_ws_metric_taken:
                 try:
                     from app.core import metrics as _m_v2v
@@ -2955,7 +2986,10 @@ async def v2v_stream(ws: WebSocket):
                     _v2v_ws_metric_taken = False
                 except Exception:
                     pass
-            reset_request_context(_v2v_ctx_tokens)
+            try:
+                reset_request_context(_v2v_ctx_tokens)
+            except BaseException:
+                pass
             logger.info("v2v stream closed")
     except BaseException:
         # MUST-FIX 1 round 2: covers CancelledError (BaseException) raised
