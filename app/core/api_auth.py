@@ -84,7 +84,14 @@ def _extract_bearer(authorization: str | None) -> str | None:
     return token.strip()
 
 
-def mask_key(value: str | None) -> str:
+# Cap input length defensively: an attacker (or buggy client) could
+# submit a multi-megabyte Authorization header. We never want to hash
+# arbitrary-size data on the auth-rejection path. The SHA-256 of any
+# 4 KiB prefix is just as opaque to log readers as the full value.
+_MASK_KEY_MAX_LEN = 4096
+
+
+def mask_key(value: str | bytes | None) -> str:
     """Return a log-safe mask of a key/token value.
 
     Never exposes any prefix of the raw token. Format:
@@ -95,11 +102,27 @@ def mask_key(value: str | None) -> str:
     input, so operators can still correlate auth-rejection log lines
     across a single rotation window without ever seeing the raw key.
     See codex MUST-FIX 3.
+
+    Codex Week 3 NIT:
+      - Accept ``bytes`` and decode safely (don't fall through to
+        ``str(b"")`` which returns the truthy string ``"b''"``).
+      - Cap input length at 4 KiB so a multi-MB header doesn't waste
+        cycles hashing on the failure path.
     """
     if value is None:
         return "<missing>"
-    # Treat whitespace-only or empty as missing too.
-    s = value if isinstance(value, str) else str(value)
+    # Normalize to str. bytes → utf-8 with replacement so we never raise
+    # on weird bytes during a log call.
+    if isinstance(value, (bytes, bytearray)):
+        if len(value) == 0:
+            return "<missing>"
+        s = bytes(value)[:_MASK_KEY_MAX_LEN].decode("utf-8", errors="replace")
+    elif isinstance(value, str):
+        s = value[:_MASK_KEY_MAX_LEN]
+    else:
+        # Other types: take repr but capped — also routes through the
+        # empty-check below.
+        s = str(value)[:_MASK_KEY_MAX_LEN]
     if not s.strip():
         return "<missing>"
     digest = hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()[:6]

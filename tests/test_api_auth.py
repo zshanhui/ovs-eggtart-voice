@@ -103,6 +103,51 @@ def test_mask_key_consistent_hash():
     assert api_auth.mask_key(raw) != api_auth.mask_key(raw + "x")
 
 
+def test_mask_key_handles_bytes_input():
+    """Codex Week 3 NIT: bytes input must be treated as the equivalent
+    string, never via `str(b"...")` (which produces `"b'...'"`, leaking
+    the original bytes literal into logs).
+    """
+    import hashlib
+    # Empty bytes → <missing>, not `str(b"") == "b''"` (truthy).
+    assert api_auth.mask_key(b"") == "<missing>"
+    assert api_auth.mask_key(bytearray()) == "<missing>"
+
+    raw = "secretbyteskey"
+    bts = raw.encode("utf-8")
+    masked = api_auth.mask_key(bts)
+    # Format matches the str path.
+    assert masked.startswith("<masked:") and masked.endswith(">")
+    # No raw substring leaks.
+    assert "secret" not in masked
+    # Critically: the `b'...'` repr form must never appear.
+    assert "b'" not in masked and "b\"" not in masked
+    # And the digest matches what we'd get from the str path.
+    assert masked == f"<masked:{hashlib.sha256(raw.encode()).hexdigest()[:6]}>"
+
+
+def test_mask_key_caps_input_length():
+    """A multi-MB token must not waste cycles hashing every byte. Cap at
+    4 KiB — the masked output is identical for value vs value+padding
+    beyond the cap, demonstrating the cap is applied before hashing."""
+    base = "x" * 4096
+    padded = base + ("y" * 100_000)
+    assert api_auth.mask_key(base) == api_auth.mask_key(padded), (
+        "input beyond _MASK_KEY_MAX_LEN must be truncated pre-hash"
+    )
+    # Same logic for bytes.
+    base_b = b"x" * 4096
+    padded_b = base_b + (b"y" * 100_000)
+    assert api_auth.mask_key(base_b) == api_auth.mask_key(padded_b)
+
+
+def test_mask_key_other_types_dont_crash():
+    """A non-str/bytes value (e.g. an int passed by accident) should not
+    raise — it's a log-only helper."""
+    out = api_auth.mask_key(12345)
+    assert out.startswith("<masked:") and out.endswith(">")
+
+
 def test_matches_constant_time():
     keys = ["abc", "def"]
     assert api_auth._matches("abc", keys) is True
