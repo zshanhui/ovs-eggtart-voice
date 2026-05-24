@@ -342,3 +342,74 @@ def test_v2v_stream_cancelled_during_setup_releases_slot(
         "SessionToken.release() was never called; the outer "
         "except BaseException did not invoke _v2v_release_early()"
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex round-4 GAP B: __aexit__ raising must NOT skip _release_session
+# ---------------------------------------------------------------------------
+
+def test_cleanup_exception_does_not_skip_slot_release(monkeypatch, tmp_path):
+    """If `acquire_cm.__aexit__()` raises during the /tts/stream ValueError
+    cleanup path, the session-limiter slot must still be released. Reproduces
+    the round-4 GAP B finding where the two cleanup calls sat on consecutive
+    lines with no protection — a failing __aexit__ would silently leak the
+    slot.
+
+    We patch _request_voice_kwargs to raise ValueError (forcing the early
+    cleanup path) AND patch the fake BackendManager's __aexit__ to raise.
+    The slot must still go back to 0.
+    """
+    monkeypatch.setenv("MODEL_DIR", str(tmp_path))
+    monkeypatch.setenv("LAZY_TTS", "1")
+    monkeypatch.setenv("LANGUAGE_MODE", "disabled")
+    monkeypatch.setenv("OVS_MAX_CONCURRENT_SESSIONS", "2")
+
+    from fastapi.testclient import TestClient
+
+    session_limiter.init_limiter({})
+
+    from app import main as appmod
+
+    class _FakeBackend:
+        sample_rate = 16000
+        name = "fake"
+
+    class _CMExitRaises:
+        async def __aenter__(self):
+            return _FakeBackend()
+
+        async def __aexit__(self, *a):
+            raise RuntimeError("simulated __aexit__ failure")
+
+    class _FakeMgr:
+        def acquire(self):
+            return _CMExitRaises()
+
+    async def _ensure_ok():
+        return _FakeMgr()
+
+    monkeypatch.setattr(appmod, "_ensure_tts_manager_started", _ensure_ok)
+
+    from app.core import tts_service as _svc
+    monkeypatch.setattr(_svc, "has_capability", lambda _c: True)
+
+    # Force the ValueError-cleanup branch in /tts/stream.
+    def _bad_kwargs(*_a, **_kw):
+        raise ValueError("simulated bad voice kwargs")
+
+    monkeypatch.setattr(appmod, "_request_voice_kwargs", _bad_kwargs)
+
+    sl = session_limiter.get_limiter()
+    assert sl is not None and sl.active == 0
+
+    with TestClient(appmod.app, raise_server_exceptions=False) as c:
+        r = c.post("/tts/stream", json={"text": "x", "language": "en"})
+        # Either 400 (clean ValueError → JSONResponse) or 500 (if the
+        # raising __aexit__ propagates) is acceptable — we only require
+        # that the slot was released.
+        assert r.status_code >= 400
+
+    assert sl.active == 0, (
+        f"slot leaked when acquire_cm.__aexit__() raised during /tts/stream "
+        f"ValueError cleanup: limiter.active={sl.active}"
+    )
