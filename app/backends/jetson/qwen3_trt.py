@@ -235,10 +235,29 @@ def _resolve_qwen3_paths() -> dict[str, str]:
     }
 
 
+def _is_customvoice_variant() -> bool:
+    """Detect Qwen3-CustomVoice variant.
+
+    CustomVoice ships 9 built-in speakers and does NOT support voice cloning
+    (no speaker_encoder, no embedding ingestion). Detected via either:
+
+    * ``QWEN3_TTS_VARIANT=customvoice`` (explicit, profile-driven), or
+    * ``OVS_TTS_MODEL_ID`` containing ``customvoice``.
+
+    When True, :class:`Qwen3TRTBackend` drops VOICE_CLONE from its capability
+    set and ``synthesize()`` rejects ``speaker_embedding`` kwargs.
+    """
+    variant = os.environ.get("QWEN3_TTS_VARIANT", "").strip().lower()
+    if variant == "customvoice":
+        return True
+    model_id = os.environ.get("OVS_TTS_MODEL_ID", "").strip().lower()
+    return "customvoice" in model_id
+
+
 class Qwen3TRTBackend(TTSBackend):
     """Qwen3-TTS via C++ TRT native inference (pybind11 module, models resident)."""
 
-    def __init__(self):
+    def __init__(self, supports_voice_cloning: Optional[bool] = None):
         self._engine = None  # qwen3_speech_engine.Pipeline
         self._tokenizer = None
         self._ready = False
@@ -246,6 +265,13 @@ class Qwen3TRTBackend(TTSBackend):
         # rebuilds the backend after each apply_profile() so __init__ always
         # sees the latest profile-applied env.
         self._paths = _resolve_qwen3_paths()
+        # Capability flag — CustomVoice variant ships 9 built-in speakers and
+        # has no speaker_encoder; explicit constructor arg wins, else auto-
+        # detect from env. Mirrored into the public ``capabilities`` set.
+        if supports_voice_cloning is None:
+            self.supports_voice_cloning = not _is_customvoice_variant()
+        else:
+            self.supports_voice_cloning = bool(supports_voice_cloning)
 
     @property
     def name(self) -> str:
@@ -255,7 +281,7 @@ class Qwen3TRTBackend(TTSBackend):
     def capabilities(self) -> set[TTSCapability]:
         caps = {TTSCapability.BASIC_TTS, TTSCapability.MULTI_LANGUAGE,
                 TTSCapability.STREAMING}
-        if os.path.exists(self._paths["speaker_encoder"]):
+        if self.supports_voice_cloning and os.path.exists(self._paths["speaker_encoder"]):
             caps.add(TTSCapability.VOICE_CLONE)
         return caps
 
@@ -390,8 +416,21 @@ class Qwen3TRTBackend(TTSBackend):
         language: Optional[str] = None,
         **kwargs,
     ) -> tuple[bytes, dict]:
-        voice = resolve_speaker_kwargs(self.model_id, speaker_id=speaker_id, **kwargs)
+        voice = resolve_speaker_kwargs(
+            self.model_id,
+            allow_embedding=self.supports_voice_cloning,
+            speaker_id=speaker_id,
+            **kwargs,
+        )
         if voice.get("speaker_embedding"):
+            if not self.supports_voice_cloning:
+                logger.warning(
+                    "Qwen3-CustomVoice backend received speaker_embedding; voice cloning is not supported by this variant",
+                )
+                raise NotImplementedError(
+                    "Qwen3-CustomVoice does not support voice cloning. "
+                    "Use a preset speaker_id (one of the 9 built-in voices) instead."
+                )
             kwargs.setdefault("speaker_embedding", voice["speaker_embedding"])
         if language is None:
             language = _detect_language(text)
@@ -518,6 +557,14 @@ class Qwen3TRTBackend(TTSBackend):
         language: Optional[str] = None,
         **kwargs,
     ) -> tuple[bytes, dict]:
+        if not self.supports_voice_cloning:
+            logger.warning(
+                "clone_voice called on Qwen3-CustomVoice backend; rejecting (no speaker_encoder, capability disabled)",
+            )
+            raise NotImplementedError(
+                "Qwen3-CustomVoice does not support voice cloning. "
+                "Switch to a clone-capable backend (e.g. MOSS-TTS-Nano) or use built-in speakers."
+            )
         if language is None:
             language = _detect_language(text)
 
@@ -560,9 +607,20 @@ class Qwen3TRTBackend(TTSBackend):
         import queue as queue_mod
         import threading
 
-        voice = resolve_speaker_kwargs(self.model_id, **kwargs)
+        voice = resolve_speaker_kwargs(
+            self.model_id,
+            allow_embedding=self.supports_voice_cloning,
+            **kwargs,
+        )
         language = kwargs.get("language") or _detect_language(text)
         speaker_embedding = voice.get("speaker_embedding") or kwargs.get("speaker_embedding")
+        if speaker_embedding and not self.supports_voice_cloning:
+            logger.warning(
+                "generate_streaming received speaker_embedding on CustomVoice backend; rejecting",
+            )
+            raise NotImplementedError(
+                "Qwen3-CustomVoice does not support voice cloning (streaming clone path)."
+            )
         first_chunk_frames = kwargs.get("first_chunk_frames", 5)
         chunk_frames = kwargs.get("chunk_frames", 25)
         max_frames = kwargs.get("max_frames", 200)
@@ -618,7 +676,16 @@ class Qwen3TRTBackend(TTSBackend):
             yield item
 
     def extract_speaker_embedding(self, audio_wav_bytes: bytes) -> bytes:
-        """Extract speaker embedding using Python mel computation + ORT."""
+        """Extract speaker embedding using Python mel computation + ORT.
+
+        CustomVoice variant has no speaker_encoder artifact and explicitly
+        disables voice cloning — raise NotImplementedError so callers see the
+        same shape as backends that never implemented this method.
+        """
+        if not self.supports_voice_cloning:
+            raise NotImplementedError(
+                "Qwen3-CustomVoice does not support speaker embedding extraction."
+            )
         import tempfile
         import subprocess
 

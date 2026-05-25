@@ -1154,10 +1154,33 @@
     let currentSpeakerId = null;
     let speakers = [];
     let modelId = null;
+    let supportsVoiceCloning = true;
 
     function setHint(msg, kind) {
       hintEl.textContent = msg || "";
       hintEl.style.color = kind === "error" ? "var(--err, #ef4444)" : "";
+    }
+
+    function applyCloneCapability() {
+      // Show the clone button only when the active TTS backend advertises
+      // voice cloning. Qwen3-CustomVoice ships built-in speakers and has no
+      // speaker_encoder, so cloning is unsupported — grey out + tooltip.
+      if (!cloneBtn) return;
+      if (supportsVoiceCloning) {
+        cloneBtn.classList.remove("hidden");
+        cloneBtn.disabled = false;
+        cloneBtn.removeAttribute("title");
+        cloneBtn.style.opacity = "";
+        cloneBtn.style.cursor = "";
+      } else {
+        // Keep visible but disabled so users see WHY it's gone (a hidden
+        // button would be confusing — tooltip explains the gap).
+        cloneBtn.classList.remove("hidden");
+        cloneBtn.disabled = true;
+        cloneBtn.title = "当前 TTS backend 不支持克隆，请切到 MOSS 等克隆后端";
+        cloneBtn.style.opacity = "0.5";
+        cloneBtn.style.cursor = "not-allowed";
+      }
     }
 
     function renderSpeakers() {
@@ -1191,10 +1214,14 @@
         const j = await r.json();
         speakers = Array.isArray(j.speakers) ? j.speakers : [];
         modelId = j.model_id || null;
+        // Server flag drives clone-UI gating. Default true so legacy servers
+        // without the field keep the old behavior.
+        supportsVoiceCloning = j.supports_voice_cloning !== false;
         if (currentSpeakerId == null && j.default_speaker_id != null) {
           currentSpeakerId = j.default_speaker_id;
         }
         renderSpeakers();
+        applyCloneCapability();
         setHint("");
       } catch (e) { setHint("加载失败: " + e.message, "error"); }
     }
@@ -1254,7 +1281,13 @@
     function openClone() { resetCloneUI(); panel.classList.remove("hidden"); }
     function closeClone() { stopRecording().catch(() => {}); panel.classList.add("hidden"); }
 
-    cloneBtn.addEventListener("click", openClone);
+    cloneBtn.addEventListener("click", () => {
+      if (!supportsVoiceCloning) {
+        showToast("当前 TTS backend 不支持克隆，请切到 MOSS", "error");
+        return;
+      }
+      openClone();
+    });
     vcClose.addEventListener("click", closeClone);
     vcCancel.addEventListener("click", closeClone);
 
@@ -1396,6 +1429,8 @@
       }
     });
 
+    // Initial show — applyCloneCapability() will refine after first speakers
+    // payload arrives (default supportsVoiceCloning=true keeps legacy behavior).
     cloneBtn.classList.remove("hidden");
     loadSpeakers().then(loadRuntime);
   })();

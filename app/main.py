@@ -934,10 +934,12 @@ async def tts_capabilities(_: None = Depends(_require_api_key)):
     if not tts_service.is_ready():
         return JSONResponse({"error": "TTS not ready"}, status_code=503)
     backend = tts_service.get_backend()
+    caps = [c.value for c in tts_service.capabilities()]
     return {
         "backend": tts_service.backend_name(),
         "model_id": backend.model_id,
-        "capabilities": [c.value for c in tts_service.capabilities()],
+        "capabilities": caps,
+        "supports_voice_cloning": getattr(backend, "supports_voice_cloning", "voice_clone" in caps),
         "sample_rate": tts_service.get_sample_rate(),
         "speakers": available_speakers(backend.model_id),
     }
@@ -960,10 +962,16 @@ async def tts_speakers_list(_: None = Depends(_require_api_key)):
     if not tts_service.is_ready():
         return JSONResponse({"error": "TTS not ready"}, status_code=503)
     backend = tts_service.get_backend()
+    from app.core.tts_backend import TTSCapability
     return {
         "model_id": backend.model_id,
         "default_speaker_id": default_speaker_id(backend.model_id),
         "speakers": available_speakers(backend.model_id),
+        "supports_voice_cloning": getattr(
+            backend,
+            "supports_voice_cloning",
+            TTSCapability.VOICE_CLONE in backend.capabilities,
+        ),
     }
 
 
@@ -1568,6 +1576,43 @@ async def tts_stream(
 
 # ── Voice Clone ───��──────────────────────────────────────────────
 
+
+def _voice_clone_unsupported_response():
+    """Build the unified 400/501 JSON response for backends without voice clone.
+
+    Returns a tuple ``(response, supports_clone)`` where ``supports_clone`` is
+    True iff the active backend advertises VOICE_CLONE capability. Callers
+    early-return the response when supports_clone is False.
+    """
+    from app.core import tts_service
+    from app.core.tts_backend import TTSCapability
+
+    if tts_service.has_capability(TTSCapability.VOICE_CLONE):
+        return None, True
+
+    backend = tts_service.get_backend() if tts_service.is_ready() else None
+    supports_clone = getattr(backend, "supports_voice_cloning", None)
+    if supports_clone is False:
+        msg = (
+            f"Current TTS backend ({tts_service.backend_name()}) does not support voice "
+            "cloning. Switch to MOSS or another clone-capable backend, or use a built-in "
+            "speaker_id via /tts."
+        )
+        return JSONResponse(
+            {"error": msg,
+             "required_capability": "voice_clone",
+             "backend": tts_service.backend_name(),
+             "supports_voice_cloning": False},
+            status_code=400,
+        ), False
+    return JSONResponse(
+        {"error": "Voice cloning not supported by current backend",
+         "required_capability": "voice_clone",
+         "backend": tts_service.backend_name()},
+        status_code=501,
+    ), False
+
+
 @app.post("/tts/clone")
 async def tts_clone(req: CloneRequest, _: None = Depends(_require_api_key)):
     """Synthesize with voice cloning. Requires voice_clone capability."""
@@ -1587,13 +1632,9 @@ async def _tts_clone_impl(req: CloneRequest):
     from app.core.tts_backend import TTSCapability
     from app.core.coordinator import get_coordinator
 
-    if not tts_service.has_capability(TTSCapability.VOICE_CLONE):
-        return JSONResponse(
-            {"error": "Voice cloning not supported by current backend",
-             "required_capability": "voice_clone",
-             "backend": tts_service.backend_name()},
-            status_code=501,
-        )
+    unsupported, _ok = _voice_clone_unsupported_response()
+    if unsupported is not None:
+        return unsupported
 
     try:
         speaker_embedding = base64.b64decode(req.speaker_embedding_b64)
@@ -1643,13 +1684,9 @@ async def tts_extract_embedding(
     from app.core.tts_backend import TTSCapability
     from app.core.session_limiter import acquire_http
 
-    if not tts_service.has_capability(TTSCapability.VOICE_CLONE):
-        return JSONResponse(
-            {"error": "Voice cloning not supported by current backend",
-             "required_capability": "voice_clone",
-             "backend": tts_service.backend_name()},
-            status_code=501,
-        )
+    unsupported, _ok = _voice_clone_unsupported_response()
+    if unsupported is not None:
+        return unsupported
 
     async with acquire_http("/tts/clone/embedding"):
         audio_bytes = await file.read()
@@ -1680,13 +1717,9 @@ async def tts_clone_stream(
     from app.core.session_limiter import get_limiter
     from app.core import metrics as _metrics
 
-    if not tts_service.has_capability(TTSCapability.VOICE_CLONE):
-        return JSONResponse(
-            {"error": "Voice cloning not supported by current backend",
-             "required_capability": "voice_clone",
-             "backend": tts_service.backend_name()},
-            status_code=501,
-        )
+    unsupported, _ok = _voice_clone_unsupported_response()
+    if unsupported is not None:
+        return unsupported
 
     if not tts_service.has_capability(TTSCapability.STREAMING):
         return JSONResponse(
