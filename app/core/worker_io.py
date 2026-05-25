@@ -122,7 +122,13 @@ class WorkerIO:
         with self._inflight_lock:
             self._inflight[request_id] = q
 
-        cancelled_by_consumer = False
+        # Track whether the request reached a natural terminal event
+        # (``done``/``cancelled``). Any other exit path — task cancel while
+        # awaiting q.get, GeneratorExit at yield, TimeoutError, WorkerExitError,
+        # arbitrary exception — must send a cancel JSON to the worker so it
+        # stops producing chunks for an abandoned slot. The cancel call itself
+        # is best-effort (worker may already be dead).
+        finished_naturally = False
         try:
             assert self._proc.stdin is not None
             try:
@@ -145,18 +151,15 @@ class WorkerIO:
                     )
                 if event.get("event") == "_worker_exit":
                     raise WorkerExitError("worker subprocess died mid-request")
-                try:
-                    yield event
-                except (GeneratorExit, asyncio.CancelledError):
-                    cancelled_by_consumer = True
-                    raise
+                yield event
                 if event.get("event") in ("done", "cancelled"):
+                    finished_naturally = True
                     return
         finally:
             with self._inflight_lock:
                 self._inflight.pop(request_id, None)
             self._sem.release()
-            if cancelled_by_consumer:
+            if not finished_naturally:
                 try:
                     self.cancel(request_id)
                 except Exception:

@@ -168,6 +168,89 @@ async def test_async_send_request_consumer_break_fires_cancel():
 
 
 @asynctest
+async def test_async_send_request_cancel_while_awaiting_fires_cancel():
+    """Task cancellation during q.get() must also send cancel JSON to worker.
+
+    Regression: prior `cancelled_by_consumer` flag was only set inside the
+    yield, so cancellation while blocked on q.get (no event ready) would
+    leak the worker slot — worker keeps producing chunks for an abandoned
+    request. Per Codex P1 review MUST_FIX.
+    """
+    proc = _FakeProc()
+    wio = WorkerIO(proc, concurrency=1)
+
+    async def consume():
+        # Worker never feeds any event for this rid — generator stays
+        # blocked on q.get. We cancel the surrounding task externally.
+        async for _ in wio.send_request("rid-W", {"id": "rid-W"}):
+            pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.05)  # let task enter q.get
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    cancel_writes = [
+        w for w in proc.stdin.writes
+        if '"type": "cancel"' in w or '"type":"cancel"' in w
+    ]
+    assert cancel_writes, f"expected a cancel write, got {proc.stdin.writes!r}"
+    assert "rid-W" in cancel_writes[-1]
+    # Semaphore must also be released.
+    assert wio._sem._value == 1, "semaphore leaked after await-cancel"
+
+
+@asynctest
+async def test_async_two_concurrent_streams_aclose_simultaneously():
+    """N=2 concurrent streams both aclose at the same time release both slots.
+
+    Models the production case where two WS clients drop mid-stream. Both
+    cancel JSONs must reach worker stdin and the semaphore must return to
+    its full count so a third request can proceed without deadlock.
+    """
+    proc = _FakeProc()
+    wio = WorkerIO(proc, concurrency=2)
+
+    # Use longer feeder delay so both generators have time to register
+    # in _inflight before chunks arrive — reader drops events for unknown
+    # rids silently (realistic behavior: worker only emits for known
+    # requests).
+    def _feeder(rid: str):
+        time.sleep(0.15)
+        proc.stdout.feed(json.dumps({"id": rid, "event": "chunk", "audio": "a"}))
+
+    gen_a = wio.send_request("rid-A", {"id": "rid-A"})
+    gen_b = wio.send_request("rid-B", {"id": "rid-B"})
+
+    # Kick off both anext concurrently so both register in _inflight
+    # before either feeder fires.
+    task_a = asyncio.create_task(gen_a.__anext__())
+    task_b = asyncio.create_task(gen_b.__anext__())
+    await asyncio.sleep(0.05)  # let both register inflight
+
+    threading.Thread(target=_feeder, args=("rid-A",), daemon=True).start()
+    threading.Thread(target=_feeder, args=("rid-B",), daemon=True).start()
+
+    first_a = await asyncio.wait_for(task_a, timeout=2.0)
+    first_b = await asyncio.wait_for(task_b, timeout=2.0)
+    assert first_a["event"] == "chunk" and first_b["event"] == "chunk"
+
+    await asyncio.gather(gen_a.aclose(), gen_b.aclose())
+
+    cancel_writes = [
+        w for w in proc.stdin.writes
+        if '"type": "cancel"' in w or '"type":"cancel"' in w
+    ]
+    cancelled_rids = {rid for rid in ("rid-A", "rid-B")
+                      if any(rid in w for w in cancel_writes)}
+    assert cancelled_rids == {"rid-A", "rid-B"}, (
+        f"expected cancel for both, got {cancel_writes!r}"
+    )
+    assert wio._sem._value == 2, "semaphore did not fully release after dual aclose"
+
+
+@asynctest
 async def test_async_send_request_worker_exit():
     proc = _FakeProc()
     wio = WorkerIO(proc, concurrency=1)
