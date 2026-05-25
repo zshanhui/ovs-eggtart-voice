@@ -445,3 +445,22 @@ def test_cancel_writes_cancel_json():
     wio.cancel("rid-Z")
     matching = [w for w in proc.stdin.writes if "cancel" in w and "rid-Z" in w]
     assert matching, proc.stdin.writes
+
+
+def test_cancel_after_close_is_silent_noop():
+    """cancel() after close() must not attempt stdin write.
+
+    Codex P1 final-review NIT: post-close cancel previously tried the
+    write and relied on the broken-pipe catch to swallow it, emitting a
+    noisy debug trace. Now cancel() returns silently if _closed is set.
+    """
+    proc = _FakeProc()
+    wio = WorkerIO(proc, concurrency=1)
+    wio.close()
+    writes_before = list(proc.stdin.writes)
+    wio.cancel("rid-after-close")
+    # No new stdin activity should appear from cancel().
+    assert proc.stdin.writes == writes_before, (
+        f"cancel() wrote after close(): new writes = "
+        f"{proc.stdin.writes[len(writes_before):]!r}"
+    )
