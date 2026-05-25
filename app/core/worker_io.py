@@ -144,6 +144,10 @@ class WorkerIO:
         # Hold semaphore from here. If close() ran while we were waiting,
         # abort immediately and release the slot back; do not register
         # inflight and do not write to dead worker stdin.
+        # NB: this is a fast-path check. The authoritative gate is the
+        # `_closed` re-check inside `_stdin_lock` below — close() also
+        # sets `_closed` under `_stdin_lock`, so any stdin write and
+        # any close() call are strictly ordered.
         if self._closed:
             self._sem.release()
             raise WorkerExitError("WorkerIO closed before request could start")
@@ -163,6 +167,13 @@ class WorkerIO:
             assert self._proc.stdin is not None
             try:
                 with self._stdin_lock:
+                    # Re-check under the same lock that close() uses to set
+                    # the flag; this closes the TOCTOU window between the
+                    # fast-path check above and the actual write.
+                    if self._closed:
+                        raise WorkerExitError(
+                            "WorkerIO closed between acquire and stdin write"
+                        )
                     self._proc.stdin.write(
                         json.dumps(payload, ensure_ascii=False) + "\n"
                     )
@@ -210,7 +221,12 @@ class WorkerIO:
         subprocess — that is the owning backend's responsibility (proc
         lifecycle stays where it is today).
         """
-        self._closed = True
+        # Set _closed under _stdin_lock so any in-flight stdin write that
+        # holds the lock observes the flag before the next acquirer can.
+        # Combined with the re-check inside send_request/request under
+        # the same lock, this guarantees no write happens after close().
+        with self._stdin_lock:
+            self._closed = True
         with self._inflight_lock:
             queues = list(self._inflight.values())
             self._inflight.clear()
@@ -243,6 +259,13 @@ class WorkerIO:
                 self._inflight[req_id] = q
             assert self._proc.stdin is not None
             with self._stdin_lock:
+                # Re-check _closed under stdin_lock — close() also sets
+                # the flag under the same lock, so this closes the TOCTOU
+                # gap between the fast-path check above and the write.
+                if self._closed:
+                    raise WorkerExitError(
+                        "WorkerIO closed between acquire and stdin write"
+                    )
                 self._proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 self._proc.stdin.flush()
             while True:
