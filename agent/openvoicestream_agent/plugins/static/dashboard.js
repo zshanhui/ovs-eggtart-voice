@@ -1177,7 +1177,7 @@
         // button would be confusing — tooltip explains the gap).
         cloneBtn.classList.remove("hidden");
         cloneBtn.disabled = true;
-        cloneBtn.title = "当前 TTS backend 不支持克隆，请切到 MOSS 等克隆后端";
+        cloneBtn.title = "Voice cloning unavailable with current TTS model";
         cloneBtn.style.opacity = "0.5";
         cloneBtn.style.cursor = "not-allowed";
       }

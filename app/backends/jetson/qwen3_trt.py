@@ -272,6 +272,30 @@ class Qwen3TRTBackend(TTSBackend):
             self.supports_voice_cloning = not _is_customvoice_variant()
         else:
             self.supports_voice_cloning = bool(supports_voice_cloning)
+        # Bug 2 fix: when the CustomVoice variant is detected via env alone
+        # (QWEN3_TTS_VARIANT=customvoice) but OVS_TTS_MODEL_ID was not set to
+        # the customvoice key, ``self.model_id`` resolves to the base
+        # ``qwen3-tts`` and the 9 built-in speakers (registered under
+        # ``qwen3-tts-customvoice``) become invisible. Pin the model_id here
+        # so speaker lookups land in the correct table.
+        self._model_id_override: Optional[str] = None
+        if _is_customvoice_variant():
+            env_model_id = os.environ.get("OVS_TTS_MODEL_ID", "").strip().lower()
+            if "customvoice" not in env_model_id:
+                self._model_id_override = "qwen3-tts-customvoice"
+                logger.info(
+                    "Qwen3-CustomVoice variant detected via env; pinning "
+                    "model_id to 'qwen3-tts-customvoice' (was %r)",
+                    env_model_id or "<unset>",
+                )
+
+    @property
+    def model_id(self) -> str:  # type: ignore[override]
+        # Bug 2 fix: honour the customvoice override (only set when the env
+        # signalled CustomVoice but OVS_TTS_MODEL_ID was the base key).
+        if self._model_id_override:
+            return self._model_id_override
+        return super().model_id
 
     @property
     def name(self) -> str:
@@ -432,6 +456,12 @@ class Qwen3TRTBackend(TTSBackend):
                     "Use a preset speaker_id (one of the 9 built-in voices) instead."
                 )
             kwargs.setdefault("speaker_embedding", voice["speaker_embedding"])
+        # Bug 1 fix: thread resolved preset speaker through to the C++ engine.
+        # resolve_speaker_kwargs returns {"speaker_id": int, "speaker": str}
+        # for preset entries — without this propagation, the 9 CustomVoice
+        # built-in speakers fall back to the engine's default voice.
+        resolved_speaker_name = voice.get("speaker") if voice else None
+        resolved_speaker_id = voice.get("speaker_id") if voice else None
         if language is None:
             language = _detect_language(text)
 
@@ -465,7 +495,7 @@ class Qwen3TRTBackend(TTSBackend):
                 for segment in segments:
                     wav, meta = self.synthesize(
                         segment,
-                        speaker_id=speaker_id,
+                        speaker_id=resolved_speaker_id if resolved_speaker_id is not None else speaker_id,
                         speed=speed,
                         pitch_shift=pitch_shift,
                         language=language,
@@ -507,6 +537,11 @@ class Qwen3TRTBackend(TTSBackend):
             # Carry voice-clone embedding through the streaming path.
             if kwargs.get("speaker_embedding"):
                 stream_kwargs["speaker_embedding"] = kwargs["speaker_embedding"]
+            # Bug 1 fix: propagate resolved preset speaker name into streaming.
+            if resolved_speaker_name:
+                stream_kwargs["speaker"] = resolved_speaker_name
+            if resolved_speaker_id is not None:
+                stream_kwargs["speaker_id"] = resolved_speaker_id
             pcm = b"".join(self.generate_streaming(text, **stream_kwargs))
             elapsed = time.time() - start
             duration = len(pcm) / 2 / self.sample_rate if pcm else 0.0
@@ -526,7 +561,13 @@ class Qwen3TRTBackend(TTSBackend):
         random_values = _sampling_uniforms(seed, max_frames)
 
         start = time.time()
-        result = self._engine.synthesize(
+        # Bug 1 fix: pass the resolved preset speaker name into the C++ engine
+        # so CustomVoice's 9 built-in voices actually get selected. The
+        # underlying TalkerGenerationRequest reads ``speaker`` from the JSON
+        # blob (see native qwen3_tts_worker.cpp:237). When the engine binding
+        # doesn't accept the kwarg (older base Qwen3-TTS .so), fall back to
+        # the legacy call.
+        engine_kwargs = dict(
             text=text,
             lang=language,
             token_ids=token_ids,
@@ -534,6 +575,18 @@ class Qwen3TRTBackend(TTSBackend):
             seed=seed,
             random_values=random_values,
         )
+        if resolved_speaker_name:
+            engine_kwargs["speaker"] = resolved_speaker_name
+        try:
+            result = self._engine.synthesize(**engine_kwargs)
+        except TypeError as exc:
+            # Older Pipeline bindings don't accept ``speaker`` — drop and retry
+            # once so the base Qwen3-TTS variant keeps working unchanged.
+            if "speaker" in engine_kwargs and "speaker" in str(exc):
+                engine_kwargs.pop("speaker", None)
+                result = self._engine.synthesize(**engine_kwargs)
+            else:
+                raise
         elapsed = time.time() - start
 
         wav_bytes = result["wav_bytes"]
@@ -614,6 +667,15 @@ class Qwen3TRTBackend(TTSBackend):
         )
         language = kwargs.get("language") or _detect_language(text)
         speaker_embedding = voice.get("speaker_embedding") or kwargs.get("speaker_embedding")
+        # Bug 1 fix: thread resolved preset speaker name through the streaming
+        # path. Without this, CustomVoice streaming requests with speaker_id
+        # silently fall back to the engine's default voice.
+        resolved_speaker_name = voice.get("speaker") if voice else None
+        # Allow callers to pass a raw ``speaker`` (string) kwarg too — caller
+        # may have already resolved the name themselves (e.g. inside
+        # synthesize()'s collect_streaming branch).
+        if not resolved_speaker_name and isinstance(kwargs.get("speaker"), str):
+            resolved_speaker_name = kwargs["speaker"]
         if speaker_embedding and not self.supports_voice_cloning:
             logger.warning(
                 "generate_streaming received speaker_embedding on CustomVoice backend; rejecting",
@@ -653,7 +715,7 @@ class Qwen3TRTBackend(TTSBackend):
                         seed=seed,
                     )
                 else:
-                    self._engine.synthesize_streaming_callback(
+                    streaming_kwargs = dict(
                         text=text,
                         lang=language,
                         token_ids=token_ids,
@@ -664,6 +726,18 @@ class Qwen3TRTBackend(TTSBackend):
                         seed=seed,
                         random_values=random_values,
                     )
+                    if resolved_speaker_name:
+                        streaming_kwargs["speaker"] = resolved_speaker_name
+                    try:
+                        self._engine.synthesize_streaming_callback(**streaming_kwargs)
+                    except TypeError as exc:
+                        # Older bindings (base Qwen3-TTS .so) don't accept
+                        # ``speaker`` — drop and retry once.
+                        if "speaker" in streaming_kwargs and "speaker" in str(exc):
+                            streaming_kwargs.pop("speaker", None)
+                            self._engine.synthesize_streaming_callback(**streaming_kwargs)
+                        else:
+                            raise
             finally:
                 chunk_queue.put(SENTINEL)
 

@@ -123,6 +123,36 @@ _tts_stream_executor: ThreadPoolExecutor | None = None
 _asr_executor: ThreadPoolExecutor | None = None
 
 
+class _VoiceCloneUnsupportedError(Exception):
+    """Raised by ``_request_voice_kwargs`` when the request carries a
+    ``speaker_embedding_b64`` but the active backend explicitly disables
+    voice cloning. Callers translate this into a 400 JSON response with
+    the unified capability payload (Bug 3 fix — /tts and /tts/stream).
+    """
+
+    def __init__(self, backend) -> None:  # type: ignore[no-untyped-def]
+        self.backend = backend
+        backend_name = getattr(backend, "name", "tts")
+        super().__init__(
+            f"Current TTS backend ({backend_name}) does not support voice cloning"
+        )
+
+
+def _voice_clone_unsupported_payload(backend) -> dict:  # type: ignore[no-untyped-def]
+    backend_name = getattr(backend, "name", "tts")
+    msg = (
+        f"Current TTS backend ({backend_name}) does not support voice "
+        "cloning. Use a built-in speaker_id via /tts, or switch to a "
+        "clone-capable backend."
+    )
+    return {
+        "error": msg,
+        "required_capability": "voice_clone",
+        "backend": backend_name,
+        "supports_voice_cloning": False,
+    }
+
+
 def _request_voice_kwargs(req: TTSRequest, *, backend=None) -> dict:
     """Resolve TTS kwargs for one synth call.
 
@@ -147,6 +177,15 @@ def _request_voice_kwargs(req: TTSRequest, *, backend=None) -> dict:
     if speaker_id is not None and req.speaker_embedding_b64:
         raise ValueError("speaker_id and speaker_embedding_b64 cannot be used together")
     if req.speaker_embedding_b64:
+        # Bug 3 fix: pre-response capability gate for /tts and /tts/stream.
+        # Without this, /tts on a non-clone backend (CustomVoice) raises
+        # NotImplementedError → FastAPI 500; /tts/stream is worse because
+        # response headers are already on the wire when the worker thread
+        # raises, leaving the client with a half-written stream.
+        if backend is not None and getattr(backend, "supports_voice_cloning", True) is False:
+            from app.core.tts_backend import TTSCapability
+            if not backend.has_capability(TTSCapability.VOICE_CLONE):
+                raise _VoiceCloneUnsupportedError(backend)
         try:
             return {"speaker_embedding": base64.b64decode(req.speaker_embedding_b64)}
         except Exception as exc:
@@ -993,11 +1032,12 @@ async def tts_speakers_register(
     if not tts_service.is_ready():
         return JSONResponse({"error": "TTS not ready"}, status_code=503)
     if not tts_service.has_capability(TTSCapability.VOICE_CLONE):
-        return JSONResponse(
-            {"error": "Voice cloning not supported by current backend",
-             "required_capability": "voice_clone"},
-            status_code=501,
-        )
+        # MEDIUM: use the unified capability-aware response (400 when the
+        # backend *explicitly* disables cloning, 501 when it merely lacks
+        # the capability) so /tts/speakers/register matches /tts/clone*.
+        unsupported, _ok = _voice_clone_unsupported_response()
+        if unsupported is not None:
+            return unsupported
 
     try:
         emb = base64.b64decode(req.speaker_embedding_b64)
@@ -1066,6 +1106,11 @@ async def _tts_synthesize(req: TTSRequest):
         async with mgr.acquire() as backend:
             try:
                 voice_kwargs = _request_voice_kwargs(req, backend=backend)
+            except _VoiceCloneUnsupportedError as exc:
+                return JSONResponse(
+                    _voice_clone_unsupported_payload(exc.backend),
+                    status_code=400,
+                )
             except ValueError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
             async with get_coordinator().acquire("tts"):
@@ -1088,7 +1133,13 @@ async def _tts_synthesize(req: TTSRequest):
         # TTS manager is intentionally never started; LAZY_TTS is now handled
         # by _ensure_tts_manager_started above.
         try:
-            voice_kwargs = _request_voice_kwargs(req)
+            legacy_backend = tts_service.get_backend() if tts_service.is_ready() else None
+            voice_kwargs = _request_voice_kwargs(req, backend=legacy_backend)
+        except _VoiceCloneUnsupportedError as exc:
+            return JSONResponse(
+                _voice_clone_unsupported_payload(exc.backend),
+                status_code=400,
+            )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         async with get_coordinator().acquire("tts"):
@@ -1223,6 +1274,15 @@ async def tts_stream(
         try:
             try:
                 voice_kwargs = _request_voice_kwargs(req, backend=backend)
+            except _VoiceCloneUnsupportedError as exc:
+                # Bug 3 fix: pre-response 400 — better than 500 mid-stream
+                # after StreamingResponse already wrote the sample-rate
+                # header. Capability gate fires before any bytes go out.
+                await _safe_cleanup_acquire_and_session(acquire_cm, _release_session)
+                return JSONResponse(
+                    _voice_clone_unsupported_payload(exc.backend),
+                    status_code=400,
+                )
             except ValueError as exc:
                 # Codex round-4 GAP B: best-effort serial cleanup so
                 # __aexit__ raising cannot skip _release_session().
@@ -1464,6 +1524,13 @@ async def tts_stream(
     sr = tts_service.get_sample_rate()
     try:
         voice_kwargs = _request_voice_kwargs(req, backend=backend)
+    except _VoiceCloneUnsupportedError as exc:
+        # Bug 3 fix: pre-response capability gate on the legacy path too.
+        _release_session()
+        return JSONResponse(
+            _voice_clone_unsupported_payload(exc.backend),
+            status_code=400,
+        )
     except ValueError as exc:
         _release_session()
         return JSONResponse({"error": str(exc)}, status_code=400)
