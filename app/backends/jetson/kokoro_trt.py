@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import queue
 import re
 import struct
 import time
@@ -212,6 +213,68 @@ def _samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+class _KokoroCtxSlot:
+    """Pre-allocated TRT context + pool slot for one concurrent Kokoro request.
+
+    Three runtime modes — engine / hybrid / split_generator. A slot holds the
+    contexts the current mode needs; other-mode ctx fields are empty.
+
+    A pool of K slots is built at preload() time. _synthesize_one() acquires
+    one slot, runs the inference, then releases it back. This amortizes the
+    ~900ms-per-context create_execution_context() cost on Jetson Orin Nano
+    across the service lifetime instead of paying it per request.
+    """
+
+    def __init__(
+        self,
+        runtime_mode: str,
+        engine,
+        split_engines: dict,
+        split_long_engines: dict,
+    ):
+        self.pool = CudaMemoryPool()
+        self.ctx = None
+        self.split_ctxs: dict[str, object] = {}
+        self.split_long_ctxs: dict[str, object] = {}
+        if runtime_mode in ("engine", "hybrid"):
+            if engine is not None:
+                self.ctx = engine.create_execution_context()
+        elif runtime_mode == "split_generator":
+            self.split_ctxs = {
+                name: eng.create_execution_context()
+                for name, eng in split_engines.items()
+            }
+            self.split_long_ctxs = {
+                name: eng.create_execution_context()
+                for name, eng in split_long_engines.items()
+            }
+        elif runtime_mode in ("ort_cpu", "cpu", "ort", "onnxruntime"):
+            # CPU ORT path needs no TRT context. We still keep an (unused)
+            # pool so destroy() is symmetric across slots.
+            pass
+        else:
+            raise ValueError(f"Unknown kokoro runtime_mode: {runtime_mode}")
+
+    def reset_per_request(self):
+        try:
+            self.pool.free_all()
+        except Exception:
+            logger.exception("KokoroCtxSlot.reset_per_request: pool.free_all raised")
+
+    def destroy(self):
+        try:
+            self.pool.synchronize()
+        except Exception:
+            pass
+        try:
+            self.pool.destroy()
+        except Exception:
+            pass
+        self.ctx = None
+        self.split_ctxs = {}
+        self.split_long_ctxs = {}
+
+
 class KokoroTRTBackend(TTSBackend):
     """English Kokoro v1.0 TTS accelerated with TensorRT on Jetson."""
 
@@ -252,6 +315,13 @@ class KokoroTRTBackend(TTSBackend):
         self._hybrid_max_seq_len: int | None = None
         self._hybrid_min_seq_len: int | None = None
         self._ready = False
+        # Pre-allocated context pool (built in preload() once we know the
+        # final runtime_mode). N slots, each owning one CUDA stream + per-mode
+        # execution contexts. _synthesize_one() borrows + returns. See
+        # _MatchaCtxSlot docstring for the latency rationale.
+        self._ctx_pool: "queue.Queue[_KokoroCtxSlot]" = queue.Queue()
+        self._slots: list[_KokoroCtxSlot] = []
+        self._pool_size: int = 0
         # Snapshot artifact paths from the *current* env at construction.
         # BackendManager rebuilds the backend after each apply_profile() so
         # __init__ sees the latest profile-applied env. Module-level _*_PATH
@@ -322,6 +392,7 @@ class KokoroTRTBackend(TTSBackend):
             and not self._split_long_engines
             and not self._split_long_ctxs
             and self._pool is None
+            and not self._slots
         ):
             return
 
@@ -334,6 +405,12 @@ class KokoroTRTBackend(TTSBackend):
                     logger.exception("Kokoro unload: pool.synchronize failed; continuing")
 
             # 2. Execution contexts before engines.
+            # 2a. Drain per-slot ctxs + streams + remaining device buffers.
+            self._teardown_ctx_pool()
+
+            # 2b. Back-compat: legacy shared ctx dicts (always empty after
+            # pre-allocated pool refactor) are still cleared so tests that
+            # populate them for unload-ordering assertions still pass.
             for name, ctx in list(self._split_ctxs.items()):
                 try:
                     del ctx
@@ -423,6 +500,7 @@ class KokoroTRTBackend(TTSBackend):
         else:
             logger.warning("Kokoro TRT engine missing at %s; using CPU ORT fallback", self._paths['engine_path'])
             self._load_ort()
+        self._build_ctx_pool()
         try:
             self._warmup()
         except Exception as exc:
@@ -434,11 +512,63 @@ class KokoroTRTBackend(TTSBackend):
                 self._engine = None
                 self._ctx = None
                 self._pool = None
+                self._teardown_ctx_pool()
                 self._load_ort()
+                self._build_ctx_pool()
                 self._warmup()
             else:
                 raise
         self._ready = True
+
+    def _build_ctx_pool(self) -> None:
+        """Pre-allocate K context slots and seed the queue.
+
+        K = OVS_TTS_STREAM_MAX_WORKERS (default 2). Slot type depends on the
+        already-resolved runtime mode. Logs the slot count so deploy
+        verification can grep for it.
+        """
+        try:
+            k = int(os.environ.get("OVS_TTS_STREAM_MAX_WORKERS", "2"))
+        except ValueError:
+            k = 2
+        k = max(1, k)
+        self._pool_size = k
+        self._slots = []
+        # Drain any prior queue contents (rebuild path after warmup fallback).
+        while True:
+            try:
+                self._ctx_pool.get_nowait()
+            except queue.Empty:
+                break
+        t0 = time.time()
+        for _ in range(k):
+            slot = _KokoroCtxSlot(
+                self._runtime_mode,
+                self._engine,
+                self._split_engines,
+                self._split_long_engines,
+            )
+            self._slots.append(slot)
+            self._ctx_pool.put(slot)
+        logger.info(
+            "Kokoro ctx pool: %d slots pre-allocated (mode=%s, %.2fs)",
+            k, self._runtime_mode, time.time() - t0,
+        )
+
+    def _teardown_ctx_pool(self) -> None:
+        """Drain queue and destroy all slots. Safe to call multiple times."""
+        while True:
+            try:
+                self._ctx_pool.get_nowait()
+            except queue.Empty:
+                break
+        for i, slot in enumerate(self._slots):
+            try:
+                slot.destroy()
+            except Exception:
+                logger.exception("Kokoro teardown: slot[%d] destroy raised", i)
+        self._slots = []
+        self._pool_size = 0
 
     def _load_tokens(self) -> None:
         if not os.path.exists(self._paths['tokens_path']):
@@ -746,41 +876,39 @@ class KokoroTRTBackend(TTSBackend):
         speed_arr = np.array([spd], dtype=np.float32)
 
         t_infer = time.time()
-        # Per-call concurrency rework: build per-call pool + execution
-        # contexts here (only for TRT modes). ORT modes don't need GPU
-        # resources and skip this. All TRT _run_* helpers receive pool/ctx
-        # via params — never touch self._pool / self._ctx during inference.
-        pool: CudaMemoryPool | None = None
-        local_ctx = None
-        local_split_ctxs: dict[str, object] = {}
-        local_split_long_ctxs: dict[str, object] = {}
+        # Borrow a pre-allocated context slot if the pool has been built
+        # (production path). free_all() between requests releases device
+        # buffers while keeping the stream + ctxs warm.
+        #
+        # When no slot is available (unit-test bypass path: tests build the
+        # backend with __new__ + a runtime_mode attr but never preload, so
+        # _slots is empty), the run helpers are mocked by the test and the
+        # pool / ctx kwargs are ignored — pass None.
+        slot: _KokoroCtxSlot | None = None
+        if self._slots:
+            slot = self._ctx_pool.get()
+        pool_arg = slot.pool if slot is not None else None
+        ctx_arg = slot.ctx if slot is not None else None
+        split_ctxs_arg = slot.split_ctxs if slot is not None else {}
+        split_long_ctxs_arg = slot.split_long_ctxs if slot is not None else {}
         try:
-            if self._runtime_mode in ("engine", "hybrid"):
-                pool = CudaMemoryPool()
-                if self._engine is not None:
-                    local_ctx = self._engine.create_execution_context()
-            elif self._runtime_mode == "split_generator":
-                pool = CudaMemoryPool()
-                local_split_ctxs = {
-                    name: eng.create_execution_context()
-                    for name, eng in self._split_engines.items()
-                }
-                local_split_long_ctxs = {
-                    name: eng.create_execution_context()
-                    for name, eng in self._split_long_engines.items()
-                }
-
             if self._runtime_mode == "engine":
-                audio = self._run_engine(input_ids, style, speed_arr, pool=pool, ctx=local_ctx)
+                audio = self._run_engine(
+                    input_ids, style, speed_arr,
+                    pool=pool_arg, ctx=ctx_arg,
+                )
             elif self._runtime_mode == "hybrid":
-                audio = self._run_hybrid(input_ids, style, speed_arr, pool=pool, ctx=local_ctx)
+                audio = self._run_hybrid(
+                    input_ids, style, speed_arr,
+                    pool=pool_arg, ctx=ctx_arg,
+                )
             elif self._runtime_mode == "split_generator":
                 try:
                     audio = self._run_split_generator(
                         input_ids, style, speed_arr,
-                        pool=pool,
-                        split_ctxs=local_split_ctxs,
-                        split_long_ctxs=local_split_long_ctxs,
+                        pool=pool_arg,
+                        split_ctxs=split_ctxs_arg,
+                        split_long_ctxs=split_long_ctxs_arg,
                     )
                 except ValueError as exc:
                     if os.environ.get("KOKORO_SPLIT_CPU_FALLBACK", "1").lower() in ("0", "false", "no"):
@@ -791,25 +919,11 @@ class KokoroTRTBackend(TTSBackend):
             else:
                 audio = self._run_ort(input_ids, style, speed_arr)
         finally:
-            if pool is not None:
+            if slot is not None:
                 try:
-                    pool.free_all()
-                except Exception:
-                    logger.exception("kokoro synth: pool.free_all failed")
-                try:
-                    pool.destroy()
-                except Exception:
-                    logger.exception("kokoro synth: pool.destroy failed")
-            if local_ctx is not None:
-                try:
-                    del local_ctx
-                except Exception:
-                    pass
-            for c in list(local_split_ctxs.values()) + list(local_split_long_ctxs.values()):
-                try:
-                    del c
-                except Exception:
-                    pass
+                    slot.reset_per_request()
+                finally:
+                    self._ctx_pool.put(slot)
         infer_ms = (time.time() - t_infer) * 1000
 
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
