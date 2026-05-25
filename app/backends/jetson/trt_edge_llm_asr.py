@@ -622,20 +622,28 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             "apply_chat_template": True,
             "add_generation_prompt": True,
         }
+        # Lifecycle gate only — request demux is delegated to WorkerIO.
         with self._worker_lock:
             self._ensure_worker()
-            assert self._worker is not None and self._worker.stdin is not None and self._worker.stdout is not None
-            t0 = time.time()
-            self._worker.stdin.write(json.dumps(input_data, ensure_ascii=False) + "\n")
-            self._worker.stdin.flush()
-            line = self._worker.stdout.readline()
-            elapsed_worker = time.time() - t0
-
-        if not line:
+            wio = self._wio
+        assert wio is not None
+        t0 = time.time()
+        try:
+            # The legacy one-shot transcribe path emits exactly one terminal
+            # event (``done`` on success, ``error`` on failure) with the
+            # matching ``id``. ``wio.request()`` loops until ``done`` /
+            # ``cancelled``, which aligns naturally here.
+            output_data: dict = {}
+            for ev in wio.request(input_data):
+                output_data = ev
+        except _WIOExitError as exc:
             stderr = self._stderr_tail_text()
             self._worker = None
-            raise RuntimeError(f"ASR worker exited before response: {stderr}")
-        output_data = json.loads(line)
+            raise RuntimeError(
+                f"ASR worker exited before response: {exc}: {stderr}"
+            ) from exc
+        elapsed_worker = time.time() - t0
+
         if not output_data.get("ok"):
             raise RuntimeError(f"ASR worker failed: {output_data}")
 
