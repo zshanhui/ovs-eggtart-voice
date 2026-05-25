@@ -62,6 +62,25 @@ def _is_worker_protocol_error(exc: BaseException) -> bool:
     return False
 
 
+def _safe_close_stream(stream: Any) -> None:
+    """Release per-stream backend resources (TRT contexts, device buffers).
+
+    Default ASRStream.close() is a no-op; backends like paraformer_trt
+    override it to drop per-stream TRT IExecutionContext + cudaMalloc'd
+    buffers (added 2026-05-25 for N>=2 concurrency safety). We swallow any
+    exception so close() never breaks lifecycle teardown.
+    """
+    if stream is None:
+        return
+    close = getattr(stream, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:
+        logger.exception("ASRSessionManager: stream.close raised; ignoring")
+
+
 class ASRSessionManager:
     """Async-safe per-utterance ASR session orchestrator.
 
@@ -275,6 +294,7 @@ class ASRSessionManager:
                     gen, self._generation,
                 )
                 return gen, "", False, None
+            _safe_close_stream(self._stream)
             self._stream = None
             self._state = SessionState.IDLE
             return gen, final_text or "", True, detected_language
@@ -310,6 +330,11 @@ class ASRSessionManager:
         self._state = SessionState.CANCELLING
         stream = self._stream
         self._stream = None
+        # close() is idempotent w.r.t. later cancel()/cancel_and_finalize() —
+        # for paraformer_trt, close() only releases per-stream TRT contexts
+        # and buffers, which are not needed for the cancel ack itself.
+        # We defer close() until *after* the cancel call below so the cancel
+        # path can still touch stream state if it needs to. See finally.
         if stream is None:
             self._state = SessionState.IDLE
             return
@@ -348,6 +373,7 @@ class ASRSessionManager:
                 await self._maybe_restart_worker()
             else:
                 logger.info("ASRSessionManager: cancel(%s) swallowed exc=%s", reason, exc)
+        _safe_close_stream(stream)
         self._state = SessionState.IDLE
 
     def mark_error(self, exc: BaseException) -> None:
@@ -406,6 +432,7 @@ class ASRSessionManager:
         if self._recovery_in_progress:
             return
         self._recovery_in_progress = True
+        _safe_close_stream(self._stream)
         self._stream = None
         self._state = SessionState.ERROR_REBUILD
         if not _is_worker_protocol_error(exc):
@@ -440,6 +467,7 @@ class ASRSessionManager:
             self._state = SessionState.ACTIVE
         except Exception as inner:
             logger.warning("ASRSessionManager: post-restart create_stream failed: %s", inner)
+            _safe_close_stream(self._stream)
             self._stream = None
             self._state = SessionState.IDLE
 

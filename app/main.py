@@ -2035,6 +2035,14 @@ async def _asr_stream_backend(
                 except (ValueError, TypeError):
                     continue
                 if cmd.get("command") == "reset":
+                    # Release per-stream GPU resources from the old stream
+                    # before swapping (no-op for backends without close()).
+                    try:
+                        _old_close = getattr(stream, "close", None)
+                        if _old_close is not None:
+                            _old_close()
+                    except Exception:
+                        logger.exception("ASR reset: old stream close raised")
                     stream = asr_be.create_stream(language=language)
                     await ws.send_json({
                         "type": "reset",
@@ -2158,6 +2166,14 @@ async def _asr_stream_backend(
         except Exception:
             pass
     finally:
+        # Release per-stream TRT contexts and device buffers (no-op for
+        # backends without per-stream GPU resources).
+        try:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+        except Exception:
+            logger.exception("ASR stream close raised")
         try:
             await ws.close()
         except Exception:
