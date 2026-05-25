@@ -84,10 +84,44 @@ bash scripts/build_moss_tts_engines.sh
 
 ## Tested on
 
-- Orin NX 16GB / JetPack R36.4.3 / TRT 10.3 / CUDA 12.6 — TTFA **157 ms** (C++ TRT post-fix, 2026-05-24), ASR CER=0 across 3 Chinese prompts (short/medium/41-char-long), 5-round-repeat output byte-identical.
+- Orin NX 16GB / JetPack R36.4.3 / TRT 10.3 / CUDA 12.6 — TTFA **157 ms** (C++ TRT post-fix, 2026-05-24), ASR CER=0 across 3 Chinese prompts (short/medium/41-char-long), 5-round-repeat output byte-identical. N=2 concurrency verified (fork d92a306 / main 62448ef, binary md5 `fed07741bd93a5bf2f132989716e514c`).
+- Orin Nano 8GB / JetPack R36.4.3 / TRT 10.3 / CUDA 12.6 — TTFA **290 ms** N=1 (4.24 s audio for "你好，今天天气真不错"), N=2 concurrency verified 2026-05-25: parity 3-way MD5 byte-identical (`e15c5a601bb208feeb3add9044d5d1b5`), burst 30/30 rounds 0 errors 0 crashes, mixed-length TTFA ratio **1.01** (well within ≤1.5× spec gate), basic dual-client PASS. Peak RAM used 5530 MB / 7.4 GB total (min avail 1735 MB) — safely under OOM threshold. Same binary as Orin NX (md5 `fed07741bd93a5bf2f132989716e514c`).
 - Orin NX ORT fallback path: TTFA ~3000 ms (CPU EP) — production-validated 2026-05-23 (`[[moss_tts_nano_ort_path_production_ready]]`).
 
-Pending (per `[[moss_tts_nano_smoke_e2e_done]]` follow-ups): Orin Nano 8GB + AGX Orin.
+Pending (per `[[moss_tts_nano_smoke_e2e_done]]` follow-ups): AGX Orin.
+
+### Deploying to Orin Nano
+
+Same `jetson-moss-tts-nano-trt` profile works as-is on Orin Nano 8GB (no separate N=1 fallback profile needed). Steps:
+
+```bash
+# 1. Create target dirs (sudo)
+sudo mkdir -p /opt/jv-workers /opt/models/moss-tts-nano/engines /opt/models/moss-tts-nano/codec_onnx
+sudo chown -R $USER:$USER /opt/jv-workers /opt/models/moss-tts-nano
+
+# 2. Install runtime deps
+sudo apt-get install -y libsentencepiece-dev libsentencepiece0
+# ensure /home/<user>/ort-from-container/lib/libonnxruntime.so.1 exists (worker rpath)
+
+# 3. Sync engines + codec + worker binary from Orin NX (via LAN rsync recommended,
+#    ~2.5 GB engines + ~120 MB codec; ~25 s on gigabit LAN at ~110 MB/s):
+#    on orin-nx:
+rsync -av --exclude '*.bak' --exclude '*.before_*' --exclude '*.fp16bak' \
+  --exclude '*.fp32test' --exclude '*.ropepin.plan' \
+  /opt/models/moss-tts-nano/engines/ harvest@<orin-nano-lan-ip>:/opt/models/moss-tts-nano/engines/
+rsync -av /opt/models/moss-tts-nano/codec_onnx/ harvest@<orin-nano-lan-ip>:/opt/models/moss-tts-nano/codec_onnx/
+scp /opt/jv-workers/moss_tts_nano_worker harvest@<orin-nano-lan-ip>:/tmp/
+#    on orin-nano:
+sudo install -m 0755 /tmp/moss_tts_nano_worker /opt/jv-workers/moss_tts_nano_worker
+md5sum /opt/jv-workers/moss_tts_nano_worker
+# expect fed07741bd93a5bf2f132989716e514c
+
+# 4. Smoke + N=2 stress (same scripts as Orin NX):
+python3 bench/perf/smoke_moss_tts_backend.py --text "你好，今天天气真不错" --output /tmp/moss_smoke.wav
+MOSS_MAX_SLOTS=2 python3 bench/perf/stress_moss_tts_n2.py --mode parity
+```
+
+Monitor RAM with `watch -n2 free -m` during N=2 burst; if peak `used` exceeds ~7000 MB, fall back to `MOSS_MAX_SLOTS=1`. In practice on Orin Nano 8GB peak observed at 5530 MB.
 
 ## Building the C++ TRT worker (Orin NX host)
 
