@@ -9,24 +9,36 @@ subprocess (one stdin / one stdout) into N in-flight per-request streams,
 keyed by ``request_id`` / ``id``. Used today by the TRT-Edge-LLM TTS
 backend. Future ASR worker backends (spec P1+) will reuse this.
 
-Public API (P1a, sync — unchanged from the original `_WorkerIO`):
+Public API per spec Section 5:
 
     wio = WorkerIO(proc, concurrency)
-    for event in wio.request(payload): ...   # generator, terminates on done/cancelled
-    wio.cancel(request_id)                   # best-effort, any thread
-    # No explicit close(): the reader thread is daemon and exits on stdout EOF.
 
-P1b will migrate ``request()`` -> ``async send_request()`` per spec Section 5.
+    # Async (spec target — preferred for new code, e.g. future ASR worker)
+    async for event in wio.send_request(rid, payload):
+        ...
+    wio.cancel(rid)
+    wio.close()
+
+    # Sync (legacy shim retained for existing TTS path that runs inside a
+    # ThreadPoolExecutor; the surrounding generator-of-PCM-chunks pipeline
+    # cannot trivially flip to async without restructuring app/main.py's
+    # streaming response wiring. Will be removed once that migration lands).
+    for event in wio.request(payload):
+        ...
+
+Both APIs share the same underlying ``_inflight`` map, ``_stdin_lock``,
+reader thread, and semaphore, so they coexist safely on the same instance.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import queue
 import subprocess
 import threading
-from typing import Iterator
+from typing import AsyncIterator, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +87,98 @@ class WorkerIO:
             daemon=True,
         )
         self._reader_thread.start()
+
+    async def send_request(
+        self, request_id: str, payload: dict
+    ) -> AsyncIterator[dict]:
+        """Async-iterate worker events for one request.
+
+        Spec section 5 target API. The semaphore + per-request queue +
+        sentinel-on-worker-exit semantics match ``request()`` exactly; the
+        only difference is awaitable ``q.get`` (offloaded to the default
+        thread executor) so callers integrate into an asyncio event loop
+        without blocking it.
+
+        If the consumer breaks out of the ``async for`` (or ``aclose()`` is
+        invoked), the ``finally`` arm fires ``cancel(request_id)`` so the
+        worker emits a terminal ``cancelled`` event. This mirrors the
+        ``GeneratorExit`` arm in the sync streaming caller at
+        ``trt_edge_llm_tts.py``.
+        """
+        # Ensure payload carries the request_id the caller passed in.
+        payload = dict(payload)
+        payload.setdefault("id", request_id)
+        if payload.get("id") != request_id:
+            raise ValueError(
+                f"payload['id']={payload.get('id')!r} != request_id={request_id!r}"
+            )
+
+        loop = asyncio.get_running_loop()
+        # Run the blocking semaphore acquire off the loop. The semaphore is
+        # a back-pressure gate; it can block when concurrency is saturated.
+        await loop.run_in_executor(None, self._sem.acquire)
+
+        q: "queue.Queue" = queue.Queue()
+        with self._inflight_lock:
+            self._inflight[request_id] = q
+
+        cancelled_by_consumer = False
+        try:
+            assert self._proc.stdin is not None
+            try:
+                with self._stdin_lock:
+                    self._proc.stdin.write(
+                        json.dumps(payload, ensure_ascii=False) + "\n"
+                    )
+                    self._proc.stdin.flush()
+            except Exception:
+                with self._inflight_lock:
+                    self._inflight.pop(request_id, None)
+                raise
+
+            while True:
+                try:
+                    event = await loop.run_in_executor(None, q.get, True, 60.0)
+                except queue.Empty:
+                    raise TimeoutError(
+                        f"WorkerIO.send_request: no event for {request_id} in 60s"
+                    )
+                if event.get("event") == "_worker_exit":
+                    raise WorkerExitError("worker subprocess died mid-request")
+                try:
+                    yield event
+                except (GeneratorExit, asyncio.CancelledError):
+                    cancelled_by_consumer = True
+                    raise
+                if event.get("event") in ("done", "cancelled"):
+                    return
+        finally:
+            with self._inflight_lock:
+                self._inflight.pop(request_id, None)
+            self._sem.release()
+            if cancelled_by_consumer:
+                try:
+                    self.cancel(request_id)
+                except Exception:
+                    logger.debug(
+                        "cancel() during async cleanup failed", exc_info=True
+                    )
+
+    def close(self) -> None:
+        """Tear down: wake every in-flight caller and stop the reader.
+
+        After ``close()``, in-flight ``send_request``/``request`` generators
+        observe a ``_worker_exit`` sentinel and surface ``WorkerExitError``.
+        The reader thread itself is daemon and will exit naturally when
+        the subprocess stdout EOFs; ``close()`` does not kill the
+        subprocess — that is the owning backend's responsibility (proc
+        lifecycle stays where it is today).
+        """
+        with self._inflight_lock:
+            queues = list(self._inflight.values())
+            self._inflight.clear()
+        for q in queues:
+            q.put({"event": "_worker_exit"})
 
     def request(self, payload: dict) -> Iterator[dict]:
         """Send ``payload`` to the worker and yield response events until ``done``.
