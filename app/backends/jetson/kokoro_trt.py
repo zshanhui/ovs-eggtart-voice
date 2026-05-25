@@ -227,6 +227,14 @@ class KokoroTRTBackend(TTSBackend):
         self._token_to_id: dict[str, int] = {}
         self._runtime_mode = os.environ.get("KOKORO_TRT_RUNTIME", "auto").strip().lower()
         self._engine = None
+        # Per-call concurrency rework (N>=2 safety): TRT IExecutionContext is
+        # not thread-safe. Shared self._ctx / self._pool / self._split_ctxs
+        # are no longer populated by load paths — each _synthesize_one() call
+        # builds its own context set + pool and tears them down in a finally
+        # block. Engines (weights) remain shared and immutable.
+        #
+        # These attrs stay declared (None / empty dict) so unload() and other
+        # introspection code paths keep working with no signature change.
         self._ctx = None
         self._pool: CudaMemoryPool | None = None
         self._ort_sess = None
@@ -459,13 +467,12 @@ class KokoroTRTBackend(TTSBackend):
             self._engine = runtime.deserialize_cuda_engine(f.read())
         if self._engine is None:
             raise RuntimeError(f"Failed to deserialize Kokoro engine: {self._paths['engine_path']}")
-        self._ctx = self._engine.create_execution_context()
+        # Per-call concurrency rework: ctx + pool are per-call now.
         names = [self._engine.get_tensor_name(i) for i in range(self._engine.num_io_tensors)]
         if "tokens" in names:
             self._token_input_name = "tokens"
         elif "input_ids" in names:
             self._token_input_name = "input_ids"
-        self._pool = CudaMemoryPool()
         self._runtime_mode = "engine"
         logger.info("Kokoro TRT engine loaded: %s (%.1fs)", self._paths['engine_path'], time.time() - t0)
 
@@ -485,8 +492,7 @@ class KokoroTRTBackend(TTSBackend):
             self._engine = runtime.deserialize_cuda_engine(f.read())
         if self._engine is None:
             raise RuntimeError(f"Failed to deserialize Kokoro hybrid prefix engine: {prefix_engine}")
-        self._ctx = self._engine.create_execution_context()
-        self._pool = CudaMemoryPool()
+        # Per-call concurrency rework: ctx + pool are per-call now.
         self._configure_hybrid_token_profile()
         self._suffix_sess = ort.InferenceSession(self._paths['hybrid_suffix_onnx'], providers=["CPUExecutionProvider"])
         self._token_input_name = "tokens"
@@ -540,16 +546,15 @@ class KokoroTRTBackend(TTSBackend):
         t0 = time.time()
         runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
         self._split_engines = {}
-        self._split_ctxs = {}
         self._split_long_engines = {}
-        self._split_long_ctxs = {}
+        # Per-call concurrency rework: execution contexts + pool created
+        # per synthesize call. Only engines (weights) are loaded here.
         for name, path in required.items():
             with open(path, "rb") as f:
                 engine = runtime.deserialize_cuda_engine(f.read())
             if engine is None:
                 raise RuntimeError(f"Failed to deserialize Kokoro split {name} engine: {path}")
             self._split_engines[name] = engine
-            self._split_ctxs[name] = engine.create_execution_context()
         long_required = {
             "decoder": self._paths['split_decoder_engine_long'],
             "source": self._paths['split_source_engine_long'],
@@ -562,11 +567,9 @@ class KokoroTRTBackend(TTSBackend):
                 if engine is None:
                     raise RuntimeError(f"Failed to deserialize Kokoro split long {name} engine: {path}")
                 self._split_long_engines[name] = engine
-                self._split_long_ctxs[name] = engine.create_execution_context()
         elif any(os.path.exists(path) for path in long_required.values()):
             missing = [path for path in long_required.values() if not os.path.exists(path)]
             logger.warning("Ignoring incomplete Kokoro 256-512 bucket; missing: %s", missing)
-        self._pool = CudaMemoryPool()
         self._configure_split_token_profile()
         self._split_length_sess = ort.InferenceSession(self._paths['split_length_onnx'], providers=["CPUExecutionProvider"])
         self._split_istft_sess = ort.InferenceSession(self._paths['split_istft_onnx'], providers=["CPUExecutionProvider"])
@@ -743,21 +746,70 @@ class KokoroTRTBackend(TTSBackend):
         speed_arr = np.array([spd], dtype=np.float32)
 
         t_infer = time.time()
-        if self._runtime_mode == "engine":
-            audio = self._run_engine(input_ids, style, speed_arr)
-        elif self._runtime_mode == "hybrid":
-            audio = self._run_hybrid(input_ids, style, speed_arr)
-        elif self._runtime_mode == "split_generator":
-            try:
-                audio = self._run_split_generator(input_ids, style, speed_arr)
-            except ValueError as exc:
-                if os.environ.get("KOKORO_SPLIT_CPU_FALLBACK", "1").lower() in ("0", "false", "no"):
-                    raise
-                logger.warning("Kokoro split-generator shape mismatch; falling back to CPU ORT: %s", exc)
-                self._load_ort()
+        # Per-call concurrency rework: build per-call pool + execution
+        # contexts here (only for TRT modes). ORT modes don't need GPU
+        # resources and skip this. All TRT _run_* helpers receive pool/ctx
+        # via params — never touch self._pool / self._ctx during inference.
+        pool: CudaMemoryPool | None = None
+        local_ctx = None
+        local_split_ctxs: dict[str, object] = {}
+        local_split_long_ctxs: dict[str, object] = {}
+        try:
+            if self._runtime_mode in ("engine", "hybrid"):
+                pool = CudaMemoryPool()
+                if self._engine is not None:
+                    local_ctx = self._engine.create_execution_context()
+            elif self._runtime_mode == "split_generator":
+                pool = CudaMemoryPool()
+                local_split_ctxs = {
+                    name: eng.create_execution_context()
+                    for name, eng in self._split_engines.items()
+                }
+                local_split_long_ctxs = {
+                    name: eng.create_execution_context()
+                    for name, eng in self._split_long_engines.items()
+                }
+
+            if self._runtime_mode == "engine":
+                audio = self._run_engine(input_ids, style, speed_arr, pool=pool, ctx=local_ctx)
+            elif self._runtime_mode == "hybrid":
+                audio = self._run_hybrid(input_ids, style, speed_arr, pool=pool, ctx=local_ctx)
+            elif self._runtime_mode == "split_generator":
+                try:
+                    audio = self._run_split_generator(
+                        input_ids, style, speed_arr,
+                        pool=pool,
+                        split_ctxs=local_split_ctxs,
+                        split_long_ctxs=local_split_long_ctxs,
+                    )
+                except ValueError as exc:
+                    if os.environ.get("KOKORO_SPLIT_CPU_FALLBACK", "1").lower() in ("0", "false", "no"):
+                        raise
+                    logger.warning("Kokoro split-generator shape mismatch; falling back to CPU ORT: %s", exc)
+                    self._load_ort()
+                    audio = self._run_ort(input_ids, style, speed_arr)
+            else:
                 audio = self._run_ort(input_ids, style, speed_arr)
-        else:
-            audio = self._run_ort(input_ids, style, speed_arr)
+        finally:
+            if pool is not None:
+                try:
+                    pool.free_all()
+                except Exception:
+                    logger.exception("kokoro synth: pool.free_all failed")
+                try:
+                    pool.destroy()
+                except Exception:
+                    logger.exception("kokoro synth: pool.destroy failed")
+            if local_ctx is not None:
+                try:
+                    del local_ctx
+                except Exception:
+                    pass
+            for c in list(local_split_ctxs.values()) + list(local_split_long_ctxs.values()):
+                try:
+                    del c
+                except Exception:
+                    pass
         infer_ms = (time.time() - t_infer) * 1000
 
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -912,9 +964,15 @@ class KokoroTRTBackend(TTSBackend):
             {self._token_input_name: input_ids, "style": style, "speed": speed},
         )[0]
 
-    def _run_engine(self, input_ids: np.ndarray, style: np.ndarray, speed: np.ndarray) -> np.ndarray:
-        pool = self._pool
-        ctx = self._ctx
+    def _run_engine(
+        self,
+        input_ids: np.ndarray,
+        style: np.ndarray,
+        speed: np.ndarray,
+        *,
+        pool: "CudaMemoryPool",
+        ctx,
+    ) -> np.ndarray:
         assert pool is not None and ctx is not None and self._engine is not None
 
         def bind_input(name: str, arr: np.ndarray) -> None:
@@ -949,10 +1007,21 @@ class KokoroTRTBackend(TTSBackend):
         pool.free_all()
         return output
 
-    def _run_hybrid(self, input_ids: np.ndarray, style: np.ndarray, speed: np.ndarray) -> np.ndarray:
-        assert self._suffix_sess is not None
-        prefix_outputs = self._run_trt_engine(
-            {"tokens": input_ids, "style": style.astype(np.float32, copy=False), "speed": speed.astype(np.float32, copy=False)}
+    def _run_hybrid(
+        self,
+        input_ids: np.ndarray,
+        style: np.ndarray,
+        speed: np.ndarray,
+        *,
+        pool: "CudaMemoryPool",
+        ctx,
+    ) -> np.ndarray:
+        assert self._suffix_sess is not None and self._engine is not None and ctx is not None
+        prefix_outputs = self._run_trt_context(
+            self._engine,
+            ctx,
+            {"tokens": input_ids, "style": style.astype(np.float32, copy=False), "speed": speed.astype(np.float32, copy=False)},
+            pool=pool,
         )
         suffix_input_names = {item.name for item in self._suffix_sess.get_inputs()}
         feeds = {}
@@ -963,7 +1032,16 @@ class KokoroTRTBackend(TTSBackend):
             feeds[name] = arr
         return self._suffix_sess.run(None, feeds)[0]
 
-    def _run_split_generator(self, input_ids: np.ndarray, style: np.ndarray, speed: np.ndarray) -> np.ndarray:
+    def _run_split_generator(
+        self,
+        input_ids: np.ndarray,
+        style: np.ndarray,
+        speed: np.ndarray,
+        *,
+        pool: "CudaMemoryPool",
+        split_ctxs: dict[str, object],
+        split_long_ctxs: dict[str, object],
+    ) -> np.ndarray:
         assert self._split_length_sess is not None and self._split_istft_sess is not None
 
         stage: dict[str, np.ndarray] = {
@@ -971,10 +1049,12 @@ class KokoroTRTBackend(TTSBackend):
             "style": style.astype(np.float32, copy=False),
             "speed": speed.astype(np.float32, copy=False),
         }
-        stage.update(self._run_named_trt_engine("encoder", stage))
+        stage.update(self._run_named_trt_engine("encoder", stage, pool=pool, ctx=split_ctxs["encoder"]))
         stage.update(_run_cpu_onnx(self._split_length_sess, stage))
         frame_t = int(stage["/encoder/MatMul_1_output_0"].shape[2])
-        bucket_engines, bucket_ctxs = self._select_split_bucket(frame_t)
+        bucket_engines, bucket_ctxs = self._select_split_bucket(
+            frame_t, split_ctxs=split_ctxs, split_long_ctxs=split_long_ctxs,
+        )
 
         stage.update(self._run_split_bucket_engine(bucket_engines, bucket_ctxs, "decoder", {
             "/encoder/MatMul_1_output_0": stage["/encoder/MatMul_1_output_0"],
@@ -982,12 +1062,12 @@ class KokoroTRTBackend(TTSBackend):
             "/decoder/decoder/N_conv/Conv_output_0": stage["/decoder/decoder/N_conv/Conv_output_0"],
             "/decoder/decoder/Unsqueeze_output_0": stage["/decoder/decoder/Unsqueeze_output_0"],
             "style": stage["style"],
-        }))
+        }, pool=pool))
 
         if "source" in bucket_engines:
             stage.update(self._run_split_bucket_engine(bucket_engines, bucket_ctxs, "source", {
                 "/decoder/decoder/Unsqueeze_output_0": stage["/decoder/decoder/Unsqueeze_output_0"],
-            }))
+            }, pool=pool))
         else:
             assert self._split_source_sess is not None
             stage.update(_run_cpu_onnx(self._split_source_sess, stage))
@@ -996,23 +1076,35 @@ class KokoroTRTBackend(TTSBackend):
             "/decoder/decoder/decode.3/Div_4_output_0": stage["/decoder/decoder/decode.3/Div_4_output_0"],
             "/decoder/decoder/generator/Concat_3_output_0": stage["/decoder/decoder/generator/Concat_3_output_0"],
             "style": stage["style"],
-        })
+        }, pool=pool)
         return _run_cpu_onnx(self._split_istft_sess, gen)["audio"]
 
-    def _select_split_bucket(self, frame_t: int):
+    def _select_split_bucket(
+        self,
+        frame_t: int,
+        *,
+        split_ctxs: dict[str, object],
+        split_long_ctxs: dict[str, object],
+    ):
         if frame_t <= 256:
-            return self._split_engines, self._split_ctxs
+            return self._split_engines, split_ctxs
         if frame_t <= 512 and self._split_long_engines:
-            return self._split_long_engines, self._split_long_ctxs
+            return self._split_long_engines, split_long_ctxs
         raise ValueError(
             f"Kokoro split-generator frame length {frame_t} is outside available TRT buckets "
             f"(base<=256, long<=512 loaded={bool(self._split_long_engines)})"
         )
 
-    def _run_named_trt_engine(self, name: str, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    def _run_named_trt_engine(
+        self,
+        name: str,
+        inputs: dict[str, np.ndarray],
+        *,
+        pool: "CudaMemoryPool",
+        ctx,
+    ) -> dict[str, np.ndarray]:
         engine = self._split_engines[name]
-        ctx = self._split_ctxs[name]
-        return self._run_trt_context(engine, ctx, inputs)
+        return self._run_trt_context(engine, ctx, inputs, pool=pool)
 
     def _run_split_bucket_engine(
         self,
@@ -1020,17 +1112,19 @@ class KokoroTRTBackend(TTSBackend):
         ctxs: dict[str, object],
         name: str,
         inputs: dict[str, np.ndarray],
+        *,
+        pool: "CudaMemoryPool",
     ) -> dict[str, np.ndarray]:
-        return self._run_trt_context(engines[name], ctxs[name], inputs)
+        return self._run_trt_context(engines[name], ctxs[name], inputs, pool=pool)
 
-    def _run_trt_engine(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        pool = self._pool
-        ctx = self._ctx
-        assert pool is not None and ctx is not None and self._engine is not None
-        return self._run_trt_context(self._engine, ctx, inputs)
-
-    def _run_trt_context(self, engine, ctx, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        pool = self._pool
+    def _run_trt_context(
+        self,
+        engine,
+        ctx,
+        inputs: dict[str, np.ndarray],
+        *,
+        pool: "CudaMemoryPool",
+    ) -> dict[str, np.ndarray]:
         assert pool is not None
 
         def bind_input(name: str, arr: np.ndarray) -> None:

@@ -29,7 +29,9 @@ def _build_backend(mode: str, *, fixed_len=None, min_len=None, max_len=128):
 def _patched_synth(backend, token_ids, capture):
     """Run _synthesize_one with token + downstream stubs and capture input_ids."""
 
-    def fake_run_split_generator(input_ids, style, speed_arr):
+    def fake_run_split_generator(input_ids, style, speed_arr, **_kwargs):
+        # _kwargs absorbs pool / split_ctxs / split_long_ctxs added by the
+        # per-call concurrency rework (2026-05-25).
         capture["input_ids"] = input_ids
         # Return a small fake audio buffer.
         return np.zeros(1024, dtype=np.float32)

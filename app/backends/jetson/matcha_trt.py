@@ -187,6 +187,12 @@ class MatchaTRTBackend(TTSBackend):
         self._acoustic_ort = None
         self._split_encoder_ort = None
         self._split_estimator_engines = []
+        # Per-call concurrency rework: shared execution contexts and CUDA
+        # pool removed. TRT IExecutionContext is not thread-safe, so each
+        # synthesize() call now builds its own context set + pool and tears
+        # them down in a finally block. Engines (weights) stay shared.
+        # These attrs are kept (always empty/None) so unload() and other
+        # introspection code paths keep working without changes.
         self._split_estimator_ctxs = []
         self._acoustic_mode = "full_ort"
         self._vocos_engine = None
@@ -439,27 +445,25 @@ class MatchaTRTBackend(TTSBackend):
 
         t0 = time.time()
         self._vocos_engine = load_engine(self._vocos_engine_path)
-        self._vocos_ctx = self._vocos_engine.create_execution_context()
+        # Per-call concurrency rework (N>=2 safety): execution contexts and
+        # CUDA pool are now created per synthesize() call. Engines (weights)
+        # remain shared and immutable.
         logger.info("Vocos loaded: %s (%.1fs)", self._vocos_engine_path, time.time() - t0)
 
         if self._acoustic_mode == "split_trt":
             t0 = time.time()
             base_dir = os.path.dirname(self._split_estimator_engine)
             self._split_estimator_engines = []
-            self._split_estimator_ctxs = []
             names = []
             for step in range(N_ODE_STEPS):
                 path = os.path.join(base_dir, f"matcha_estimator_step{step}_bf16.engine")
                 engine = load_engine(path)
                 self._split_estimator_engines.append(engine)
-                self._split_estimator_ctxs.append(engine.create_execution_context())
                 names.append([engine.get_tensor_name(i) for i in range(engine.num_io_tensors)])
             logger.info(
                 "Split Matcha estimator TRT loaded from %s (%.1fs, tensors=%s)",
                 base_dir, time.time() - t0, names,
             )
-
-        self._cuda_pool = CudaMemoryPool()
 
     def _warmup(self):
         """Warmup inference."""
@@ -606,107 +610,137 @@ class MatchaTRTBackend(TTSBackend):
             speed = 1.0
         detected_language = detect_zh_en(text, language)
 
-        pool = self._cuda_pool
-        t_start = time.time()
+        # Per-call concurrency rework (N>=2 safety):
+        #   * fresh CudaMemoryPool (own stream + allocations) per request
+        #   * fresh execution context per request for each shared engine
+        # Engines (weights) stay shared and read-only. Cleanup in finally.
+        pool = CudaMemoryPool()
+        vocos_ctx = self._vocos_engine.create_execution_context()
+        split_estimator_ctxs = [
+            eng.create_execution_context() for eng in self._split_estimator_engines
+        ]
 
-        # Step 1: text → tokens
-        t0 = time.time()
-        tokens = self._text_to_tokens(text)
-        text_ms = (time.time() - t0) * 1000
-        if len(tokens) == 0:
-            logger.warning("No tokens for text: %r", text)
-            silence = np.zeros(int(SAMPLE_RATE * 0.1), dtype=np.float32)
-            return _samples_to_wav(silence, SAMPLE_RATE), {
-                "duration": 0.1,
-                "inference_time": 0.0,
+        try:
+            t_start = time.time()
+
+            # Step 1: text → tokens
+            t0 = time.time()
+            tokens = self._text_to_tokens(text)
+            text_ms = (time.time() - t0) * 1000
+            if len(tokens) == 0:
+                logger.warning("No tokens for text: %r", text)
+                silence = np.zeros(int(SAMPLE_RATE * 0.1), dtype=np.float32)
+                return _samples_to_wav(silence, SAMPLE_RATE), {
+                    "duration": 0.1,
+                    "inference_time": 0.0,
+                    "language": detected_language,
+                }
+
+            num_tokens = min(len(tokens), 80)
+            t0 = time.time()
+            x = np.array([tokens[:num_tokens]], dtype=np.int64)
+            x_length = np.array([num_tokens], dtype=np.int64)
+            noise_scale = np.array([1.0], dtype=np.float32)
+            length_scale = np.array([1.0 / speed], dtype=np.float32)
+            if self._acoustic_mode == "split_trt":
+                mel = self._run_split_acoustic(
+                    x, x_length, noise_scale, length_scale,
+                    pool=pool, estimator_ctxs=split_estimator_ctxs,
+                )
+            else:
+                ao = self._acoustic_ort.run(None, {
+                    "x": x, "x_length": x_length,
+                    "noise_scale": noise_scale, "length_scale": length_scale,
+                })
+                mel = ao[0]  # [1, 80, T_mel] already denormalized (denorm baked into graph)
+            encoder_ms = (time.time() - t0) * 1000
+            estimator_ms = 0.0
+            mel_frames = mel.shape[2]
+            # Pad to MAX_MEL_FRAMES for vocos engine compat (drop excess if any)
+            if mel.shape[2] > MAX_MEL_FRAMES:
+                mel = mel[:, :, :MAX_MEL_FRAMES]
+                mel_frames = MAX_MEL_FRAMES
+            valid_mel_frames = mel_frames
+            mel = _pad_mel_axis(mel)
+            mel_frames = mel.shape[2]
+            mask = None
+            mask_valid = valid_mel_frames
+
+            def alloc(arr):
+                ptr = pool.allocate(arr.nbytes)
+                pool.copy_htod(arr, ptr)
+                return ptr
+            logger.debug("matcha frames: tokens=%d mask=%d mel_frames=%d (~%.2fs)",
+                         num_tokens, mask_valid, mel_frames, mel_frames * HOP_LENGTH / SAMPLE_RATE)
+
+            # Vocos
+            t0 = time.time()
+            mel_input = mel[:, :, :mel_frames].astype(np.float32)
+            d_mel = alloc(mel_input)
+            vocos_ctx.set_tensor_address("mels", d_mel)
+            vocos_ctx.set_input_shape("mels", (1, MEL_DIM, mel_frames))
+
+            mag = np.zeros((1, 513, mel_frames), dtype=np.float32)
+            out_x = np.zeros((1, 513, mel_frames), dtype=np.float32)
+            out_y = np.zeros((1, 513, mel_frames), dtype=np.float32)
+
+            d_mag = pool.allocate(mag.nbytes)
+            d_x_out = pool.allocate(out_x.nbytes)
+            d_y_out = pool.allocate(out_y.nbytes)
+
+            vocos_ctx.set_tensor_address("mag", d_mag)
+            vocos_ctx.set_tensor_address("x", d_x_out)
+            vocos_ctx.set_tensor_address("y", d_y_out)
+            vocos_ctx.execute_async_v3(pool.stream_handle())
+            pool.synchronize()
+
+            pool.copy_dtoh(d_mag, mag)
+            pool.copy_dtoh(d_x_out, out_x)
+            pool.copy_dtoh(d_y_out, out_y)
+            vocos_ms = (time.time() - t0) * 1000
+
+            # ISTFT runs on the padded engine shape, then trims to real duration.
+            audio = _istft(mag[0], out_x[0], out_y[0], length=valid_mel_frames * HOP_LENGTH)
+
+            # No peak normalize — sherpa returns raw ISTFT (offline-tts-impl.cc:88-102 only int16-scales).
+            # Clip to int16 range to prevent overflow on rare loud frames.
+            audio = np.clip(audio, -1.0, 1.0)
+
+            elapsed = time.time() - t_start
+            duration = len(audio) / SAMPLE_RATE
+            wav_bytes = _samples_to_wav(audio.astype(np.float32), SAMPLE_RATE)
+
+            meta = {
+                "duration": round(duration, 3),
+                "inference_time": round(elapsed, 3),
+                "rtf": round(elapsed / duration, 3) if duration > 0 else 0,
+                "sample_rate": SAMPLE_RATE,
+                "num_tokens": num_tokens,
+                "text_ms": round(text_ms, 1),
+                "encoder_ms": round(encoder_ms, 1),
+                "estimator_ms": round(estimator_ms, 1),
+                "vocos_ms": round(vocos_ms, 1),
                 "language": detected_language,
             }
-
-        num_tokens = min(len(tokens), 80)
-        t0 = time.time()
-        x = np.array([tokens[:num_tokens]], dtype=np.int64)
-        x_length = np.array([num_tokens], dtype=np.int64)
-        noise_scale = np.array([1.0], dtype=np.float32)
-        length_scale = np.array([1.0 / speed], dtype=np.float32)
-        if self._acoustic_mode == "split_trt":
-            mel = self._run_split_acoustic(x, x_length, noise_scale, length_scale)
-        else:
-            ao = self._acoustic_ort.run(None, {
-                "x": x, "x_length": x_length,
-                "noise_scale": noise_scale, "length_scale": length_scale,
-            })
-            mel = ao[0]  # [1, 80, T_mel] already denormalized (denorm baked into graph)
-        encoder_ms = (time.time() - t0) * 1000
-        estimator_ms = 0.0
-        mel_frames = mel.shape[2]
-        # Pad to MAX_MEL_FRAMES for vocos engine compat (drop excess if any)
-        if mel.shape[2] > MAX_MEL_FRAMES:
-            mel = mel[:, :, :MAX_MEL_FRAMES]
-            mel_frames = MAX_MEL_FRAMES
-        valid_mel_frames = mel_frames
-        mel = _pad_mel_axis(mel)
-        mel_frames = mel.shape[2]
-        mask = None
-        mask_valid = valid_mel_frames
-
-        def alloc(arr):
-            ptr = pool.allocate(arr.nbytes)
-            pool.copy_htod(arr, ptr)
-            return ptr
-        logger.debug("matcha frames: tokens=%d mask=%d mel_frames=%d (~%.2fs)",
-                     num_tokens, mask_valid, mel_frames, mel_frames * HOP_LENGTH / SAMPLE_RATE)
-
-        # Vocos
-        t0 = time.time()
-        mel_input = mel[:, :, :mel_frames].astype(np.float32)
-        d_mel = alloc(mel_input)
-        self._vocos_ctx.set_tensor_address("mels", d_mel)
-        self._vocos_ctx.set_input_shape("mels", (1, MEL_DIM, mel_frames))
-
-        mag = np.zeros((1, 513, mel_frames), dtype=np.float32)
-        out_x = np.zeros((1, 513, mel_frames), dtype=np.float32)
-        out_y = np.zeros((1, 513, mel_frames), dtype=np.float32)
-
-        d_mag = pool.allocate(mag.nbytes)
-        d_x_out = pool.allocate(out_x.nbytes)
-        d_y_out = pool.allocate(out_y.nbytes)
-
-        self._vocos_ctx.set_tensor_address("mag", d_mag)
-        self._vocos_ctx.set_tensor_address("x", d_x_out)
-        self._vocos_ctx.set_tensor_address("y", d_y_out)
-        self._vocos_ctx.execute_async_v3(pool.stream_handle())
-        pool.synchronize()
-
-        pool.copy_dtoh(d_mag, mag)
-        pool.copy_dtoh(d_x_out, out_x)
-        pool.copy_dtoh(d_y_out, out_y)
-        vocos_ms = (time.time() - t0) * 1000
-
-        # ISTFT runs on the padded engine shape, then trims to real duration.
-        audio = _istft(mag[0], out_x[0], out_y[0], length=valid_mel_frames * HOP_LENGTH)
-
-        # No peak normalize — sherpa returns raw ISTFT (offline-tts-impl.cc:88-102 only int16-scales).
-        # Clip to int16 range to prevent overflow on rare loud frames.
-        audio = np.clip(audio, -1.0, 1.0)
-
-        elapsed = time.time() - t_start
-        duration = len(audio) / SAMPLE_RATE
-        wav_bytes = _samples_to_wav(audio.astype(np.float32), SAMPLE_RATE)
-
-        meta = {
-            "duration": round(duration, 3),
-            "inference_time": round(elapsed, 3),
-            "rtf": round(elapsed / duration, 3) if duration > 0 else 0,
-            "sample_rate": SAMPLE_RATE,
-            "num_tokens": num_tokens,
-            "text_ms": round(text_ms, 1),
-            "encoder_ms": round(encoder_ms, 1),
-            "estimator_ms": round(estimator_ms, 1),
-            "vocos_ms": round(vocos_ms, 1),
-            "language": detected_language,
-        }
-        pool.free_all()
-        return wav_bytes, meta
+            return wav_bytes, meta
+        finally:
+            try:
+                pool.free_all()
+            except Exception:
+                logger.exception("matcha synth: pool.free_all failed")
+            try:
+                pool.destroy()
+            except Exception:
+                logger.exception("matcha synth: pool.destroy failed")
+            try:
+                del vocos_ctx
+            except Exception:
+                pass
+            for c in split_estimator_ctxs:
+                try:
+                    del c
+                except Exception:
+                    pass
 
     def generate_streaming(self, text: str, **kwargs):
         """Yield raw PCM int16 chunks.
@@ -751,8 +785,16 @@ class MatchaTRTBackend(TTSBackend):
         x_length: np.ndarray,
         noise_scale: np.ndarray,
         length_scale: np.ndarray,
+        *,
+        pool: "CudaMemoryPool",
+        estimator_ctxs: list,
     ) -> np.ndarray:
-        """Run Matcha acoustic as ORT encoder + TRT estimator ODE loop."""
+        """Run Matcha acoustic as ORT encoder + TRT estimator ODE loop.
+
+        ``pool`` and ``estimator_ctxs`` are per-call resources owned by the
+        caller (synthesize); we never touch self._cuda_pool /
+        self._split_estimator_ctxs here so concurrent callers can't collide.
+        """
         mu, mask, z = self._split_encoder_ort.run(None, {
             "x": x,
             "x_length": x_length,
@@ -773,15 +815,20 @@ class MatchaTRTBackend(TTSBackend):
         z = _pad_mel_axis(z)
         for step in range(N_ODE_STEPS):
             feeds = {"z": z, "mu": mu, "mask": mask}
-            velocity = self._run_estimator_trt(step, feeds)
+            velocity = self._run_estimator_trt(step, feeds, pool=pool, ctx=estimator_ctxs[step])
             z = z + ODE_DT * velocity
 
         mel = z[:, :, :valid_frames] * MEL_SIGMA + MEL_MEAN
         return mel.astype(np.float32)
 
-    def _run_estimator_trt(self, step: int, feeds: dict[str, np.ndarray]) -> np.ndarray:
-        pool = self._cuda_pool
-        ctx = self._split_estimator_ctxs[step]
+    def _run_estimator_trt(
+        self,
+        step: int,
+        feeds: dict[str, np.ndarray],
+        *,
+        pool: "CudaMemoryPool",
+        ctx,
+    ) -> np.ndarray:
 
         def alloc_input(name: str, arr: np.ndarray) -> int:
             arr = np.ascontiguousarray(arr.astype(np.float32, copy=False))
