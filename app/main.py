@@ -295,19 +295,24 @@ def _try_asr_manager():
 
 def _resolve_tts_stream_max_workers() -> tuple[int, str | None, str]:
     """Resolve the TTS stream executor `max_workers` from env + the
-    currently-loaded backend name. Returns `(workers, backend_name_or_None,
-    env_var_used)`. Extracted so a one-shot post-startup refresh can
-    replace the executor when the backend-specific env didn't apply at
-    first call (TTS service not yet ready → backend_name() == "").
+    currently-loaded backend's concurrency_capability. Returns
+    `(workers, backend_name_or_None, source_label)`.
 
-    Codex Week 3 BLOCKER 4: if `_get_tts_stream_executor()` is called
-    before TTS service is ready (e.g. lazy startup, first /v2v/stream
-    warming up), backend_name() returns "" and the
-    OVS_TTS_STREAM_MAX_WORKERS_{KOKORO,MATCHA,QWEN3,MOSS} envs never
-    activate — the executor sticks at the global default forever.
+    Spec docs/specs/concurrency-capability-framework.md §5: executor cap
+    and the WorkerIO semaphore must derive from the same capability
+    source. Resolution precedence:
+
+      1. backend-specific env (OVS_TTS_STREAM_MAX_WORKERS_{KOKORO,MATCHA,
+         QWEN3,MOSS}) if matching, then global OVS_TTS_STREAM_MAX_WORKERS
+         — env values are CLAMPED to the backend ceiling.
+      2. backend.concurrency_capability(profile).max_concurrent (None ->
+         legacy global default of 2 since the executor needs a finite N).
+      3. legacy default ``2``.
+
+    Codex Week 3 BLOCKER 4 lazy-startup workflow is preserved: the
+    one-shot post-ready refresh still applies because we re-read both
+    backend name and capability each call until the flag flips.
     """
-    max_workers_str = os.environ.get("OVS_TTS_STREAM_MAX_WORKERS", "2")
-    env_used = "OVS_TTS_STREAM_MAX_WORKERS"
     try:
         from app.core import tts_service as _tts_svc
         backend_name = (
@@ -317,6 +322,10 @@ def _resolve_tts_stream_max_workers() -> tuple[int, str | None, str]:
         )
     except Exception:
         backend_name = ""
+
+    # Pull explicit env (back-compat with codex Week 3 BLOCKER 4).
+    env_used = None
+    env_str: str | None = None
     for suffix, env_name in (
         ("kokoro", "OVS_TTS_STREAM_MAX_WORKERS_KOKORO"),
         ("matcha", "OVS_TTS_STREAM_MAX_WORKERS_MATCHA"),
@@ -324,10 +333,47 @@ def _resolve_tts_stream_max_workers() -> tuple[int, str | None, str]:
         ("moss", "OVS_TTS_STREAM_MAX_WORKERS_MOSS"),
     ):
         if suffix in backend_name and os.environ.get(env_name):
-            max_workers_str = os.environ[env_name]
+            env_str = os.environ[env_name]
             env_used = env_name
             break
-    return int(max_workers_str), backend_name or None, env_used
+    if env_str is None and os.environ.get("OVS_TTS_STREAM_MAX_WORKERS"):
+        env_str = os.environ["OVS_TTS_STREAM_MAX_WORKERS"]
+        env_used = "OVS_TTS_STREAM_MAX_WORKERS"
+
+    # Capability-driven default (spec §5 alignment with WorkerIO).
+    cap_max: int | None = None
+    try:
+        from app.core.profile_loader import current_profile
+        from app.core.tts_backend import _TTS_REGISTRY
+        prof = current_profile()
+        spec = prof.get("tts_backend")
+        if spec and spec in _TTS_REGISTRY:
+            module_path, cls_name = _TTS_REGISTRY[spec]
+            import importlib as _il
+            cls = getattr(_il.import_module(module_path), cls_name)
+            cap = cls.concurrency_capability(prof)
+            cap_max = cap.max_concurrent  # may be None (unbounded)
+    except Exception:
+        cap_max = None
+
+    if env_str is not None:
+        try:
+            n = int(env_str)
+        except (TypeError, ValueError):
+            n = 2
+        if cap_max is not None and n > cap_max:
+            logger.warning(
+                "TTS executor: %s=%d exceeds backend ceiling %d; clamping",
+                env_used, n, cap_max,
+            )
+            n = cap_max
+        return max(1, n), backend_name or None, env_used or "OVS_TTS_STREAM_MAX_WORKERS"
+
+    if cap_max is not None:
+        return max(1, cap_max), backend_name or None, "concurrency_capability"
+
+    # No env, no capability resolvable — legacy default.
+    return 2, backend_name or None, "default"
 
 
 # Tracks whether the cached executor was created BEFORE the TTS backend

@@ -94,6 +94,45 @@ def test_executor_resolves_at_init_when_backend_ready(monkeypatch):
     assert appmod._tts_stream_executor_resolved_backend is True
 
 
+def test_executor_falls_back_to_capability_when_no_env(monkeypatch):
+    """Spec §5: without env vars, executor cap aligns with backend
+    concurrency_capability so the WorkerIO semaphore and executor share
+    the same ceiling source."""
+    # Force the loaded profile to declare matcha_trt (cap default K=2).
+    monkeypatch.delenv("OVS_TTS_STREAM_MAX_WORKERS", raising=False)
+    monkeypatch.delenv("OVS_TTS_STREAM_MAX_WORKERS_MATCHA", raising=False)
+    from app.core import profile_loader
+    monkeypatch.setattr(
+        profile_loader,
+        "current_profile",
+        lambda: {
+            "tts_backend": "jetson.matcha_trt",
+            "asr_backend": "jetson.paraformer_trt",
+        },
+    )
+    _patch_tts_service(monkeypatch, is_ready=True, name="jetson.matcha_trt.fp16")
+    n, name, src = appmod._resolve_tts_stream_max_workers()
+    assert n == 2
+    assert src == "concurrency_capability"
+
+
+def test_executor_env_clamped_to_capability(monkeypatch, caplog):
+    """Spec §5: env-based override is clamped to the backend ceiling."""
+    monkeypatch.setenv("OVS_TTS_STREAM_MAX_WORKERS_MATCHA", "16")
+    from app.core import profile_loader
+    monkeypatch.setattr(
+        profile_loader,
+        "current_profile",
+        lambda: {
+            "tts_backend": "jetson.matcha_trt",
+            "asr_backend": "jetson.paraformer_trt",
+        },
+    )
+    _patch_tts_service(monkeypatch, is_ready=True, name="jetson.matcha_trt.fp16")
+    n, _, _ = appmod._resolve_tts_stream_max_workers()
+    assert n == 2, f"expected clamp to backend ceiling 2, got {n}"
+
+
 def test_executor_no_change_when_global_equals_backend_specific(monkeypatch):
     """Refresh path picks correct value even when values match — no
     spurious replacement, but flag flips so subsequent calls skip the
