@@ -26,6 +26,14 @@ if [[ -z "${OVS_PROFILE:-}" && -z "${OVS_PROFILE_JSON:-}" ]]; then
         ;;
     esac
   fi
+else
+  # When OVS_PROFILE is explicitly set (by user or OVS_PROFILE_DEFAULT),
+  # the profile is the single source of truth for LANGUAGE_MODE /
+  # ASR_BACKEND / TTS_BACKEND. Unset any image-baked or env-inherited
+  # values so profile_loader can inject the profile's intended values
+  # without tripping its CRITICAL_KEYS conflict guard (see
+  # app/core/profile_loader.py:CRITICAL_KEYS).
+  unset LANGUAGE_MODE ASR_BACKEND TTS_BACKEND
 fi
 
 exec "$@"
