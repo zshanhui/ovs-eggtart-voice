@@ -477,25 +477,61 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         self._wio = WorkerIO(self._worker, concurrency=1)
 
     def _worker_request(self, input_data: dict) -> dict:
+        """Send one streaming protocol line to the worker, return its single reply.
+
+        Streaming events emitted by ``qwen3_asr_worker`` (``begin_ack``,
+        ``partial``, ``final``, ``segment_rotation``, ``chunk_ack``,
+        ``end_ack``, ``error``) are one-line responses keyed by the
+        request's ``id`` — exactly one event per input line. We route the
+        write + read through ``WorkerIO.request()`` (so the daemon reader
+        thread demuxes by ``id``) but break out of the iterator after the
+        first event since none of the streaming events are the ``done``/
+        ``cancelled`` terminals that ``request()`` would otherwise loop
+        for. ``request()``'s finally arm still unregisters the inflight
+        queue and releases the semaphore on early break.
+
+        The same ``id`` is reused across begin → N×chunk → end, but the
+        WorkerIO inflight queue is registered fresh on each ``request()``
+        call (and popped in finally), so the lifecycle aligns as long as
+        these calls are strictly serialized — which they are: WorkerIO's
+        ``Semaphore(1)`` enforces this.
+        """
         req_event = input_data.get("event") if isinstance(input_data, dict) else None
+        # Lifecycle gate only.
         with self._worker_lock:
             self._ensure_worker()
-            assert self._worker is not None and self._worker.stdin is not None and self._worker.stdout is not None
+            wio = self._wio
+        assert wio is not None
+        try:
+            output_data: Optional[dict] = None
+            gen = wio.request(input_data)
             try:
-                self._worker.stdin.write(json.dumps(input_data, ensure_ascii=False) + "\n")
-                self._worker.stdin.flush()
-            except (BrokenPipeError, OSError) as exc:
-                stderr = self._stderr_tail_text()
-                self._worker = None
-                raise WorkerExitError(
-                    f"ASR worker stdin broken (likely killed): {exc}: {stderr}"
-                ) from exc
-            line = self._worker.stdout.readline()
-        if not line:
+                for ev in gen:
+                    output_data = ev
+                    break
+            finally:
+                gen.close()
+        except _WIOExitError as exc:
+            stderr = self._stderr_tail_text()
+            self._worker = None
+            raise WorkerExitError(
+                f"ASR worker exited before response: {exc}: {stderr}"
+            ) from exc
+        except (BrokenPipeError, OSError) as exc:
+            # WorkerIO surfaces a stdin write failure (worker subprocess
+            # already dead, pipe broken) by letting the OSError propagate
+            # out of ``request()``. Translate into the legacy
+            # WorkerExitError contract that ASRSessionManager recovery
+            # logic depends on (commit `bf24284` multi-utterance fix).
+            stderr = self._stderr_tail_text()
+            self._worker = None
+            raise WorkerExitError(
+                f"ASR worker stdin broken (likely killed): {exc}: {stderr}"
+            ) from exc
+        if output_data is None:
             stderr = self._stderr_tail_text()
             self._worker = None
             raise WorkerExitError(f"ASR worker exited before response: {stderr}")
-        output_data = json.loads(line)
         typed = _classify_worker_response(output_data, request_event=req_event)
         if typed is not None:
             raise typed
