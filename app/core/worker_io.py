@@ -302,6 +302,12 @@ class WorkerIO:
         try:
             assert self._proc.stdin is not None
             with self._stdin_lock:
+                # Skip writing if close() has set _closed under the same
+                # lock — the worker stdin is already considered dead.
+                # Avoids a guaranteed-fail write and the noisy "broken
+                # pipe" debug trace that the catch below would emit.
+                if self._closed:
+                    return
                 self._proc.stdin.write(
                     json.dumps({"type": "cancel", "id": req_id}) + "\n"
                 )

@@ -28,13 +28,10 @@ Slot = Literal["asr", "tts"]
 def _resolve_mode(policy: dict, profile: Optional[dict]) -> str:
     """Resolve the effective coordinator mode per spec §4.
 
-    ``exclusive`` is unconditional; otherwise we start from
-    ``policy.mode`` (default ``concurrent``) and downgrade to
-    ``serialized`` if either active backend declares
-    ``supports_parallel=False`` or ``max_concurrent <= 1``.
-
-    ``profile`` is optional; without it (legacy callers / tests) we
-    return the raw ``policy.mode`` to preserve behavior.
+    Thin wrapper over ``capability_resolver.resolve`` — the actual
+    aggregation + downgrade rules live there. Without ``profile`` we
+    return the raw ``policy.mode`` to preserve legacy/test behavior
+    (matches the pre-resolver contract).
     """
     requested = (policy or {}).get("mode", "concurrent")
     if requested == "exclusive":
@@ -43,49 +40,24 @@ def _resolve_mode(policy: dict, profile: Optional[dict]) -> str:
         return requested
 
     try:
-        from app.core.asr_backend import _ASR_REGISTRY
-        from app.core.tts_backend import _TTS_REGISTRY
-        from app.core.concurrency_capability import ConcurrencyCapability
+        from app.core.capability_resolver import resolve as _resolve_cap
     except Exception:
         return requested
 
-    def _cap(key: str, registry: dict) -> ConcurrencyCapability:
-        spec = profile.get(key)
-        if not spec or spec not in registry:
-            return ConcurrencyCapability.default()
-        module_path, cls_name = registry[spec]
-        try:
-            import importlib
-            mod = importlib.import_module(module_path)
-            cls = getattr(mod, cls_name)
-            return cls.concurrency_capability(profile)
-        except Exception as exc:
-            logger.debug(
-                "coordinator: capability lookup failed for %s=%s: %s",
-                key, spec, exc,
-            )
-            return ConcurrencyCapability.default()
-
-    asr_cap = _cap("asr_backend", _ASR_REGISTRY)
-    tts_cap = _cap("tts_backend", _TTS_REGISTRY)
-
-    def _parallel_ok(cap: ConcurrencyCapability) -> bool:
-        if not cap.supports_parallel:
-            return False
-        # None means "no hard cap" (e.g. per-stream paraformer) -> parallel.
-        if cap.max_concurrent is None:
-            return True
-        return cap.max_concurrent > 1
-
-    if requested == "concurrent" and not (_parallel_ok(asr_cap) and _parallel_ok(tts_cap)):
+    resolved = _resolve_cap(profile=profile, policy=policy)
+    if (
+        requested == "concurrent"
+        and resolved.coordinator_mode == "serialized"
+    ):
+        asr_cap = resolved.asr_cap
+        tts_cap = resolved.tts_cap
         logger.info(
             "coordinator: downgrading concurrent -> serialized "
             "(asr.supports_parallel=%s/max=%s, tts.supports_parallel=%s/max=%s)",
             asr_cap.supports_parallel, asr_cap.max_concurrent,
             tts_cap.supports_parallel, tts_cap.max_concurrent,
         )
-        return "serialized"
-    return requested
+    return resolved.coordinator_mode
 
 
 class BackendCoordinator:

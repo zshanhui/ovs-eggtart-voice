@@ -79,68 +79,6 @@ def _parse_int(value: str | int | None, *, label: str) -> int | None:
         raise ValueError(f"{label} must be an integer, got {value!r}") from exc
 
 
-def _backend_class(profile: dict | None, key: str, registry: dict):
-    """Resolve a backend class from a profile registry-key without instantiating.
-
-    Returns ``None`` if the profile is missing the key, the registry lookup
-    fails, or the lazy import errors out. Callers must fall back to the
-    conservative default (``ConcurrencyCapability.default()``).
-    """
-    if not isinstance(profile, dict):
-        return None
-    spec = profile.get(key)
-    if not spec or spec not in registry:
-        return None
-    module_path, cls_name = registry[spec]
-    try:
-        import importlib
-        mod = importlib.import_module(module_path)
-        return getattr(mod, cls_name)
-    except Exception as exc:
-        logger.debug("session_limiter: %s import failed for %r: %s", key, spec, exc)
-        return None
-
-
-def _capability_ceiling(profile: dict | None) -> tuple[int | None, str]:
-    """Compute the aggregated backend ceiling.
-
-    Returns ``(ceiling, source)`` where ``ceiling`` is ``None`` if neither
-    backend declares a hard cap (treated as +inf), else the integer min.
-    ``source`` is a short label for logging.
-    """
-    from app.core.asr_backend import _ASR_REGISTRY
-    from app.core.tts_backend import _TTS_REGISTRY
-    from app.core.concurrency_capability import ConcurrencyCapability
-
-    asr_cls = _backend_class(profile, "asr_backend", _ASR_REGISTRY)
-    tts_cls = _backend_class(profile, "tts_backend", _TTS_REGISTRY)
-
-    def _cap(cls) -> ConcurrencyCapability:
-        if cls is None:
-            return ConcurrencyCapability.default()
-        try:
-            return cls.concurrency_capability(profile)
-        except Exception as exc:
-            logger.debug(
-                "session_limiter: concurrency_capability() raised for %s: %s",
-                getattr(cls, "__name__", cls), exc,
-            )
-            return ConcurrencyCapability.default()
-
-    asr_cap = _cap(asr_cls)
-    tts_cap = _cap(tts_cls)
-
-    asr_n = asr_cap.max_concurrent  # may be None == +inf
-    tts_n = tts_cap.max_concurrent
-    if asr_n is None and tts_n is None:
-        return None, "asr=inf,tts=inf"
-    if asr_n is None:
-        return tts_n, f"asr=inf,tts={tts_n}"
-    if tts_n is None:
-        return asr_n, f"asr={asr_n},tts=inf"
-    return min(asr_n, tts_n), f"asr={asr_n},tts={tts_n}"
-
-
 def resolve_limit(profile: dict | None = None) -> int:
     """Resolve the effective session limit.
 
@@ -153,61 +91,34 @@ def resolve_limit(profile: dict | None = None) -> int:
 
     Precedence (after clamping): env override > profile field > ceiling.
     Raises ``ValueError`` for non-int, zero, or negative values.
+
+    Implementation: delegates to ``capability_resolver.resolve`` so all
+    three downstream callers (limiter, coordinator, executor) share one
+    capability snapshot. Pre-validate env/profile values before calling
+    the resolver so the historical ``ValueError`` messages remain
+    surfaced even when the resolver isn't asked about that field.
     """
+    from app.core.capability_resolver import resolve as _resolve_cap
+
     profile = profile or {}
 
-    env_raw = os.environ.get("OVS_MAX_CONCURRENT_SESSIONS")
-    env_val = _parse_int(env_raw, label="OVS_MAX_CONCURRENT_SESSIONS")
-    if env_val is not None and env_val <= 0:
-        raise ValueError(
-            f"OVS_MAX_CONCURRENT_SESSIONS must be > 0, got {env_val}"
-        )
+    # Preserve the original ``ValueError`` surface for sanity checks even
+    # though the resolver re-validates internally. Tests rely on these
+    # being raised by ``resolve_limit`` directly.
+    _parse_int(os.environ.get("OVS_MAX_CONCURRENT_SESSIONS"),
+               label="OVS_MAX_CONCURRENT_SESSIONS")
+    _parse_int(profile.get("max_concurrent_sessions"),
+               label="profile.max_concurrent_sessions")
 
-    profile_val = _parse_int(
-        profile.get("max_concurrent_sessions"),
-        label="profile.max_concurrent_sessions",
-    )
-    if profile_val is not None and profile_val <= 0:
-        raise ValueError(
-            f"profile.max_concurrent_sessions must be > 0, got {profile_val}"
-        )
-
-    # Only consult capability aggregation when the profile names a backend.
-    # Otherwise (e.g. mac dev-shell), fall back to the legacy target table
-    # so undeclared environments keep working.
-    if profile.get("asr_backend") or profile.get("tts_backend"):
-        ceiling, ceiling_src = _capability_ceiling(profile)
-    else:
-        target = _infer_target(profile)
-        ceiling = _TARGET_DEFAULTS.get(target, _UNKNOWN_DEFAULT)
-        ceiling_src = f"target_default={target}"
-
-    # Clamp env override to ceiling.
-    if env_val is not None:
-        if ceiling is not None and env_val > ceiling:
-            logger.warning(
-                "session_limiter: OVS_MAX_CONCURRENT_SESSIONS=%d exceeds backend"
-                " ceiling (%s) → clamping to %d",
-                env_val, ceiling_src, ceiling,
-            )
-            return ceiling
-        return env_val
-
-    # Clamp profile override to ceiling.
-    if profile_val is not None:
-        if ceiling is not None and profile_val > ceiling:
-            logger.warning(
-                "session_limiter: profile.max_concurrent_sessions=%d exceeds"
-                " backend ceiling (%s) → clamping to %d",
-                profile_val, ceiling_src, ceiling,
-            )
-            return ceiling
-        return profile_val
-
-    # No explicit override. If ceiling is +inf, fall back to a sane default
-    # (target table, then UNKNOWN_DEFAULT) so we don't admit unbounded
-    # sessions.
+    resolved = _resolve_cap(profile=profile)
+    for w in resolved.clamp_warnings:
+        if "OVS_MAX_CONCURRENT_SESSIONS" in w or "max_concurrent_sessions" in w:
+            logger.warning("session_limiter: %s", w)
+    ceiling = resolved.session_ceiling
     if ceiling is None:
+        # Resolver returns None only when both backends declare max=None
+        # AND no profile/env override applies. Fall back to legacy target
+        # table (behaviour preserved for mac dev-shell etc.).
         target = _infer_target(profile)
         return _TARGET_DEFAULTS.get(target, _UNKNOWN_DEFAULT)
     return ceiling

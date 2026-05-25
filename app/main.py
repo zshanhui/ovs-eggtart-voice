@@ -362,57 +362,34 @@ def _resolve_tts_stream_max_workers() -> tuple[int, str | None, str]:
     except Exception:
         backend_name = ""
 
-    # Pull explicit env (back-compat with codex Week 3 BLOCKER 4).
-    env_used = None
-    env_str: str | None = None
-    for suffix, env_name in (
-        ("kokoro", "OVS_TTS_STREAM_MAX_WORKERS_KOKORO"),
-        ("matcha", "OVS_TTS_STREAM_MAX_WORKERS_MATCHA"),
-        ("qwen3", "OVS_TTS_STREAM_MAX_WORKERS_QWEN3"),
-        ("moss", "OVS_TTS_STREAM_MAX_WORKERS_MOSS"),
-    ):
-        if suffix in backend_name and os.environ.get(env_name):
-            env_str = os.environ[env_name]
-            env_used = env_name
-            break
-    if env_str is None and os.environ.get("OVS_TTS_STREAM_MAX_WORKERS"):
-        env_str = os.environ["OVS_TTS_STREAM_MAX_WORKERS"]
-        env_used = "OVS_TTS_STREAM_MAX_WORKERS"
-
-    # Capability-driven default (spec §5 alignment with WorkerIO).
-    cap_max: int | None = None
+    # Delegate to the shared resolver (spec §5). Profile lookup +
+    # capability fallback + env clamp now live in one place — see
+    # ``app.core.capability_resolver``.
     try:
         from app.core.profile_loader import current_profile
-        from app.core.tts_backend import _TTS_REGISTRY
+        from app.core.capability_resolver import resolve_executor_for_tts
         prof = current_profile()
-        spec = prof.get("tts_backend")
-        if spec and spec in _TTS_REGISTRY:
-            module_path, cls_name = _TTS_REGISTRY[spec]
-            import importlib as _il
-            cls = getattr(_il.import_module(module_path), cls_name)
-            cap = cls.concurrency_capability(prof)
-            cap_max = cap.max_concurrent  # may be None (unbounded)
     except Exception:
-        cap_max = None
+        prof = {}
+        from app.core.capability_resolver import resolve_executor_for_tts
 
-    if env_str is not None:
-        try:
-            n = int(env_str)
-        except (TypeError, ValueError):
-            n = 2
-        if cap_max is not None and n > cap_max:
-            logger.warning(
-                "TTS executor: %s=%d exceeds backend ceiling %d; clamping",
-                env_used, n, cap_max,
-            )
-            n = cap_max
-        return max(1, n), backend_name or None, env_used or "OVS_TTS_STREAM_MAX_WORKERS"
-
-    if cap_max is not None:
-        return max(1, cap_max), backend_name or None, "concurrency_capability"
-
-    # No env, no capability resolvable — legacy default.
-    return 2, backend_name or None, "default"
+    workers, name, src = resolve_executor_for_tts(
+        profile=prof, tts_backend_name=backend_name or None,
+    )
+    # Surface the legacy WARNING for env > ceiling clamps. The resolver
+    # already produced the warning text; we reproduce it here at WARNING
+    # level to preserve the prior log surface for ops dashboards.
+    try:
+        from app.core.capability_resolver import resolve as _resolve_cap
+        snapshot = _resolve_cap(
+            profile=prof, tts_backend_name=backend_name or None,
+        )
+        for w in snapshot.clamp_warnings:
+            if w.startswith("TTS executor:"):
+                logger.warning(w)
+    except Exception:
+        pass
+    return workers, name, src
 
 
 # Tracks whether the cached executor was created BEFORE the TTS backend

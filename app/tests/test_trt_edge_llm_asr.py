@@ -213,9 +213,12 @@ def test_worker_request_injects_worker_exit_on_empty_line():
 def test_worker_request_broken_pipe_raises_worker_exit():
     """SIGKILL of the worker causes BrokenPipeError on stdin.write. Without
     classification, that escapes as a raw IOError and the session manager
-    cannot route it to ERROR_REBUILD. After the fix, _worker_request must
-    surface this as WorkerExitError so restart_worker fires."""
+    cannot route it to ERROR_REBUILD. After the WorkerIO migration,
+    _worker_request must still surface this as WorkerExitError so
+    restart_worker fires.
+    """
     import pytest
+    from app.core.worker_io import WorkerIO
     backend = TRTEdgeLLMASRBackend()
 
     class _DeadStdin:
@@ -224,11 +227,20 @@ def test_worker_request_broken_pipe_raises_worker_exit():
         def flush(self):
             raise BrokenPipeError("worker dead")
 
+    class _Stdout:
+        # WorkerIO's reader thread iterates stdout; an empty iterator
+        # just causes it to EOF immediately (we never get there because
+        # the stdin.write above fires first).
+        def __iter__(self):
+            return iter(())
+
     class _Worker:
         stdin = _DeadStdin()
-        stdout = object()  # truthy, never read because write fails first
+        stdout = _Stdout()
 
-    backend._worker = _Worker()
+    proc = _Worker()
+    backend._worker = proc
+    backend._wio = WorkerIO(proc, concurrency=1)
     backend._ensure_worker = lambda: None  # don't try to spawn
 
     with pytest.raises(WorkerExitError):
