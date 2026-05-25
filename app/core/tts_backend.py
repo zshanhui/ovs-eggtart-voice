@@ -147,6 +147,7 @@ _TTS_REGISTRY: Dict[str, Tuple[str, str]] = {
     "jetson.matcha_trt":   ("app.backends.jetson.matcha_trt",       "MatchaTRTBackend"),
     "jetson.kokoro_trt":   ("app.backends.jetson.kokoro_trt",       "KokoroTRTBackend"),
     "jetson.qwen3_trt":    ("app.backends.jetson.qwen3_trt",        "Qwen3TRTBackend"),
+    "jetson.moss_tts_nano":("app.backends.jetson.moss_tts_nano",    "MossTtsNanoBackend"),
     "cpu.sherpa":          ("app.backends.cpu.sherpa",              "SherpaBackend"),
     "rk.tts":              ("app.backends.rk.tts",                  "RKTTSBackend"),
 }

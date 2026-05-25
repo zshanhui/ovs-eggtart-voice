@@ -93,6 +93,7 @@ COPY third_party/qwen3-edgellm-jetson/ /opt/qwen3-edgellm-jetson/
 RUN set -eux; \
     mkdir -p /opt/models /opt/edgellm /opt/edgellm-bin /opt/models/qwen3-edgellm; \
     chmod +x /opt/jv-workers/qwen3_asr_worker /opt/jv-workers/qwen3_tts_worker; \
+    if [ -f /opt/jv-workers/moss_tts_nano_worker ]; then chmod +x /opt/jv-workers/moss_tts_nano_worker; fi; \
     cp /opt/jv-workers/libNvInfer_edgellm_plugin.so /opt/edgellm/libNvInfer_edgellm_plugin.so; \
     cp /opt/jv-workers/libNvInfer_edgellm_plugin_asr.so /opt/edgellm/libNvInfer_edgellm_plugin_asr.so; \
     cp /opt/jv-workers/libNvInfer_edgellm_plugin.so /opt/edgellm-bin/libNvInfer_edgellm_plugin.so; \
