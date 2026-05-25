@@ -154,6 +154,22 @@ def test_matcha_invalid_env_falls_back(monkeypatch):
     assert cap.max_concurrent == 2  # fallback
 
 
+def test_kokoro_invalid_env_falls_back(monkeypatch):
+    monkeypatch.setenv("OVS_TTS_STREAM_MAX_WORKERS", "not-an-int")
+    from app.backends.jetson.kokoro_trt import KokoroTRTBackend
+
+    cap = KokoroTRTBackend.concurrency_capability()
+    assert cap.max_concurrent == 2  # fallback
+
+
+def test_trt_edge_llm_tts_invalid_env_falls_back(monkeypatch):
+    monkeypatch.setenv("OVS_TTS_WORKER_CONCURRENCY", "not-an-int")
+    from app.backends.jetson.trt_edge_llm_tts import TRTEdgeLLMTTSBackend
+
+    cap = TRTEdgeLLMTTSBackend.concurrency_capability()
+    assert cap.max_concurrent == 1  # conservative fallback
+
+
 def test_matcha_k1_serialized(monkeypatch):
     monkeypatch.setenv("OVS_TTS_STREAM_MAX_WORKERS", "1")
     from app.backends.jetson.matcha_trt import MatchaTRTBackend
