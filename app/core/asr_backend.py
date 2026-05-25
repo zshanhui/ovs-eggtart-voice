@@ -13,6 +13,8 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from app.core.concurrency_capability import ConcurrencyCapability
+
 logger = logging.getLogger(__name__)
 
 
@@ -130,6 +132,19 @@ class ASRBackend(ABC):
         an unload() stay resident, which is fine for 'concurrent' and
         'serialized' modes."""
         pass
+
+    @classmethod
+    def concurrency_capability(
+        cls, profile: Optional[dict] = None
+    ) -> ConcurrencyCapability:
+        """Describe runtime concurrency properties.
+
+        Classmethod (not instance property) so the scheduler can read the
+        ceiling before ``preload()``. Default is conservative (N=1,
+        serialized) — backends opt in by overriding. See
+        ``docs/specs/concurrency-capability-framework.md`` Section 2.
+        """
+        return ConcurrencyCapability.default()
 
 
 _ASR_REGISTRY: Dict[str, Tuple[str, str]] = {

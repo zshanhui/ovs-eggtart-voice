@@ -746,6 +746,24 @@ class ParaformerTRTStream(ASRStream):
 
 class ParaformerTRTBackend(ASRBackend):
 
+    @classmethod
+    def concurrency_capability(cls, profile=None):
+        from app.core.concurrency_capability import ConcurrencyCapability
+
+        # Per-stream _ParaformerCtxBundle: each ASRStream owns its own enc/dec
+        # TRT execution contexts + buffer cache. Backend only holds shared
+        # engines (weights). There is no fixed pool — concurrency scales with
+        # the number of open streams, bounded only by VRAM. See spec Section 1
+        # row "paraformer_trt" and ASRStream.close()/__del__ in
+        # app/core/asr_backend.py for bundle lifetime.
+        return ConcurrencyCapability(
+            supports_parallel=True,
+            max_concurrent=None,
+            is_stateful=True,
+            requires_exclusive_device=True,
+            scaling_mode="multi_runtime_per_slot",
+        )
+
     def __init__(self):
         # Per-stream concurrency rework (N>=2 safety): TRT IExecutionContext
         # is not thread-safe. Backend keeps shared engines (weights) only;

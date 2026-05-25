@@ -13,6 +13,8 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Dict, Optional, Tuple
 
+from app.core.concurrency_capability import ConcurrencyCapability
+
 logger = logging.getLogger(__name__)
 
 
@@ -125,6 +127,19 @@ class TTSBackend(ABC):
     def unload(self) -> None:
         """Release GPU/NPU resources. See ASRBackend.unload() for semantics."""
         pass
+
+    @classmethod
+    def concurrency_capability(
+        cls, profile: Optional[dict] = None
+    ) -> ConcurrencyCapability:
+        """Describe runtime concurrency properties.
+
+        Classmethod (not instance property) so the scheduler can read the
+        ceiling before ``preload()``. Default is conservative (N=1,
+        serialized) — backends opt in by overriding. See
+        ``docs/specs/concurrency-capability-framework.md`` Section 2.
+        """
+        return ConcurrencyCapability.default()
 
 
 _TTS_REGISTRY: Dict[str, Tuple[str, str]] = {

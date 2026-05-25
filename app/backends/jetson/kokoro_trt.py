@@ -337,6 +337,37 @@ class KokoroTRTBackend(TTSBackend):
     # Hardware (VRAM) verification on orin-nano will be a separate dispatch.
     supports_hot_reload: bool = True
 
+    @classmethod
+    def concurrency_capability(cls, profile=None):
+        from app.core.concurrency_capability import ConcurrencyCapability
+
+        # K = OVS_TTS_STREAM_MAX_WORKERS (default 2), matching _build_ctx_pool().
+        # Profile may override via tts_stream_max_workers (or nested
+        # tts_backend_config.stream_max_workers). Engines (weights) shared;
+        # each _KokoroCtxSlot holds its own TRT execution contexts.
+        env_val = os.environ.get("OVS_TTS_STREAM_MAX_WORKERS")
+        profile_val = None
+        if isinstance(profile, dict):
+            profile_val = profile.get("tts_stream_max_workers")
+            if profile_val is None:
+                cfg = profile.get("tts_backend_config")
+                if isinstance(cfg, dict):
+                    profile_val = cfg.get("stream_max_workers")
+        try:
+            k = int(env_val) if env_val is not None else (
+                int(profile_val) if profile_val is not None else 2
+            )
+        except (TypeError, ValueError):
+            k = 2
+        k = max(1, k)
+        return ConcurrencyCapability(
+            supports_parallel=k > 1,
+            max_concurrent=k,
+            is_stateful=True,
+            requires_exclusive_device=True,
+            scaling_mode="single_runtime_multiplex",
+        )
+
     def __init__(self):
         self._token_to_id: dict[str, int] = {}
         self._runtime_mode = os.environ.get("KOKORO_TRT_RUNTIME", "auto").strip().lower()

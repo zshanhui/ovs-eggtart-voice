@@ -249,6 +249,38 @@ class MatchaTRTBackend(TTSBackend):
     # matcha_trt_unload_vram_release (orin-nx N-round swap test).
     supports_hot_reload: bool = True
 
+    @classmethod
+    def concurrency_capability(cls, profile=None):
+        from app.core.concurrency_capability import ConcurrencyCapability
+
+        # K = OVS_TTS_STREAM_MAX_WORKERS (default 2), matching _build_ctx_pool().
+        # Profile may override via tts_stream_max_workers (or nested
+        # tts_backend_config.stream_max_workers). Engines (weights) are shared;
+        # each slot holds its own pre-allocated TRT execution contexts so K
+        # concurrent synthesize() calls never share a context.
+        env_val = os.environ.get("OVS_TTS_STREAM_MAX_WORKERS")
+        profile_val = None
+        if isinstance(profile, dict):
+            profile_val = profile.get("tts_stream_max_workers")
+            if profile_val is None:
+                cfg = profile.get("tts_backend_config")
+                if isinstance(cfg, dict):
+                    profile_val = cfg.get("stream_max_workers")
+        try:
+            k = int(env_val) if env_val is not None else (
+                int(profile_val) if profile_val is not None else 2
+            )
+        except (TypeError, ValueError):
+            k = 2
+        k = max(1, k)
+        return ConcurrencyCapability(
+            supports_parallel=k > 1,
+            max_concurrent=k,
+            is_stateful=True,
+            requires_exclusive_device=True,
+            scaling_mode="single_runtime_multiplex",
+        )
+
     def __init__(self):
         self._acoustic_ort = None
         self._split_encoder_ort = None

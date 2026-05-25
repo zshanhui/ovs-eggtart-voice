@@ -318,6 +318,23 @@ class RKASRBackend(ASRBackend):
     ``ASR_BACKEND`` env var (set in the rk3576/rk3588 profile).
     """
 
+    @classmethod
+    def concurrency_capability(cls, profile=None):
+        """Declare concurrency for RK NPU ASR.
+
+        Spec §1 sample row "RK ASR/TTS": rkvoice-stream owns the NPU
+        lifecycle (see ``app/backends/rk/asr.py:380`` hot-reload note)
+        and runs single-session. NPU is an exclusive device.
+        """
+        from app.core.concurrency_capability import ConcurrencyCapability
+        return ConcurrencyCapability(
+            supports_parallel=False,
+            max_concurrent=1,
+            is_stateful=True,
+            requires_exclusive_device=True,
+            scaling_mode="external_managed",
+        )
+
     def __init__(self):
         from rkvoice_stream import create_asr
         self._inner = create_asr()
