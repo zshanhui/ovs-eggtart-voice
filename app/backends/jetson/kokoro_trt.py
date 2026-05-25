@@ -19,11 +19,27 @@ import queue
 import re
 import struct
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
 from app.backends.jetson.matcha_trt import CudaMemoryPool
+
+
+@dataclass
+class _DeviceTensor:
+    """Handle to a tensor that lives in device memory between TRT stages.
+
+    Lifetime is bounded by the per-synthesize CudaMemoryPool — these tensors
+    are valid until the synthesize call's outer try/finally calls
+    slot.reset_per_request() (which calls pool.free_all()). Never escape this
+    scope; pass by value within one _synthesize_one() invocation only.
+    """
+    ptr: int
+    shape: tuple[int, ...]
+    dtype: type
+    nbytes: int
 from app.core.tts_backend import TTSBackend, TTSCapability
 from app.core.tts_speakers import resolve_speaker_kwargs
 
@@ -1170,27 +1186,77 @@ class KokoroTRTBackend(TTSBackend):
             frame_t, split_ctxs=split_ctxs, split_long_ctxs=split_long_ctxs,
         )
 
-        stage.update(self._run_split_bucket_engine(bucket_engines, bucket_ctxs, "decoder", {
-            "/encoder/MatMul_1_output_0": stage["/encoder/MatMul_1_output_0"],
-            "/decoder/decoder/F0_conv/Conv_output_0": stage["/decoder/decoder/F0_conv/Conv_output_0"],
-            "/decoder/decoder/N_conv/Conv_output_0": stage["/decoder/decoder/N_conv/Conv_output_0"],
-            "/decoder/decoder/Unsqueeze_output_0": stage["/decoder/decoder/Unsqueeze_output_0"],
-            "style": stage["style"],
-        }, pool=pool))
+        # Stages 3 (decoder TRT) → 4 (source TRT or CPU) → 5 (generator TRT)
+        # → 6 (iSTFT CPU). If source is TRT, we can keep decoder/source
+        # outputs device-resident and skip 2 D2H + 2 H2D round trips per
+        # synthesize. iSTFT (CPU) forces generator's output back to host.
+        source_is_trt = "source" in bucket_engines
+        device_chain_outputs: dict[str, _DeviceTensor] = {}
 
-        if "source" in bucket_engines:
-            stage.update(self._run_split_bucket_engine(bucket_engines, bucket_ctxs, "source", {
-                "/decoder/decoder/Unsqueeze_output_0": stage["/decoder/decoder/Unsqueeze_output_0"],
-            }, pool=pool))
+        # style is bound by generator (and originally by decoder) — for the
+        # device path we still bind style via H2D each stage because it's tiny
+        # (256 floats) and not produced by another TRT engine. Cheaper to keep
+        # the host array around than thread the device pointer through.
+
+        if source_is_trt:
+            # Pure TRT chain: decoder → generator (with style + source-Div_4
+            # rebound on generator). source's Div_4 output overrides decoder's.
+            decoder_dev = self._run_split_bucket_engine(
+                bucket_engines, bucket_ctxs, "decoder", {
+                    "/encoder/MatMul_1_output_0": stage["/encoder/MatMul_1_output_0"],
+                    "/decoder/decoder/F0_conv/Conv_output_0": stage["/decoder/decoder/F0_conv/Conv_output_0"],
+                    "/decoder/decoder/N_conv/Conv_output_0": stage["/decoder/decoder/N_conv/Conv_output_0"],
+                    "/decoder/decoder/Unsqueeze_output_0": stage["/decoder/decoder/Unsqueeze_output_0"],
+                    "style": stage["style"],
+                },
+                pool=pool, return_device=True,
+            )
+            source_dev = self._run_split_bucket_engine(
+                bucket_engines, bucket_ctxs, "source", {
+                    "/decoder/decoder/Unsqueeze_output_0": stage["/decoder/decoder/Unsqueeze_output_0"],
+                },
+                pool=pool, return_device=True,
+            )
+            # Merge — source's outputs override decoder's where keys collide
+            # (specifically Div_4 in the kokoro split topology).
+            device_chain_outputs = {**decoder_dev, **source_dev}
+
+            # Generator needs Div_4 (from source) and Concat_3 (from decoder).
+            # style is the only host-side input.
+            needed = (
+                "/decoder/decoder/decode.3/Div_4_output_0",
+                "/decoder/decoder/generator/Concat_3_output_0",
+            )
+            gen_device_inputs = {k: device_chain_outputs[k] for k in needed if k in device_chain_outputs}
+            gen = self._run_split_bucket_engine(
+                bucket_engines, bucket_ctxs, "generator",
+                {"style": stage["style"]},
+                pool=pool,
+                device_inputs=gen_device_inputs,
+                return_device=False,  # iSTFT is CPU; output must be host
+            )
         else:
+            # CPU source path — cannot keep decoder output device-resident
+            # because source ORT wants host arrays. Fall back to legacy host
+            # I/O for all three stages.
+            stage.update(self._run_split_bucket_engine(
+                bucket_engines, bucket_ctxs, "decoder", {
+                    "/encoder/MatMul_1_output_0": stage["/encoder/MatMul_1_output_0"],
+                    "/decoder/decoder/F0_conv/Conv_output_0": stage["/decoder/decoder/F0_conv/Conv_output_0"],
+                    "/decoder/decoder/N_conv/Conv_output_0": stage["/decoder/decoder/N_conv/Conv_output_0"],
+                    "/decoder/decoder/Unsqueeze_output_0": stage["/decoder/decoder/Unsqueeze_output_0"],
+                    "style": stage["style"],
+                }, pool=pool,
+            ))
             assert self._split_source_sess is not None
             stage.update(_run_cpu_onnx(self._split_source_sess, stage))
-
-        gen = self._run_split_bucket_engine(bucket_engines, bucket_ctxs, "generator", {
-            "/decoder/decoder/decode.3/Div_4_output_0": stage["/decoder/decoder/decode.3/Div_4_output_0"],
-            "/decoder/decoder/generator/Concat_3_output_0": stage["/decoder/decoder/generator/Concat_3_output_0"],
-            "style": stage["style"],
-        }, pool=pool)
+            gen = self._run_split_bucket_engine(
+                bucket_engines, bucket_ctxs, "generator", {
+                    "/decoder/decoder/decode.3/Div_4_output_0": stage["/decoder/decoder/decode.3/Div_4_output_0"],
+                    "/decoder/decoder/generator/Concat_3_output_0": stage["/decoder/decoder/generator/Concat_3_output_0"],
+                    "style": stage["style"],
+                }, pool=pool,
+            )
         return _run_cpu_onnx(self._split_istft_sess, gen)["audio"]
 
     def _select_split_bucket(
@@ -1216,9 +1282,14 @@ class KokoroTRTBackend(TTSBackend):
         *,
         pool: "CudaMemoryPool",
         ctx,
-    ) -> dict[str, np.ndarray]:
+        device_inputs: dict[str, "_DeviceTensor"] | None = None,
+        return_device: bool = False,
+    ):
         engine = self._split_engines[name]
-        return self._run_trt_context(engine, ctx, inputs, pool=pool)
+        return self._run_trt_context(
+            engine, ctx, inputs, pool=pool,
+            device_inputs=device_inputs, return_device=return_device,
+        )
 
     def _run_split_bucket_engine(
         self,
@@ -1228,8 +1299,13 @@ class KokoroTRTBackend(TTSBackend):
         inputs: dict[str, np.ndarray],
         *,
         pool: "CudaMemoryPool",
-    ) -> dict[str, np.ndarray]:
-        return self._run_trt_context(engines[name], ctxs[name], inputs, pool=pool)
+        device_inputs: dict[str, "_DeviceTensor"] | None = None,
+        return_device: bool = False,
+    ):
+        return self._run_trt_context(
+            engines[name], ctxs[name], inputs, pool=pool,
+            device_inputs=device_inputs, return_device=return_device,
+        )
 
     def _run_trt_context(
         self,
@@ -1238,10 +1314,32 @@ class KokoroTRTBackend(TTSBackend):
         inputs: dict[str, np.ndarray],
         *,
         pool: "CudaMemoryPool",
-    ) -> dict[str, np.ndarray]:
-        assert pool is not None
+        device_inputs: dict[str, "_DeviceTensor"] | None = None,
+        return_device: bool = False,
+    ):
+        """Run a TRT context with optional device-resident I/O.
 
-        def bind_input(name: str, arr: np.ndarray) -> None:
+        Args:
+            inputs: host numpy arrays bound via H2D copy.
+            device_inputs: pre-existing device pointers (from a previous TRT
+                stage's ``return_device=True`` output) — bound directly with
+                no H2D copy. Inputs in ``device_inputs`` override entries in
+                ``inputs`` with the same name.
+            return_device: if True, do not D2H output buffers; instead return
+                ``dict[str, _DeviceTensor]`` of device pointers valid for the
+                lifetime of ``pool``. The caller is responsible for ensuring
+                ``pool.free_all()`` is not called until those tensors are no
+                longer needed (synthesize-level finally handles this).
+
+        Pool lifecycle: this method NEVER calls ``pool.free_all()``. The outer
+        ``_synthesize_one()`` finally block (via ``slot.reset_per_request()``)
+        is the single source of truth for releasing per-request device memory.
+        That gives multi-stage callers a stable device-resident buffer chain.
+        """
+        assert pool is not None
+        device_inputs = device_inputs or {}
+
+        def bind_host_input(name: str, arr: np.ndarray) -> None:
             arr = np.ascontiguousarray(arr)
             self._validate_engine_input_shape(engine, name, arr)
             ptr = pool.allocate(arr.nbytes)
@@ -1249,12 +1347,30 @@ class KokoroTRTBackend(TTSBackend):
             ctx.set_tensor_address(name, ptr)
             self._set_or_validate_input_shape(ctx, name, arr)
 
-        for name, arr in inputs.items():
-            bind_input(name, arr)
+        def bind_device_input(name: str, dt: "_DeviceTensor") -> None:
+            ctx.set_tensor_address(name, dt.ptr)
+            # set_input_shape mirrors the dynamic-shape path used for host
+            # arrays — emulate by constructing a tiny stand-in with the right
+            # shape attribute. Using a class with .shape avoids a real
+            # numpy alloc.
+            class _ShapeOnly:
+                __slots__ = ("shape",)
+                def __init__(self, shape):
+                    self.shape = shape
+            self._set_or_validate_input_shape(ctx, name, _ShapeOnly(dt.shape))
 
-        outputs: dict[str, np.ndarray] = {}
-        output_ptrs: list[tuple[str, int, np.ndarray]] = []
+        # First H2D-bind any host inputs not shadowed by device_inputs.
+        for name, arr in inputs.items():
+            if name in device_inputs:
+                continue
+            bind_host_input(name, arr)
+        for name, dt in device_inputs.items():
+            bind_device_input(name, dt)
+
         import tensorrt as trt
+
+        host_output_ptrs: list[tuple[str, int, np.ndarray]] = []
+        device_output_handles: dict[str, _DeviceTensor] = {}
 
         for i in range(engine.num_io_tensors):
             name = engine.get_tensor_name(i)
@@ -1262,23 +1378,32 @@ class KokoroTRTBackend(TTSBackend):
                 continue
             shape = tuple(int(d) for d in ctx.get_tensor_shape(name))
             if any(d < 0 for d in shape):
-                pool.free_all()
                 raise RuntimeError(f"Kokoro hybrid prefix output has dynamic shape: {name} {shape}")
             dtype = _trt_dtype_to_np(engine.get_tensor_dtype(name))
-            out = np.empty(shape, dtype=dtype)
-            ptr = pool.allocate(out.nbytes)
-            ctx.set_tensor_address(name, ptr)
-            output_ptrs.append((name, ptr, out))
+            if return_device:
+                nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+                ptr = pool.allocate(nbytes)
+                ctx.set_tensor_address(name, ptr)
+                device_output_handles[name] = _DeviceTensor(
+                    ptr=ptr, shape=shape, dtype=dtype, nbytes=nbytes,
+                )
+            else:
+                out = np.empty(shape, dtype=dtype)
+                ptr = pool.allocate(out.nbytes)
+                ctx.set_tensor_address(name, ptr)
+                host_output_ptrs.append((name, ptr, out))
 
         ok = ctx.execute_async_v3(pool.stream_handle())
         if not ok:
-            pool.free_all()
             raise RuntimeError("Kokoro hybrid prefix TRT execute_async_v3 returned False")
         pool.synchronize()
-        for name, ptr, out in output_ptrs:
+
+        if return_device:
+            return device_output_handles
+        outputs: dict[str, np.ndarray] = {}
+        for name, ptr, out in host_output_ptrs:
             pool.copy_dtoh(ptr, out)
             outputs[name] = out
-        pool.free_all()
         return outputs
 
     def _validate_engine_input_shape(self, engine, name: str, arr: np.ndarray) -> None:
