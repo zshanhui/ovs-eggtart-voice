@@ -192,6 +192,24 @@ class SherpaASRBackend(ASRBackend):
     # PR5: CPU / ORT model — releasable in-process via del + gc.
     supports_hot_reload = True
 
+    @classmethod
+    def concurrency_capability(cls, profile=None):
+        """Declare concurrency for desktop/CPU ASR.
+
+        Spec §1 sample row "desktop/CPU ASR/TTS". CPU/ORT recognizer
+        objects are independent across streams; the soft cap of 4 matches
+        the historical desktop default from session_limiter and bounds
+        CPU thread contention.
+        """
+        from app.core.concurrency_capability import ConcurrencyCapability
+        return ConcurrencyCapability(
+            supports_parallel=True,
+            max_concurrent=4,
+            is_stateful=True,
+            requires_exclusive_device=False,
+            scaling_mode="external_managed",
+        )
+
     def __init__(self):
         self._online_recognizer = None
         self._offline_recognizer = None

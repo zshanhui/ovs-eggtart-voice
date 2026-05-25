@@ -227,3 +227,45 @@ def test_qwen3_trt_falls_back_to_default():
     cap = Qwen3TRTBackend.concurrency_capability()
     assert cap == ConcurrencyCapability.default()
     assert cap.max_concurrent == 1
+
+
+# ---------- CPU / desktop backends: parallel 4, non-exclusive ----------
+
+
+def test_sherpa_tts_cpu_capability():
+    from app.backends.cpu.sherpa import SherpaBackend
+    cap = SherpaBackend.concurrency_capability()
+    assert cap.supports_parallel is True
+    assert cap.max_concurrent == 4
+    assert cap.requires_exclusive_device is False
+    assert cap.scaling_mode == "external_managed"
+
+
+def test_sherpa_asr_cpu_capability():
+    from app.backends.cpu.sherpa_asr import SherpaASRBackend
+    cap = SherpaASRBackend.concurrency_capability()
+    assert cap.supports_parallel is True
+    assert cap.max_concurrent == 4
+    assert cap.requires_exclusive_device is False
+    assert cap.scaling_mode == "external_managed"
+
+
+# ---------- RK NPU backends: serial, exclusive, max 1 ----------
+
+
+def test_rk_asr_capability():
+    from app.backends.rk.asr import RKASRBackend
+    cap = RKASRBackend.concurrency_capability()
+    assert cap.supports_parallel is False
+    assert cap.max_concurrent == 1
+    assert cap.requires_exclusive_device is True
+    assert cap.scaling_mode == "external_managed"
+
+
+def test_rk_tts_capability():
+    from app.backends.rk.tts import RKTTSBackend
+    cap = RKTTSBackend.concurrency_capability()
+    assert cap.supports_parallel is False
+    assert cap.max_concurrent == 1
+    assert cap.requires_exclusive_device is True
+    assert cap.scaling_mode == "external_managed"

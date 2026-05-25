@@ -73,6 +73,27 @@ class SherpaBackend(TTSBackend):
     # this backend can be hot-reloaded in-process.
     supports_hot_reload = True
 
+    @classmethod
+    def concurrency_capability(cls, profile=None):
+        """Declare concurrency for desktop/CPU TTS.
+
+        Spec §1 sample table row "desktop/CPU ASR/TTS": CPU/ORT is stateless
+        at the device level (no GPU/NPU lock), so multiple synthesize()
+        calls can run in parallel up to a soft cap chosen to bound CPU
+        thread contention. Default ``max_concurrent=4`` mirrors the
+        historical ``_TARGET_DEFAULTS["desktop"]=4`` at
+        ``app/core/session_limiter.py:30``; the limiter aggregation in
+        commit 3 must not regress this to 1.
+        """
+        from app.core.concurrency_capability import ConcurrencyCapability
+        return ConcurrencyCapability(
+            supports_parallel=True,
+            max_concurrent=4,
+            is_stateful=True,
+            requires_exclusive_device=False,
+            scaling_mode="external_managed",
+        )
+
     def __init__(self):
         self._tts = None
         self._ready = False
