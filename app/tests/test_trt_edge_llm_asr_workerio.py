@@ -224,6 +224,70 @@ def test_worker_request_worker_exit_raises_worker_exit_error():
     assert backend._worker is None
 
 
+def test_cancel_and_finalize_timeout_raises_worker_exit_error():
+    """cancel_and_finalize() waits 500ms for 'end' ack; if the worker
+    is unresponsive, it must raise WorkerExitError so the session
+    manager can trigger restart_worker(). Codex follow-up review NIT.
+    """
+    from app.backends.jetson.trt_edge_llm_asr import (
+        _TRTEdgeLLMStreamingASRStream,
+        WorkerExitError,
+    )
+
+    backend, proc, _wio = _make_backend_with_wio()
+    # Stash minimum config needed by stream constructor.
+    backend._config = {
+        "stream_chunk_sec": 0.6,
+        "stream_unfixed_chunks": 4,
+        "stream_unfixed_tokens": 16,
+    }
+
+    # Feed the begin_ack so the constructor's _begin() returns; then
+    # leave the queue idle so the subsequent 'end' event never gets
+    # acked and cancel_and_finalize() trips its 500ms timeout.
+    def _feeder_begin_only():
+        for _ in range(50):
+            if proc.stdin.writes:
+                break
+            time.sleep(0.01)
+        first = json.loads(proc.stdin.writes[0])
+        proc.stdout.feed(json.dumps({"id": first["id"], "event": "begin_ack"}))
+
+    threading.Thread(target=_feeder_begin_only, daemon=True).start()
+    stream = _TRTEdgeLLMStreamingASRStream(backend)
+
+    start = time.time()
+    with pytest.raises(WorkerExitError):
+        stream.cancel_and_finalize()
+    elapsed = time.time() - start
+    # Should fire within ~0.5s; allow generous upper bound for slow CI.
+    assert 0.4 < elapsed < 2.0, f"cancel timeout took {elapsed:.3f}s, expected ~0.5s"
+    # Stream marks itself closed even on the timeout error path.
+    assert stream._closed is True
+
+
+def test_restart_worker_clears_wio_and_makes_next_wio_a_fresh_object():
+    """restart_worker() must drop the WorkerIO instance so the next
+    request rebuilds via _ensure_worker. Pins the contract that survived
+    the WorkerIO migration (#5). Codex follow-up review NIT.
+    """
+    backend, proc, wio_before = _make_backend_with_wio()
+    # restart_worker() expects subprocess.poll() — _FakeProc doesn't have
+    # one, so monkey-patch to "already exited" to skip kill/wait.
+    proc.poll = lambda: 0  # type: ignore[method-assign]
+    proc.stdout.close = lambda: None  # type: ignore[method-assign]
+    proc.stdin.close = lambda: None  # type: ignore[method-assign]
+
+    backend.restart_worker()
+
+    # After restart, backend has cleared both refs.
+    assert backend._worker is None, "expected _worker cleared after restart"
+    assert backend._wio is None, "expected _wio cleared after restart"
+    # The old WorkerIO instance had close() called on it (semaphore
+    # not re-used, inflight drained — sentinel was put).
+    assert wio_before._closed is True, "old WorkerIO should be marked closed"
+
+
 def test_worker_request_classifies_no_active_session():
     """Typed error classification still fires through the WorkerIO path."""
     from app.backends.jetson.trt_edge_llm_asr import NoActiveSessionError
