@@ -79,6 +79,15 @@ class ASRStream(ABC):
         """
         self.cancel_and_finalize()
 
+    def close(self) -> None:
+        """Release per-stream resources (TRT exec contexts, device buffers).
+
+        Default: no-op. Backends whose stream owns per-instance GPU resources
+        (e.g. paraformer_trt's _ParaformerCtxBundle) override this to drop
+        them deterministically. Safe to call multiple times.
+        """
+        pass
+
 
 class ASRBackend(ABC):
 
