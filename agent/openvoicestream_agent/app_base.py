@@ -1266,19 +1266,19 @@ class BaseApp:
                 self._set_state(ConvState.IDLE)
                 self._reset_sleep_timer()
             await self._broadcast("on_assistant_done")
-            # SLV closes /v2v/stream after honoring tts_flush. Reconnect
-            # proactively here so the next mic turn does not send ASR/text
-            # frames into a closing transport and silently lose TTS.
-            try:
-                await asyncio.wait_for(self.slv.reconnect(), timeout=2.0)
-                self._slv_reconnect_count = getattr(self, "_slv_reconnect_count", 0) + 1
-                await self._broadcast(
-                    "on_slv_reconnect", {"count": self._slv_reconnect_count}
-                )
-            except asyncio.TimeoutError:
-                logger.warning("SLV reconnect timed out after tts_done")
-            except Exception:
-                logger.exception("SLV reconnect failed after tts_done")
+            # NOTE: previous code called ``self.slv.reconnect()`` here
+            # proactively after every tts_done. On voice-arm /
+            # jetson-qwen3asr-matcha-nx that turned every successful
+            # turn into a reconnect race: SLV server was still finishing
+            # its asr_thinker cleanup when the new WS came in, the
+            # server immediately closed the fresh connection (3-40 ms
+            # lifetime), and the agent ended up looping on dead
+            # transports. ``SLVClient.send_audio`` already auto-connects
+            # when ``self._ws is None`` — letting the next mic chunk
+            # (~100ms later) do the reopen gives SLV enough time to
+            # finish closing the prior session. The same lazy path
+            # covers send_text() / flush_tts() / abort() — they all
+            # check ``self._ws is None`` and call ``connect()``.
             return
 
         if isinstance(evt, SLVError):
@@ -1309,22 +1309,15 @@ class BaseApp:
                 self._set_state(ConvState.IDLE)
             else:
                 logger.info("SLVError while SLEEPING; staying SLEEPING")
-            # Reconnect the transport so the next mic chunk has a live WS to
-            # land on. Without this, the agent stays alive but functionally
-            # mute: send_audio() silently drops every chunk into the dead
-            # connection, no asr_final ever arrives, and the user only gets
-            # the failure mode by restarting the container. Best-effort —
-            # if the SLV server is down we'll just SLVError again next try.
-            try:
-                await asyncio.wait_for(self.slv.reconnect(), timeout=2.0)
-                self._slv_reconnect_count = getattr(self, "_slv_reconnect_count", 0) + 1
-                await self._broadcast(
-                    "on_slv_reconnect", {"count": self._slv_reconnect_count}
-                )
-            except asyncio.TimeoutError:
-                logger.warning("SLV reconnect timed out after SLVError")
-            except Exception:
-                logger.exception("SLV reconnect failed after SLVError")
+            # No proactive reconnect here — same race as TTSDone (the SLV
+            # server immediately closes a fresh connection that arrives
+            # while it's still tearing the previous session down).
+            # ``SLVClient.send_audio`` / ``_send_json`` already auto-call
+            # ``connect()`` when ``_ws is None``, and the dead-WS detection
+            # in those paths nulls _ws on ``ConnectionClosed``. The next
+            # mic chunk (or text send) naturally reopens the transport
+            # ~100ms later — enough headroom for SLV to finalize the prior
+            # session cleanly.
             return
 
     async def _run_user_utterance(
