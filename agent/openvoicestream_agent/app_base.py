@@ -1220,12 +1220,22 @@ class BaseApp:
                 # invocations, and ultimately stranded the agent in a
                 # broken speaking↔idle ping-pong that needed a restart.
                 #
-                # Only reset to IDLE when we genuinely arrived here from
-                # LISTENING (i.e. the agent was waiting for THIS final and
-                # it turned out to be noise). For THINKING/SPEAKING/
-                # BARGED_IN/IDLE/SLEEPING, leave the FSM alone.
+                # State transitions on low-signal final:
+                #   LISTENING — agent was waiting for THIS final and it
+                #     turned out to be noise; recover to IDLE.
+                #   BARGED_IN — barge-in fired (cancelled TTS+LLM)
+                #     expecting the user's actual command; got noise
+                #     instead. Treat as cancelled barge-in: clear back
+                #     to IDLE so the next real utterance flows cleanly.
+                #     Without this the agent stays in BARGED_IN forever
+                #     when the barge-in audio produces only short noise
+                #     finals ('Yeah.', '头', etc.).
+                #   THINKING / SPEAKING — a noise final mid-turn must
+                #     NOT cancel the in-flight LLM/TTS belonging to a
+                #     PREVIOUS real utterance.
+                #   IDLE / SLEEPING — already terminal; no transition.
                 cur_state = getattr(self, "_state", ConvState.IDLE)
-                if cur_state == ConvState.LISTENING:
+                if cur_state in (ConvState.LISTENING, ConvState.BARGED_IN):
                     self._set_state(ConvState.IDLE)
                     self._reset_sleep_timer()
                 elif cur_state in (ConvState.THINKING, ConvState.SPEAKING):
