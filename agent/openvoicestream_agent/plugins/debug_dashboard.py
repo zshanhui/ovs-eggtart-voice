@@ -103,6 +103,9 @@ class DebugDashboardPlugin(Plugin):
         web_app.router.add_post("/api/control/restart_mic", self._api_restart_mic)
         web_app.router.add_post("/api/control/abort", self._api_abort)
         web_app.router.add_post("/api/control/send_text", self._api_send_text)
+        web_app.router.add_post(
+            "/api/control/inject_user_text", self._api_inject_user_text
+        )
         web_app.router.add_get("/api/session/history", self._api_session_history)
         web_app.router.add_post("/api/session/clear", self._api_session_clear)
         # AppMode framework endpoints.
@@ -377,6 +380,98 @@ class DebugDashboardPlugin(Plugin):
             return web.json_response({"ok": True})
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _api_inject_user_text(self, request):  # noqa: ANN001
+        # DEBUG-ONLY: bypasses ASR/wake-word for end-to-end testing without a mic.
+        # Production deployments should gate this behind an auth check or env flag.
+        """Debug-only: fake an ASRFinal so the dialogue runner (and any
+        tool-call / preamble path) executes end-to-end without a real mic.
+
+        Unlike /api/control/send_text (which only forwards the string to
+        SLV's TTS-ish ``send_text``), this synthesises a real
+        ``ASRFinal`` event and feeds it through ``_dispatch_one`` — i.e.
+        exactly the entrypoint a server-VAD ASR final would hit. The
+        result: full LLM turn, tool_call dispatch, preamble emission,
+        arm action — same code paths a spoken utterance walks.
+        """
+        from aiohttp import web
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad json"}, status=400)
+        text = (body or {}).get("text")
+        if not isinstance(text, str) or not text.strip():
+            return web.json_response(
+                {"ok": False, "error": "missing text"}, status=422
+            )
+        language = (body or {}).get("language")
+        if language is not None and not isinstance(language, str):
+            return web.json_response(
+                {"ok": False, "error": "language must be string"}, status=422
+            )
+
+        app = self.app
+        # Reject if a prior LLM turn is still in flight — injecting a
+        # second utterance mid-turn would race the FSM and confuse the
+        # preamble / tool-dispatch sequencing this endpoint exists to
+        # validate.
+        turn_task = getattr(app, "_llm_turn_task", None)
+        if turn_task is not None and not turn_task.done():
+            return web.json_response(
+                {"ok": False, "status": "busy",
+                 "error": "previous llm_turn still running"},
+                status=409,
+            )
+
+        # Clear discard latch (typed-text bypass of ASR doesn't run the
+        # normal arm_for_next_turn path in _dispatch_one's ASRFinal
+        # branch — _dispatch_one does it itself, but harmless to do here
+        # too in case state is mid-SPEAKING). Also wake if pipeline_mode
+        # gated us into SLEEPING — _dispatch_one would otherwise drop the
+        # event with no LLM turn.
+        try:
+            arm = getattr(app.audio, "arm_for_next_turn", None)
+            if callable(arm):
+                arm()
+        except Exception:  # pragma: no cover - defensive
+            pass
+        try:
+            if getattr(app, "_state", ConvState.IDLE) == ConvState.SLEEPING:
+                wake = getattr(app, "wake", None)
+                if callable(wake):
+                    await wake(source="inject_user_text")
+        except Exception:
+            logger.debug("pre-inject wake failed", exc_info=True)
+
+        try:
+            from ..slv_client import ASRFinal
+        except Exception as e:  # pragma: no cover - defensive
+            return web.json_response(
+                {"ok": False, "error": f"ASRFinal import failed: {e}"},
+                status=500,
+            )
+
+        evt = ASRFinal(text=text, session_complete=False, language=language)
+        logger.info(
+            "inject_user_text: faking ASRFinal text=%r language=%r",
+            text, language,
+        )
+        try:
+            # Dispatch in a fire-and-forget task: _dispatch_one spawns
+            # the LLM turn via asyncio.create_task and returns, so doing
+            # this inline is fine. We still create_task so the HTTP
+            # response isn't blocked by dispatcher work (broadcast etc).
+            asyncio.create_task(
+                app._dispatch_one(evt), name="inject-user-text"
+            )
+        except Exception as e:
+            return web.json_response(
+                {"ok": False, "error": str(e)}, status=500
+            )
+        return web.json_response(
+            {"ok": True, "status": "dispatched", "text": text}
+        )
 
     async def _api_modes_list(self, request):  # noqa: ANN001
         from aiohttp import web
