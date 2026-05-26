@@ -700,6 +700,15 @@ class BaseApp:
                         self._schedule_mic_rms_broadcast(
                             {"rms": rms, "threshold": thr, "state": self._vad_state}
                         )
+                        # TEMP DIAGNOSTIC: log loud chunks so we can see
+                        # whether mic is even picking up user speech post-TTS.
+                        # 0.03 ≈ ordinary indoor voice at 30cm; <0.01 is silence.
+                        if rms > 0.03:
+                            logger.info(
+                                "mic chunk loud: rms=%.4f state=%s convstate=%s",
+                                rms, self._vad_state,
+                                getattr(self, "_state", ConvState.IDLE).value,
+                            )
                     except Exception:  # pragma: no cover - defensive
                         pass
 
@@ -1355,19 +1364,32 @@ class BaseApp:
                 self._set_state(ConvState.IDLE)
                 self._reset_sleep_timer()
             await self._broadcast("on_assistant_done")
-            # NOTE: previous code called ``self.slv.reconnect()`` here
-            # proactively after every tts_done. On voice-arm /
-            # jetson-qwen3asr-matcha-nx that turned every successful
-            # turn into a reconnect race: SLV server was still finishing
-            # its asr_thinker cleanup when the new WS came in, the
-            # server immediately closed the fresh connection (3-40 ms
-            # lifetime), and the agent ended up looping on dead
-            # transports. ``SLVClient.send_audio`` already auto-connects
-            # when ``self._ws is None`` — letting the next mic chunk
-            # (~100ms later) do the reopen gives SLV enough time to
-            # finish closing the prior session. The same lazy path
-            # covers send_text() / flush_tts() / abort() — they all
-            # check ``self._ws is None`` and call ``connect()``.
+            # Proactive reconnect after TTS done. On serialized profiles
+            # (e.g. jetson-qwen3asr-matcha-nx) the ASR worker shares a
+            # coord lock with TTS; observed in voice-arm validation that
+            # silero VAD on the server stops firing speech_start after
+            # the first tts_done — loud mic audio (RMS 0.12+) goes
+            # nowhere, no SLV event arrives, agent goes to sleep on the
+            # next sleep_timeout. A fresh WS forces a clean ASR session.
+            #
+            # The earlier removal of this reconnect (commit 1acf7f3) was
+            # because the SLV WS session-limiter would reject reconnects
+            # that landed inside the previous session's 3-40 ms teardown.
+            # That race is now handled by SLVClient.reconnect()'s
+            # 50 ms grace + backoff retry (commit 7e1b8c8), so reconnect
+            # here is safe again.
+            try:
+                await asyncio.wait_for(self.slv.reconnect(), timeout=4.0)
+                self._slv_reconnect_count = getattr(self, "_slv_reconnect_count", 0) + 1
+                self._first_tts_seen = False
+                self._eos_sent_this_turn = False
+                await self._broadcast(
+                    "on_slv_reconnect", {"count": self._slv_reconnect_count}
+                )
+            except asyncio.TimeoutError:
+                logger.warning("SLV reconnect timed out after tts_done")
+            except Exception:
+                logger.exception("SLV reconnect failed after tts_done")
             return
 
         if isinstance(evt, SLVError):
