@@ -618,6 +618,12 @@ class DebugDashboardPlugin(Plugin):
                 pass
             try:
                 self.app._set_state(ConvState.THINKING)
+                # Symmetric with the server-VAD / client-VAD THINKING
+                # entries: arm the thinking-watchdog so a wedged SLV
+                # TTS can't strand this PTT turn forever.
+                arm = getattr(self.app, "_arm_thinking_watchdog", None)
+                if callable(arm):
+                    arm()
             except Exception:
                 pass
             return web.json_response({"ok": True})

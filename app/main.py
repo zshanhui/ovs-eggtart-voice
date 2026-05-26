@@ -3045,8 +3045,45 @@ async def v2v_stream(ws: WebSocket):
     
                 task = asyncio.create_task(drain())
                 state["current_tts_task"] = task
+                # Outer per-sentence deadline. Codex review 2026-05-26
+                # caught the gap: the inner ``audio_queue.get()`` watchdog
+                # only fires AFTER ``tts_started`` is emitted (drain() has
+                # already passed backend acquire + coord acquire +
+                # send_json). If the wedge is in any of those earlier
+                # steps — backend-manager acquire blocked by a stuck
+                # reload, ``coord.acquire`` deadlock, or Matcha's
+                # pre-yield ORT/TRT setup — the client never sees
+                # ``tts_started`` and waits forever. Wrap the whole drain
+                # in a deadline that covers ALL of the above; tuning via
+                # env so we can dial up on slow Jetsons.
+                tts_sentence_timeout_s = float(
+                    os.getenv("OVS_TTS_SENTENCE_TIMEOUT_S", "15.0")
+                )
                 try:
-                    await task
+                    await asyncio.wait_for(task, timeout=tts_sentence_timeout_s)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "v2v tts: per-sentence deadline %.1fs exceeded for "
+                        "sentence=%r — cancelling drain and continuing",
+                        tts_sentence_timeout_s, sentence[:80],
+                    )
+                    stop_event.set()
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    # Try to send an error event so the client side
+                    # cancels its turn promptly (instead of waiting for
+                    # its own thinking watchdog at 20s).
+                    if not state["client_closed"]:
+                        try:
+                            await send_error(
+                                f"tts: per-sentence deadline {tts_sentence_timeout_s:.0f}s "
+                                f"exceeded"
+                            )
+                        except Exception:
+                            logger.exception("send_error after tts deadline failed")
                 except asyncio.CancelledError:
                     # Barge-in: tell the synth thread to break out of the
                     # generator loop, then drain any chunks it produced

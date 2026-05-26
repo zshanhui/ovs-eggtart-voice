@@ -869,6 +869,10 @@ class BaseApp:
         except Exception:
             logger.exception("SLV reconnect failed during thinking-watchdog recovery")
         self._first_tts_seen = False
+        # Symmetric latch reset with the SLVError / dispatch-reconnect
+        # paths. Without clearing this, the next utterance could
+        # short-circuit ``send_asr_eos_once`` and never receive a final.
+        self._eos_sent_this_turn = False
         self._set_state(ConvState.IDLE)
         self._reset_sleep_timer()
 
@@ -980,6 +984,10 @@ class BaseApp:
                                 {"ts": int(_t.time() * 1000), "drove_eos": False},
                             )
                         self._set_state(ConvState.THINKING)
+                        # Arm the thinking-watchdog so a wedged SLV TTS
+                        # can't strand the FSM. (Symmetric with the
+                        # server-VAD path at _dispatch_one.)
+                        self._arm_thinking_watchdog()
                         self._vad_eos_sent = True
                     self._vad_state = "idle"
                     self._vad_speech_ms = 0
