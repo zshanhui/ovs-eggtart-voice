@@ -528,19 +528,22 @@ async def test_tool_preamble_text_fires_callback():
     )
     assert final == "done"
 
-    # Expected ordering:
-    #   started:wave_hand, preamble:好的。, started:silent_tool, tok:done
+    # Expected ordering (after early-fire optimisation):
+    #   preamble:好的。 (fired on first tool_call name delta),
+    #   started:wave_hand, started:silent_tool, tok:done
     started_events = [e for e in events if e[0] == "started"]
     preamble_events = [e for e in events if e[0] == "preamble"]
     assert started_events == [("started", "wave_hand"), ("started", "silent_tool")]
+    # Preamble fires exactly once per tool slot, regardless of whether
+    # the trigger was early (during streaming) or dispatch-time fallback.
     assert preamble_events == [("preamble", "好的。")]
 
-    # Ordering check: preamble for wave_hand must come AFTER its
-    # on_tool_started and BEFORE silent_tool's on_tool_started.
+    # Ordering check: preamble fires EARLY now — before either
+    # on_tool_started, as soon as the tool_call name delta arrives.
     idx_wave_started = events.index(("started", "wave_hand"))
     idx_preamble = events.index(("preamble", "好的。"))
     idx_silent_started = events.index(("started", "silent_tool"))
-    assert idx_wave_started < idx_preamble < idx_silent_started
+    assert idx_preamble < idx_wave_started < idx_silent_started
 
 
 @pytest.mark.asyncio

@@ -122,6 +122,10 @@ async def stream_with_tools(
             text_chunks: list[str] = []
             tool_accs: dict[int, _ToolCallAcc] = {}
             finish_reason: str | None = None
+            # Track which tool_call slots have already had their preamble
+            # fired (early, on first name delta). Prevents the post-stream
+            # dispatch-time fallback from re-firing the same preamble.
+            preamble_fired: set[int] = set()
 
             kwargs: dict[str, Any] = dict(llm_kwargs or {})
             kwargs["session"] = session
@@ -205,6 +209,33 @@ async def stream_with_tools(
                         slot.id = ev.tool_call_id
                     if ev.name:
                         slot.name = ev.name
+                        # Early-fire on_tool_preamble as soon as we know
+                        # the tool name, instead of waiting for the full
+                        # arguments JSON + dispatch. This drops voice
+                        # preamble latency from ~stream-end to ~one token
+                        # after the model commits to a tool call.
+                        if (
+                            on_tool_preamble is not None
+                            and idx not in preamble_fired
+                        ):
+                            tool_meta = registry._tools.get(ev.name)
+                            pre_text = (
+                                getattr(tool_meta, "preamble_text", "") or ""
+                            )
+                            if pre_text:
+                                preamble_fired.add(idx)
+                                logger.info(
+                                    "tool preamble (early): text=%r tool=%s",
+                                    pre_text,
+                                    ev.name,
+                                )
+                                try:
+                                    await on_tool_preamble(pre_text)
+                                except Exception:  # noqa: BLE001
+                                    logger.debug(
+                                        "on_tool_preamble (early) raised",
+                                        exc_info=True,
+                                    )
                     if ev.arguments:
                         slot.arguments += ev.arguments
                 elif ev.kind == "finish":
@@ -239,8 +270,12 @@ async def stream_with_tools(
             })
             session.add_assistant_tool_calls(preamble, tc_payload)
 
-            # Execute each tool sequentially.
-            for tc in tc_payload:
+            # Execute each tool sequentially. Track index for preamble
+            # fallback: tc_payload is built sorted by tool_accs keys, so
+            # enumerate aligns with the original tool_call indexes.
+            sorted_idxs = sorted(tool_accs.keys())
+            for tc_pos, tc in enumerate(tc_payload):
+                tc_idx = sorted_idxs[tc_pos] if tc_pos < len(sorted_idxs) else tc_pos
                 if on_tool_started is not None:
                     try:
                         await on_tool_started(tc)
@@ -252,7 +287,10 @@ async def stream_with_tools(
                 # the registry so callers that bypass the decorator
                 # (programmatic ``registry.register(...)``) still
                 # benefit. Lookup-miss + empty preamble = no-op.
-                if on_tool_preamble is not None:
+                if (
+                    on_tool_preamble is not None
+                    and tc_idx not in preamble_fired
+                ):
                     tname = tc.get("function", {}).get("name") or ""
                     tool_meta = registry._tools.get(tname) if tname else None
                     preamble = getattr(tool_meta, "preamble_text", "") or ""
