@@ -156,9 +156,27 @@ class ModeContext:
             allowlist_raw = self._resolve_mode_value("tools_allowlist")
             if allowlist_raw is None:
                 allowlist_raw = getattr(cfg, "tools_default_allowlist", []) or []
-            allowed_tools: set[str] = (
-                set(allowlist_raw) if tools_enabled and allowlist_raw else set()
-            )
+            # Semantics matrix:
+            #   tools_enabled=False                      → no tools (set())
+            #   tools_enabled=True  + allowlist non-empty → that subset (set(...))
+            #   tools_enabled=True  + allowlist empty     → ALL registered (None)
+            #
+            # `None` flows through to ``ToolRegistry.list_openai_tools(None)``
+            # which already exposes the full registry. The empty-list-means-all
+            # branch was documented in the user guide ("expose every
+            # registered tool") but the original implementation collapsed
+            # it to ``set()`` (no tools). That made
+            # ``tools_enabled=True + allowlist=[]`` operationally identical
+            # to ``tools_enabled=False`` — a footgun for solutions like
+            # voice-arm where every action a plugin registers should be
+            # callable without re-listing each name in YAML.
+            allowed_tools: set[str] | None
+            if not tools_enabled:
+                allowed_tools = set()
+            elif allowlist_raw:
+                allowed_tools = set(allowlist_raw)
+            else:
+                allowed_tools = None
             max_iters = int(getattr(cfg, "tools_max_iterations", 5))
 
             # Resolve registry: prefer the BaseApp-owned registry (so
@@ -251,8 +269,11 @@ class ModeContext:
                 ctx=tool_ctx,
                 max_iterations=max_iters,
                 on_assistant_token=_on_token,
-                on_tool_started=_on_tool_started if allowed_tools else None,
-                on_tool_completed=_on_tool_completed if allowed_tools else None,
+                # ``allowed_tools`` may be ``None`` (= all registered) so
+                # the truthy check below would skip the callbacks. Gate on
+                # ``tools_enabled`` directly — that's the real semantic.
+                on_tool_started=_on_tool_started if tools_enabled else None,
+                on_tool_completed=_on_tool_completed if tools_enabled else None,
                 llm_kwargs=llm_kwargs,
                 first_token_timeout_s=first_timeout,
                 idle_timeout_s=idle_timeout,

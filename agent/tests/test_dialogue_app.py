@@ -616,3 +616,87 @@ async def test_multi_mode_app_class_is_back_compat_dialogue_shim():
     from apps.multi_mode.app import MultiModeApp
 
     assert DialogueApp is MultiModeApp
+
+
+@pytest.mark.asyncio
+async def test_empty_allowlist_with_tools_enabled_exposes_all_registered():
+    """`tools_enabled=True` + `tools_default_allowlist=[]` MUST send every
+    registered tool to the LLM, not zero tools.
+
+    Regression guard for the original semantics where an empty allowlist
+    was equivalent to ``tools_enabled=False`` — a footgun for solutions
+    whose plugins register all the tools they want exposed (no need to
+    re-list every name in YAML).
+    """
+    from openvoicestream_agent.llm.base import LLMEvent
+    from openvoicestream_agent.tools import ToolRegistry
+
+    cfg = Config(
+        system_prompt="SYS",
+        tools_enabled=True,
+        tools_default_allowlist=[],  # empty = all
+    )
+    slv = FakeSLV()
+    session = Session()
+    events = type("E", (), {"emit": lambda *a, **kw: None})()
+
+    reg = ToolRegistry()
+
+    @reg.tool()
+    def alpha() -> dict:
+        return {"ok": True}
+
+    @reg.tool()
+    def beta() -> dict:
+        return {"ok": True}
+
+    # LLM that calls `beta` — proves the tool was actually offered.
+    llm = _ScriptedEventsLLM([
+        [
+            LLMEvent(
+                kind="tool_call_delta",
+                tool_call_index=0,
+                tool_call_id="c1",
+                name="beta",
+                arguments="{}",
+            ),
+            LLMEvent(kind="finish", finish_reason="tool_calls"),
+        ],
+        [
+            LLMEvent(kind="text", text="done"),
+            LLMEvent(kind="finish", finish_reason="stop"),
+        ],
+    ])
+
+    class _FakeApp:
+        def __init__(self):
+            self.tool_registry = reg
+
+        async def broadcast(self, name, *args):
+            pass
+
+    fake_app = _FakeApp()
+
+    ctx = ModeContext(
+        config=cfg,
+        slv=slv,
+        llm=llm,
+        translator=None,
+        session=session,
+        audio=None,
+        events=events,
+        broadcast=fake_app.broadcast,
+    )
+    mgr = ModeManager(lambda **kw: ctx)
+    mgr.register(ChatMode())
+    await mgr.start("chat")
+    await mgr.current.on_user_utterance(ctx, "do it")
+
+    # First LLM call (iter 0) received both tools — proving the empty
+    # allowlist expanded to "all registered".
+    assert llm.calls, "LLM stream_events was never called"
+    iter0_tools = llm.calls[0]["kwargs"].get("tools") or []
+    names = {t["function"]["name"] for t in iter0_tools}
+    assert names == {"alpha", "beta"}, (
+        f"Expected both registered tools to be exposed, got {names}"
+    )

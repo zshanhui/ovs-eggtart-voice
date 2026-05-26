@@ -24,6 +24,18 @@ tools_default_allowlist:
 tools_max_iterations: 5     # safety cap per user turn
 ```
 
+The allowlist controls which registered tools the LLM is allowed to call:
+
+| `tools_enabled` | `tools_default_allowlist` | Behavior |
+|---|---|---|
+| `false` | _anything_ | No tools sent to LLM |
+| `true`  | `[a, b]` | Only `a` and `b` (must be registered) |
+| `true`  | `[]` or unset | **All registered tools** |
+
+The "all" case is the right default for single-mode solutions whose
+plugins register exactly the tools they want exposed — no need to repeat
+every action name in YAML.
+
 Per-mode override (only the named mode sees these tools):
 
 ```yaml
