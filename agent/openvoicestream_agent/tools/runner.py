@@ -257,6 +257,9 @@ async def stream_with_tools(
                     tool_meta = registry._tools.get(tname) if tname else None
                     preamble = getattr(tool_meta, "preamble_text", "") or ""
                     if preamble:
+                        logger.info(
+                            "tool preamble: text=%r tool=%s", preamble, tname
+                        )
                         try:
                             await on_tool_preamble(preamble)
                         except Exception:  # noqa: BLE001

@@ -233,8 +233,11 @@ class ModeContext:
                     return
                 try:
                     await self.slv.send_text(text)
+                    logger.info(
+                        "dispatched tool preamble to SLV: %r", text
+                    )
                 except Exception:  # pragma: no cover - best effort
-                    logger.debug(
+                    logger.warning(
                         "tool preamble send_text failed", exc_info=True
                     )
 
