@@ -1008,8 +1008,20 @@ class BaseApp:
             # bogus barge-ins or noise the dashboard.
             if not (evt.text or "").strip():
                 return
-            # Barge-in: user spoke (real text) while we were playing.
-            if self.audio.is_playing:
+            # Barge-in: user spoke (real text) while we were SPEAKING.
+            #
+            # We gate on FSM state, NOT audio.is_playing alone. Reason: a
+            # TTSDone event flips state SPEAKING→IDLE the moment SLV says
+            # "no more frames", but audio_io is still draining buffered
+            # PCM through the speaker for another 100-500ms. During that
+            # window, a fresh ASRPartial from a NEW user utterance (a
+            # legitimate new turn, NOT a barge-in over a still-playing
+            # reply) would fire barge-in, abort SLV, and cancel a brand
+            # new LLM turn that hadn't even started — wedging the agent
+            # into a loop of fake barge-ins on garbled partials. By
+            # requiring SPEAKING/BARGED_IN here we treat a partial during
+            # IDLE/THINKING as the start of a normal utterance.
+            if self._state in (ConvState.SPEAKING, ConvState.BARGED_IN) and self.audio.is_playing:
                 logger.info(
                     "BARGE-IN fired (state=%s, partial=%r)",
                     self._state.value, evt.text[:40]
@@ -1095,23 +1107,43 @@ class BaseApp:
                 or stripped_for_signal in _INTERJECTIONS
             ):
                 logger.info(
-                    "low-signal asr_final ignored (text=%r, signal=%r)",
+                    "low-signal asr_final ignored (text=%r, signal=%r, state=%s)",
                     (evt.text or "")[:30], stripped_for_signal,
+                    getattr(self, "_state", ConvState.IDLE).name,
                 )
-                # State must NOT stay stuck in THINKING when no real text
-                # arrives. Reset back to IDLE so the next user turn can
-                # transition cleanly via LISTENING.
-                # Also clear the discard latch: a prior barge-in may have
-                # set it, and the next intent (which might be typed text
-                # via the dashboard, with no ASRFinal) needs audible TTS.
+                # Clear the discard latch so a later legitimate turn
+                # (including dashboard-typed text with no ASRFinal) gets
+                # audible TTS — a prior barge-in / abort may have armed it.
                 try:
                     arm = getattr(self.audio, "arm_for_next_turn", None)
                     if callable(arm):
                         arm()
                 except Exception:  # pragma: no cover - defensive
                     pass
-                self._set_state(ConvState.IDLE)
-                self._reset_sleep_timer()
+                # State transitions — be conservative. A noise / silence
+                # asr_final must NOT cancel an in-flight LLM/TTS turn
+                # belonging to a PREVIOUS real utterance. Symptom: with
+                # always-on mic, server VAD frequently emits empty
+                # asr_finals while the model is mid-tool-call; forcing
+                # state back to IDLE here was cancelling the runner, which
+                # then re-fired text-only completions, looped tool
+                # invocations, and ultimately stranded the agent in a
+                # broken speaking↔idle ping-pong that needed a restart.
+                #
+                # Only reset to IDLE when we genuinely arrived here from
+                # LISTENING (i.e. the agent was waiting for THIS final and
+                # it turned out to be noise). For THINKING/SPEAKING/
+                # BARGED_IN/IDLE/SLEEPING, leave the FSM alone.
+                cur_state = getattr(self, "_state", ConvState.IDLE)
+                if cur_state == ConvState.LISTENING:
+                    self._set_state(ConvState.IDLE)
+                    self._reset_sleep_timer()
+                elif cur_state in (ConvState.THINKING, ConvState.SPEAKING):
+                    logger.debug(
+                        "low-signal final arrived during %s; FSM left alone "
+                        "(in-flight turn keeps running)",
+                        cur_state.name,
+                    )
                 return
             logger.info(
                 "asr_final received: %r (language=%r)", evt.text, evt.language
