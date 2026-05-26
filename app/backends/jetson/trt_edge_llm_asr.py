@@ -271,7 +271,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         return self._ready
 
     def preload(self) -> None:
-        """Verify all required files exist."""
+        """Verify all required files exist (auto-download missing artifacts if enabled)."""
         worker_binary = self._config["worker_binary"]
         asr_binary = self._config["asr_binary"]
         plugin_path = self._config["plugin_path"]
@@ -289,13 +289,24 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 audio_encoder_dir, "audio", "audio_encoder.engine"
             ), "audio encoder engine"),
         ]
-        missing = []
-        for path, label in required:
-            if not os.path.exists(path):
-                missing.append(f"{label}: {path}")
+        missing = [(path, label) for path, label in required if not os.path.exists(path)]
+        if missing:
+            # Switching to a jetson-qwen3asr-* profile on a fresh image leaves
+            # the engine dirs empty — auto-download them so the user doesn't
+            # have to know to run deploy_qwen3_artifacts.py manually.
+            try:
+                from app.core.qwen3_artifact_downloader import ensure_artifacts
+                ensure_artifacts([p for p, _ in missing])
+            except Exception:
+                logger.exception(
+                    "Qwen3 artifact auto-download raised; will report original "
+                    "missing files below"
+                )
+            missing = [(p, l) for p, l in missing if not os.path.exists(p)]
         if missing:
             raise FileNotFoundError(
-                "ASR preload failed — missing:\n  " + "\n  ".join(missing)
+                "ASR preload failed — missing:\n  "
+                + "\n  ".join(f"{l}: {p}" for p, l in missing)
             )
         self._require_streaming_worker_assets()
 

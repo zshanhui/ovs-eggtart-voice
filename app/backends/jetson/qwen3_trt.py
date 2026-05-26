@@ -362,14 +362,30 @@ class Qwen3TRTBackend(TTSBackend):
         _meminfo("tts_start")
 
         # Verify files
-        for path, desc in [
+        required = [
             (self._paths["talker_engine"], "talker engine"),
             (self._paths["cp_engine"], "CP engine"),
             (os.path.join(self._paths["base"], "engines", "vocoder_fp16.engine"), "vocoder engine"),
             (os.path.join(self._paths["sherpa_dir"], "config.json"), "config.json (authoritative)"),
-        ]:
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"Missing {desc}: {path}")
+        ]
+        missing = [(path, desc) for path, desc in required if not os.path.exists(path)]
+        if missing:
+            # Auto-download Qwen3 TTS artifacts on fresh images (same UX as
+            # the ASR backend, same opt-out env). Failures fall through to
+            # the FileNotFoundError below so a broken auto-download still
+            # surfaces clearly.
+            try:
+                from app.core.qwen3_artifact_downloader import ensure_artifacts
+                ensure_artifacts([p for p, _ in missing])
+            except Exception:
+                logger.exception(
+                    "Qwen3 artifact auto-download raised; will report original "
+                    "missing files below"
+                )
+            missing = [(p, d) for p, d in missing if not os.path.exists(p)]
+        if missing:
+            path, desc = missing[0]
+            raise FileNotFoundError(f"Missing {desc}: {path}")
 
         # Load tokenizer
         self._load_tokenizer()
