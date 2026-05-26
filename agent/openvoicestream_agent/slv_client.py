@@ -116,22 +116,33 @@ class SLVClient:
 
     # ── lifecycle ───────────────────────────────────────────────────
 
+    # Time we wait after sending CLIENT_CONFIG before declaring a fresh
+    # WS healthy. If the server closes within this window the limiter
+    # almost certainly rejected us (SLV's per-client WS slot is still
+    # busy with the previous session's teardown); back off and retry.
+    _RECONNECT_GRACE_S = 0.05
+    # Backoff schedule for the limiter race. Empirically the slot
+    # releases inside ~40ms, but Jetson under thermal throttle can be
+    # slower; cover up to ~1.75s of contention before giving up.
+    _RECONNECT_BACKOFFS = (0.25, 0.5, 1.0)
+
     async def connect(self) -> None:
         if self._ws is not None:
             return  # idempotent
-        self._reader_done.clear()
-        self._tts_sample_rate = None
-        self._ws = await ws_connect(self.url, max_size=None)
-        await self._ws.send(json.dumps({"type": CLIENT_CONFIG, **self.config}))
-        self._reader_task = asyncio.create_task(self._reader_loop(), name="slv-reader")
+        await self._open_with_retry()
 
     async def reconnect(self) -> None:
         """Tear down current WS and open a fresh one, replaying config.
 
-        SLV closes the session after asr_eos (even in multi_utterance), so
-        the agent must reopen for the next utterance. Audio capture stays
-        alive; only the SLV transport flips. Holds _send_lock so concurrent
-        send_audio() blocks until reconnect completes.
+        Self-healing against SLV's session-limiter race (server `app/main.py`
+        ``try_acquire_ws`` admission): the previous session's WS slot is
+        held until a teardown chain (dispatcher cancel → ASR cancel →
+        ws.close → manager unregister → token release) completes. A
+        reconnect that arrives inside that 3–40 ms window is closed with
+        WS code 4429. We detect the immediate close by waiting on the
+        reader-done signal for ``_RECONNECT_GRACE_S`` after sending the
+        config frame; if reader fires inside the grace, we back off and
+        retry.
         """
         if self._closed:
             return
@@ -153,9 +164,68 @@ class SLVClient:
                     pass
             self._reader_done.clear()
             self._tts_sample_rate = None
+            await self._open_with_retry()
+
+    async def _open_with_retry(self) -> None:
+        """Open a WS and verify it survived the limiter grace window.
+
+        Must be called with ``self._send_lock`` already held by the
+        caller (or in a single-threaded init path like ``connect``).
+        """
+        attempts = list(self._RECONNECT_BACKOFFS) + [None]
+        for attempt_idx, backoff in enumerate(attempts):
+            self._reader_done.clear()
+            self._tts_sample_rate = None
             self._ws = await ws_connect(self.url, max_size=None)
             await self._ws.send(json.dumps({"type": CLIENT_CONFIG, **self.config}))
-            self._reader_task = asyncio.create_task(self._reader_loop(), name="slv-reader")
+            self._reader_task = asyncio.create_task(
+                self._reader_loop(), name="slv-reader"
+            )
+            try:
+                # If the server rejects this connection (limiter race,
+                # bad config, etc.) the reader sees ConnectionClosed
+                # almost immediately and sets _reader_done. Survive the
+                # grace window → connection is healthy, return.
+                await asyncio.wait_for(
+                    self._reader_done.wait(), timeout=self._RECONNECT_GRACE_S
+                )
+            except asyncio.TimeoutError:
+                # Healthy: reader is still running after grace window.
+                return
+            # Reader fired → connection died inside grace window.
+            # Tear down what we just built and back off.
+            dead_reader = self._reader_task
+            dead_ws = self._ws
+            self._ws = None
+            self._reader_task = None
+            if dead_reader is not None and not dead_reader.done():
+                dead_reader.cancel()
+                try:
+                    await dead_reader
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if dead_ws is not None:
+                try:
+                    await dead_ws.close()
+                except Exception:
+                    pass
+            # Drain any SLVError the reader may have queued so subsequent
+            # events() consumers don't see this rejection.
+            try:
+                while not self._queue.empty():
+                    _ = self._queue.get_nowait()
+            except Exception:
+                pass
+            if backoff is None:
+                raise ConnectionError(
+                    f"SLV reconnect: server closed within {self._RECONNECT_GRACE_S}s "
+                    f"on all {len(attempts)} attempts (limiter race?)"
+                )
+            logger.warning(
+                "SLV reconnect attempt %d rejected within %.0fms; retrying in %.2fs",
+                attempt_idx + 1, self._RECONNECT_GRACE_S * 1000, backoff,
+            )
+            await asyncio.sleep(backoff)
 
     async def close(self) -> None:
         self._closed = True
