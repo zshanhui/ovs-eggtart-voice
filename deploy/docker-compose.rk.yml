@@ -80,8 +80,43 @@ services:
       - MODEL_DIR=/opt/tts/models
     restart: unless-stopped
 
+  # ── LLM chat server (RKLLM on NPU) ────────────────────────────────────
+  llm:
+    image: sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rk-v1.4-closedloop
+    container_name: openvoicestream-llm
+    privileged: true
+    init: true
+    network_mode: host
+    command: ["python3", "-m", "uvicorn", "services.llm.server:app", "--host", "0.0.0.0", "--port", "8001"]
+    mem_limit: 2000m
+    memswap_limit: 2000m
+    volumes:
+      - /dev:/dev
+      - ../configs:/opt/speech/configs:ro
+      - rk-llm-models:/opt/models
+      - ../services:/opt/speech/services:ro
+    environment:
+      # ── Model ──────────────────────────────────────────────────────
+      - RKLLM_MODEL_PATH=${RKLLM_MODEL_PATH:-/opt/models/rkllm/qwen3-0.6b-instruct.w4a16.rk3576.rkllm}
+      # "dummy" for testing without a real model; "real" when wired to librkllmrt.so
+      - RKLLM_ENGINE=${RKLLM_ENGINE:-dummy}
+      - RKLLM_SYSTEM_PROMPT=${RKLLM_SYSTEM_PROMPT:-You are a helpful assistant.}
+      - RKLLM_MAX_TOKENS=${RKLLM_MAX_TOKENS:-512}
+      - RKLLM_MAX_CONTEXT_TOKENS=${RKLLM_MAX_CONTEXT_TOKENS:-4096}
+      # ── NPU access ─────────────────────────────────────────────────
+      - RKLLM_LIB_PATH=/opt/asr/lib/librkllmrt.so
+      - LD_LIBRARY_PATH=/opt/rk-runtime:/opt/asr/lib:/usr/lib
+      - RK_NPU_CORE_MASK=${RK_LLM_NPU_CORE_MASK:-NPU_CORE_2}
+      # ── Python path (same base as speech) ───────────────────────────
+      - PYTHONPATH=/opt/speech
+    restart: unless-stopped
+    depends_on:
+      - speech
+
 volumes:
   rk-asr-models:
     name: rk-asr-models
   rk-tts-models:
     name: rk-tts-models
+  rk-llm-models:
+    name: rk-llm-models
