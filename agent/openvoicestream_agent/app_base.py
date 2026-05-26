@@ -446,6 +446,46 @@ class BaseApp:
         )
         self._dispatch_task = asyncio.create_task(self._slv_dispatch(), name="slv-dispatch")
 
+        # LLM backend warmup — runs after all plugins have registered
+        # (so tool_registry is fully populated) and BEFORE any plugin
+        # start() so the very first user turn never pays cold-start
+        # cost. EdgeLLMBackend warms both the prefix KV cache and the
+        # TRT-LLM CUDA graph; other backends inherit the default no-op.
+        try:
+            tools_payload = None
+            registry = getattr(self, "tool_registry", None)
+            if registry is not None and hasattr(registry, "list_openai_tools"):
+                try:
+                    tools_payload = registry.list_openai_tools(allow=None) or None
+                except Exception:
+                    logger.debug("warmup: tool_registry lookup failed", exc_info=True)
+                    tools_payload = None
+            sys_prompt = ""
+            try:
+                overrides = getattr(self.config, "mode_overrides", {}) or {}
+                mode_cfg = overrides.get("chat") if isinstance(overrides, dict) else None
+                if isinstance(mode_cfg, dict):
+                    sys_prompt = mode_cfg.get("system_prompt") or ""
+            except Exception:
+                pass
+            if not sys_prompt:
+                sys_prompt = getattr(self.config, "system_prompt", "") or ""
+            warmup_result = await self.llm.warmup(
+                system_prompt=sys_prompt,
+                tools=tools_payload,
+                enable_thinking=False,
+            )
+            if warmup_result:
+                logger.info("LLM backend warmup result: %s", warmup_result)
+                if warmup_result.get("cache_warmed") and self.session is not None:
+                    self.session.cache_warmed = True
+                    logger.info(
+                        "session.cache_warmed=True after backend warmup; "
+                        "first turn will use prefix_cache"
+                    )
+        except Exception:
+            logger.warning("LLM warmup failed; first turn may be cold", exc_info=True)
+
         for p in self.plugins:
             try:
                 await p.start()

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, AsyncIterator
 
+import httpx
 from openai import APIError
 
 from ..session import Session
@@ -187,3 +189,140 @@ class EdgeLLMBackend(OpenAICompatBackend):
         async for ev in self.stream_events(messages, session=session, **kw):
             if ev.kind == "text" and ev.text:
                 yield ev.text
+
+    # ── warmup ──────────────────────────────────────────────────────
+    async def warmup(  # type: ignore[override]
+        self,
+        *,
+        system_prompt: str = "",
+        tools: list[dict[str, Any]] | None = None,
+        enable_thinking: bool = False,
+        timeout_s: float | None = 60.0,
+    ) -> dict[str, Any]:
+        """Two-step edge-llm cold-path elimination.
+
+        Step A — POST ``/v1/cache/system_prompt`` with the *messages*
+        branch so the cached KV prefix is byte-identical to the prefix
+        a real turn will use (server reuses its own
+        ``_build_prefix_formatted_request`` slice).
+
+        Step B — POST ``/v1/chat/completions`` with the same prefix,
+        ``prefix_cache=true``, ``max_tokens=1``, and the real tools
+        list, then drain the SSE stream. The point isn't the output —
+        it's to force the TRT-LLM engine to run a full forward pass
+        with the real-shape inputs so its CUDA graph capture / kernel
+        warm / JIT all happen here, not on the user's first command.
+
+        Fail-open: any error is logged at WARNING and swallowed. The
+        first real turn will simply pay cold-start cost.
+
+        Returns a metadata dict (always — empty on full failure):
+            {
+              "cache_warmed": bool, "cache_warmup_ms": int,
+              "graph_warmed": bool, "graph_warmup_ms": int,
+              "messages_branch": bool,
+            }
+        """
+        result: dict[str, Any] = {
+            "cache_warmed": False,
+            "graph_warmed": False,
+            "cache_warmup_ms": 0,
+            "graph_warmup_ms": 0,
+        }
+        if not system_prompt:
+            return result
+        base = self.base_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        cache_url = base + "/v1/cache/system_prompt"
+        chat_url = base + "/v1/chat/completions"
+
+        # ── Step A: prefix KV cache ────────────────────────────────
+        cache_t0 = time.perf_counter()
+        cache_body: dict[str, Any] = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": ""},
+            ],
+            "prefix_cache": True,
+            "enable_thinking": enable_thinking,
+        }
+        if tools:
+            cache_body["tools"] = tools
+        try:
+            async with httpx.AsyncClient(timeout=timeout_s or 60.0) as client:
+                resp = await client.post(cache_url, json=cache_body)
+                resp.raise_for_status()
+                try:
+                    info = resp.json() or {}
+                except Exception:
+                    info = {}
+            result["cache_warmed"] = True
+            result["messages_branch"] = bool(info.get("messages_branch", False))
+            result["prompt_chars"] = info.get("prompt_chars")
+            # Legacy fallback if server didn't take messages branch.
+            if not result["messages_branch"]:
+                legacy = {"system_prompt": system_prompt}
+                if tools:
+                    legacy["tools"] = tools
+                try:
+                    async with httpx.AsyncClient(timeout=timeout_s or 60.0) as client:
+                        resp2 = await client.post(cache_url, json=legacy)
+                        resp2.raise_for_status()
+                except Exception as exc:
+                    logger.debug("cache warmup legacy fallback failed: %s", exc)
+        except Exception as exc:
+            logger.warning(
+                "edge-llm cache warmup failed: %s (first turn pays cold prefill)",
+                exc,
+            )
+        result["cache_warmup_ms"] = int((time.perf_counter() - cache_t0) * 1000)
+
+        # ── Step B: CUDA graph / kernel warm via real-shape decode ──
+        # Only attempt if cache_warmed (otherwise prefix_cache=True
+        # would be rejected — and a no-prefix call doesn't exercise
+        # the same engine path).
+        if result["cache_warmed"]:
+            graph_t0 = time.perf_counter()
+            chat_body: dict[str, Any] = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    # Single-char user message is the cheapest valid
+                    # completion request that still hits the real
+                    # forward path.
+                    {"role": "user", "content": "."},
+                ],
+                "stream": True,
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "prefix_cache": True,
+                "return_cache_metrics": True,
+                "enable_thinking": enable_thinking,
+            }
+            if tools:
+                chat_body["tools"] = tools
+            try:
+                async with httpx.AsyncClient(timeout=timeout_s or 60.0) as client:
+                    async with client.stream(
+                        "POST", chat_url, json=chat_body
+                    ) as resp:
+                        resp.raise_for_status()
+                        # Drain the SSE stream fully so the engine runs
+                        # the whole 1-token forward pass before we move
+                        # on. We discard payload — only the side effect
+                        # (CUDA graph capture) matters here.
+                        async for _ in resp.aiter_lines():
+                            pass
+                result["graph_warmed"] = True
+            except Exception as exc:
+                logger.warning(
+                    "edge-llm graph warmup failed: %s "
+                    "(first turn pays JIT / CUDA-graph capture cost)",
+                    exc,
+                )
+            result["graph_warmup_ms"] = int(
+                (time.perf_counter() - graph_t0) * 1000
+            )
+
+        return result

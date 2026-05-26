@@ -77,3 +77,24 @@ class LLMBackend(ABC):
     async def aclose(self) -> None:
         """Release any held network/transport resources. Default: no-op."""
         return None
+
+    async def warmup(
+        self,
+        *,
+        system_prompt: str = "",
+        tools: list[dict[str, Any]] | None = None,
+        enable_thinking: bool = False,
+        timeout_s: float | None = 60.0,
+    ) -> dict[str, Any]:
+        """Optional pre-flight warmup.
+
+        Default no-op: returns ``{}`` and never raises. Backends with
+        engine-specific warmup paths (e.g. :class:`EdgeLLMBackend` warms
+        the prefix KV cache *and* runs one real-shape forward pass to
+        capture the TRT-LLM CUDA graph) override this to do the work.
+
+        Callers should treat this as fire-and-forget: any non-empty
+        return value is opportunistic metadata for the dashboard /
+        session, never required for correctness.
+        """
+        return {}
