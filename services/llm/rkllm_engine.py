@@ -164,76 +164,66 @@ class DummyRKLLMEngine(RKLLMEngine):
 
 
 # ---------------------------------------------------------------------------
-# Real RKLLM engine (skeleton — integrate with librkllmrt.so)
+# Real RKLLM engine — production path via librkllmrt.so
 # ---------------------------------------------------------------------------
+# Uses the ctypes binding in services.llm.rkllm_binding which was
+# reverse-engineered from Rockchip's public rkllm_api_demo at
+# airockchip/rknn-llm on GitHub.
 #
-# The RKLLM C runtime provides these functions (from rkllm.h):
+# The binding handles:
+#   - rkllm_createDefaultParam()  → returns RKLLMParam by value
+#   - rkllm_init(handle*, param*, callback, userdata)  → int
+#   - rkllm_run(handle, input*, infer*, userdata)       → int (BLOCKING)
+#   - rkllm_set_chat_template(handle, system, user_pfx, asst_pfx) → int
+#   - rkllm_abort(handle) / rkllm_destroy(handle)
 #
-#   RKLLMHandle  rkllm_init(RKLLMParam *param, RKLLMResultCallback callback, void *userdata)
-#   int           rkllm_run(RKLLMHandle handle, RKLLMInput *input, RKLLMRunParam *run_param, void *userdata)
-#   int           rkllm_abort(RKLLMHandle handle)
-#   int           rkllm_destroy(RKLLMHandle handle)
-#
-# The callback signature is:
-#   void (*callback)(RKLLMResult *result, void *userdata, int state)
-#
-# Where RKLLMResult contains token text and state indicates:
-#   RKLLM_RUN_NORMAL  = 1  (token in progress)
-#   RKLLM_RUN_FINISH  = 0  (generation complete)
-#   RKLLM_RUN_ERROR   = -1 (error)
-#
-# To complete this implementation:
-#   1. Obtain the RKLLM SDK from Rockchip (rknn-llm v1.2.3+)
-#   2. Define ctypes structs matching RKLLMParam, RKLLMInput, RKLLMRunParam
-#   3. Set LIB_PATH = "/opt/asr/lib/librkllmrt.so" (or env RKLLM_LIB_PATH)
-#   4. Wire the C callback to a Python callable that collects tokens
-#   5. For chat models, use RKLLM_INPUT_TEXT (not RKLLM_INPUT_EMBED)
-#
-# Reference: third_party/qwen3-edgellm-jetson/ (Jetson equivalent pattern)
+# rkllm_run is a synchronous (blocking) call.  The callback fires in-thread
+# during the call, so the engine MUST run on a background thread.
 
 
 class RealRKLLMEngine(RKLLMEngine):
     """Production engine that calls ``librkllmrt.so`` via ctypes.
 
-    Currently a skeleton — the ctypes definitions and C-callback wiring
-    need to be filled in once the RKLLM SDK headers are available.
+    Requires a compiled ``.rkllm`` chat model (Step 3 — model conversion
+    on a CUDA PC with the RKLLM-Toolkit).
     """
 
-    LIB_PATH = "/opt/asr/lib/librkllmrt.so"
-
     def __init__(self, lib_path: str | None = None) -> None:
-        self._lib_path = lib_path or self.LIB_PATH
-        self._handle: Any = None
-        self._loaded: bool = False
+        self._lib_path = lib_path
+        self._llm: Any = None  # services.llm.rkllm_binding.RKLLM
+        self._model_path: str | None = None
 
     # ------------------------------------------------------------------
     def load(self, model_path: str) -> None:
-        # TODO: call rkllm_init with:
-        #   - model_path pointing to the .rkllm file
-        #   - RKLLM_INPUT_TEXT input type (chat model, not embed)
-        #   - max_context_len, max_new_tokens from config
-        #   - NPU core mask (0x7 for all 3 cores on rk3588, 0x3 on rk3576)
-        #
-        # from ctypes import CDLL, c_char_p, c_void_p, c_int, CFUNCTYPE, Structure, POINTER
-        #
-        # _lib = CDLL(self._lib_path)
-        # _lib.rkllm_init.restype = c_void_p
-        # _lib.rkllm_init.argtypes = [POINTER(RKLLMParam), ...]
-        #
-        # See the comment block above for the full C API reference.
-        raise NotImplementedError(
-            "RealRKLLMEngine requires the RKLLM SDK headers and ctypes wiring. "
-            "Use DummyRKLLMEngine for testing the server logic."
-        )
+        from services.llm.rkllm_binding import RKLLM, RKLLMError
+
+        logger.info("Loading RKLLM model: %s", model_path)
+        try:
+            self._llm = RKLLM(
+                model_path,
+                max_tokens=512,
+                max_context_len=4096,
+                temperature=0.7,
+                top_p=0.9,
+                top_k=50,
+                repeat_penalty=1.05,
+                lib_path=self._lib_path,
+            )
+        except RKLLMError as exc:
+            raise RuntimeError(f"Failed to load RKLLM model: {exc}") from exc
+        self._model_path = model_path
+        logger.info("RKLLM model loaded.")
 
     def unload(self) -> None:
-        # TODO: call rkllm_destroy(handle)
-        self._handle = None
-        self._loaded = False
+        if self._llm is not None:
+            self._llm.close()
+            self._llm = None
+        self._model_path = None
 
     def is_ready(self) -> bool:
-        return self._loaded
+        return self._llm is not None and self._llm.is_loaded
 
+    # ------------------------------------------------------------------
     def generate(
         self,
         prompt: str,
@@ -241,15 +231,31 @@ class RealRKLLMEngine(RKLLMEngine):
         *,
         on_token: Callable[[str], None] | None = None,
     ) -> tuple[str, RKLLMStats]:
-        # TODO:
-        #   1. Set up RKLLMRunParam (max_tokens, temperature, top_p, top_k)
-        #   2. Set up RKLLMInput with prompt text
-        #   3. Register a Python callback that:
-        #        - Collects token text into a buffer
-        #        - Calls on_token(token) for each token
-        #        - On RKLLM_RUN_FINISH, signals completion
-        #   4. Call rkllm_run(handle, input, run_param)
-        #   5. Return (full_text, stats)
-        raise NotImplementedError(
-            "RealRKLLMEngine requires the RKLLM SDK headers and ctypes wiring."
+        if self._llm is None:
+            raise RuntimeError("Model not loaded")
+
+        cfg = config or RKLLMConfig()
+
+        tokens: list[str] = []
+        t0 = time.monotonic()
+        first_token_ms = 0.0
+
+        # rkllm_run is BLOCKING — the Python callback fires in-thread.
+        for i, tok in enumerate(self._llm.chat(prompt)):
+            tokens.append(tok)
+            if i == 0:
+                first_token_ms = (time.monotonic() - t0) * 1000
+            if on_token:
+                on_token(tok)
+
+        total_ms = (time.monotonic() - t0) * 1000
+        full_text = "".join(tokens)
+
+        stats = RKLLMStats(
+            prompt_tokens=len(prompt) // 2,
+            completion_tokens=len(tokens),
+            first_token_ms=first_token_ms,
+            total_time_ms=total_ms,
+            tokens_per_second=len(tokens) / (total_ms / 1000) if total_ms > 0 else 0,
         )
+        return full_text, stats
