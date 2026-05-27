@@ -1417,6 +1417,11 @@ class BaseApp:
             # later reset state out from under whatever dispatch we're
             # about to run.
             self._cancel_asr_watchdog()
+            # Snapshot whether the agent had just sent client-side EOS —
+            # if a low-signal/empty final follows, that final IS the
+            # response to our EOS and there's no LLM turn in flight to
+            # protect (race #2: stuck in THINKING).
+            _had_pending_eos = self._eos_sent_this_turn
             # Clear the per-turn EOS dedupe flag for ALL final paths
             # (duplicate-of-streamed, empty, and real). Previously it was
             # only reset in the non-empty branch below, so a duplicate or
@@ -1513,6 +1518,19 @@ class BaseApp:
                 #   IDLE / SLEEPING — already terminal; no transition.
                 cur_state = getattr(self, "_state", ConvState.IDLE)
                 if cur_state in (ConvState.LISTENING, ConvState.BARGED_IN):
+                    self._set_state(ConvState.IDLE)
+                    self._reset_sleep_timer()
+                elif cur_state == ConvState.THINKING and _had_pending_eos:
+                    # Race #2: we sent client-EOS expecting a real
+                    # final but SLV returned an empty/low-signal one
+                    # (server VAD coalesced silence). There is no
+                    # in-flight LLM turn to protect — sit in THINKING
+                    # forever otherwise. Force back to IDLE so the
+                    # next utterance can flow.
+                    logger.info(
+                        "empty asr_final after pending EOS while THINKING; "
+                        "resetting to IDLE (race #2)"
+                    )
                     self._set_state(ConvState.IDLE)
                     self._reset_sleep_timer()
                 elif cur_state in (ConvState.THINKING, ConvState.SPEAKING):
