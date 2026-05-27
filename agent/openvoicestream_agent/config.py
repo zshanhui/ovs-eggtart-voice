@@ -128,12 +128,19 @@ class Config:
     # ``max * 0.75`` — otherwise every turn trims, clears cache_warmed,
     # and the upstream KV-cache hot path is permanently defeated.
     #
-    # Default 7000: assumes engine context window ≥ 8K (8192). Leaves
-    # ~1000 tokens for output. Trim budget = 5250; with a typical
+    # Default 7000: tuned for an 8K (8192-token) engine context window
+    # with ~1K output headroom (7000 + ~1000 generated ≈ 8K). Trim
+    # budget (history-only) = 7000 * 0.75 = 5250 tokens; with a typical
     # 3-4K system+tools prefix that still leaves ~1500-2000 tokens for
-    # history (~5-6 turns). Set to None to disable trimming (matches the
-    # original append-only invariant). Override per-deployment if the
-    # engine uses a smaller context window.
+    # history (~5-6 turns). Set to None to disable trimming (matches
+    # the original append-only invariant).
+    #
+    # Override per-deployment if the engine uses a different context
+    # window (engines-3072 → ~2000; 16K engines → ~14000). EdgeLLMBackend
+    # warmup() will log an INFO/WARNING comparing this value to the
+    # observed engine context when it can be inferred (currently best-
+    # effort — the upstream server does not yet expose max_seq_len via
+    # /v1/info, so we rely on operator configuration).
     session_max_input_tokens: int | None = 7000
     # Tokenizer used to estimate prompt size. Default matches the most
     # common edge-llm engine; override per-deployment if your engine

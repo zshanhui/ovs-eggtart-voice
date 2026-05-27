@@ -252,6 +252,8 @@ class EdgeLLMBackend(OpenAICompatBackend):
               "cache_warmed": bool, "cache_warmup_ms": int,
               "graph_warmed": bool, "graph_warmup_ms": int,
               "messages_branch": bool,
+              "engine_max_seq_len": int,   # only if /v1/info exposes it
+              "prompt_chars": int,         # from cache endpoint metadata
             }
         """
         result: dict[str, Any] = {
@@ -267,6 +269,24 @@ class EdgeLLMBackend(OpenAICompatBackend):
             base = base[:-3]
         cache_url = base + "/v1/cache/system_prompt"
         chat_url = base + "/v1/chat/completions"
+        info_url = base + "/v1/info"
+
+        # Best-effort: probe ``/v1/info`` for engine metadata (max_seq_len
+        # etc.) so the caller can sanity-check session_max_input_tokens
+        # against the actual engine context. Upstream may not implement
+        # this endpoint yet — 404/connect-error is silently ignored.
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                info_resp = await client.get(info_url)
+                if info_resp.status_code == 200:
+                    info_data = info_resp.json() or {}
+                    max_seq = info_data.get("max_seq_len") or info_data.get(
+                        "engine_max_seq_len"
+                    )
+                    if isinstance(max_seq, int) and max_seq > 0:
+                        result["engine_max_seq_len"] = max_seq
+        except Exception:  # pragma: no cover - optional probe
+            logger.debug("edge-llm /v1/info probe failed (optional)", exc_info=True)
 
         # ── Step A: prefix KV cache ────────────────────────────────
         cache_t0 = time.perf_counter()

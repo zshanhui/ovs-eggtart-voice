@@ -589,6 +589,34 @@ class BaseApp:
                         "partial warmup: prefix cached but engine graph "
                         "not warmed; first tool_call decode may be slow"
                     )
+                # Plan D item 4: validate session_max_input_tokens vs
+                # observed engine max_seq_len (when available).
+                engine_max = warmup_result.get("engine_max_seq_len")
+                cfg_max = getattr(self.config, "session_max_input_tokens", None)
+                if isinstance(engine_max, int) and isinstance(cfg_max, int):
+                    if cfg_max > engine_max - 1000:
+                        logger.warning(
+                            "session budget tight: session_max_input_tokens=%d "
+                            "is within 1000 of engine max_seq_len=%d. After "
+                            "trim+output the request may still hit the engine "
+                            "ceiling. Consider lowering to ~%d.",
+                            cfg_max, engine_max, max(1024, engine_max - 1500),
+                        )
+                    elif cfg_max < engine_max // 2:
+                        logger.info(
+                            "session budget conservative: "
+                            "session_max_input_tokens=%d is <50%% of engine "
+                            "max_seq_len=%d. You could raise it for longer "
+                            "conversation history (user config takes priority "
+                            "— not auto-adjusting).",
+                            cfg_max, engine_max,
+                        )
+                    else:
+                        logger.info(
+                            "session budget OK vs engine: "
+                            "session_max_input_tokens=%d, engine_max_seq_len=%d",
+                            cfg_max, engine_max,
+                        )
         except Exception:
             logger.warning("LLM warmup failed; first turn may be cold", exc_info=True)
 
