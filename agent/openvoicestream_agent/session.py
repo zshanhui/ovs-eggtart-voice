@@ -86,7 +86,22 @@ class Session:
     history: list[dict[str, str]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     locale: str = "zh"
-    cache_warmed: bool = False
+    # Split warmup flags (was single ``cache_warmed`` field, kept as a
+    # backward-compat property below):
+    #   * prefix_cache_warmed — server holds a KV-prefix entry we can
+    #     reuse on the next request (``prefix_cache=True``). Set after
+    #     a successful warmup Step A OR a successful real turn (which
+    #     also saves its prefix). Cleared by session reset / trim /
+    #     echo recovery.
+    #   * graph_warmed — TRT-LLM CUDA graph captured + JIT done for the
+    #     real-shape forward path. Independent of prefix_cache (the
+    #     server can have one without the other after a partial warmup
+    #     failure). Currently informational only: edge_llm doesn't
+    #     change the request based on this flag; the runner logs a hint
+    #     when prefix is hot but graph isn't, because the first tool_call
+    #     decode after a partial warmup may still pay JIT cost.
+    prefix_cache_warmed: bool = False
+    graph_warmed: bool = False
     # Token-aware trim controls (A2). None disables trimming entirely
     # and preserves the original append-only invariant.
     max_input_tokens: int | None = None
@@ -102,18 +117,33 @@ class Session:
     # importing the EventBus type.
     event_bus: Any = None
 
+    # ── backward-compat alias ───────────────────────────────────────
+    # Old field was a single ``cache_warmed`` bool that conflated prefix
+    # cache and CUDA graph warm. We split into two; keep the old name
+    # as a property targeting prefix_cache_warmed (the half that
+    # actually drives ``prefix_cache=True`` on requests). Older callers
+    # and tests that read or assign ``session.cache_warmed`` keep working.
+    @property
+    def cache_warmed(self) -> bool:
+        return self.prefix_cache_warmed
+
+    @cache_warmed.setter
+    def cache_warmed(self, value: bool) -> None:
+        self.prefix_cache_warmed = bool(value)
+
     def reset(self) -> None:
         """Clear conversation history and per-session cache latches.
 
         Called when a new dialogue starts (mode switch / explicit clear /
-        user-driven reset). Both ``cache_warmed`` and the A4
+        user-driven reset). Both warmup flags and the A4
         ``prefix_cache_disabled`` flag get reset so the next turn can
         re-warm normally — otherwise a session that ever hit a prefix-cache
         failure would skip prefix_cache forever, even across logical
         conversations.
         """
         self.history.clear()
-        self.cache_warmed = False
+        self.prefix_cache_warmed = False
+        self.graph_warmed = False
         self.prefix_cache_disabled = False
 
     def add_user(self, text: str) -> None:
@@ -208,7 +238,8 @@ class Session:
             self.ECHO_WINDOW, first[:60],
         )
         self.history.clear()
-        self.cache_warmed = False
+        self.prefix_cache_warmed = False
+        self.graph_warmed = False
         self.prefix_cache_disabled = False
         bus = getattr(self, "event_bus", None)
         if bus is not None:
@@ -322,6 +353,58 @@ class Session:
                 i += 1
             turns.append(rest[start:i])
 
+        # Corner case (Plan D item 6): no user-anchored turns at all
+        # (history is exclusively assistant/tool messages — can happen
+        # if an in-flight tool round was rolled back leaving orphan
+        # entries, or a programmatic test populates only tool results).
+        # In this case the regular path returns the input unchanged,
+        # so an oversized all-tool history would silently slip past the
+        # budget and overflow ``max_seq_len`` upstream. Degrade by
+        # dropping oldest non-system messages until under budget, log
+        # ERROR so the underlying invariant violation gets noticed.
+        if not turns:
+            rest_tokens = sum(self._msg_tokens(m) for m in rest)
+            if rest_tokens <= budget:
+                return messages
+            logger.error(
+                "session trim corner case: history has no user-anchored "
+                "turns but total %d tokens > budget %d. Falling back to "
+                "raw drop-oldest until under budget — investigate why "
+                "history is all assistant/tool (orphan rollback?).",
+                rest_tokens, budget,
+            )
+            kept = list(rest)
+            dropped_msgs = 0
+            while kept and rest_tokens > budget:
+                removed = kept.pop(0)
+                rest_tokens -= self._msg_tokens(removed)
+                dropped_msgs += 1
+            # Clear cache_warmed: prefix the upstream KV cache was keyed
+            # against is no longer present.
+            if self.prefix_cache_warmed:
+                self.prefix_cache_warmed = False
+            bus = getattr(self, "event_bus", None)
+            if bus is not None:
+                try:
+                    bus.emit(
+                        "on_session_trimmed",
+                        {
+                            "dropped_messages": dropped_msgs,
+                            "kept_messages": len(kept),
+                            "approx_tokens": rest_tokens,
+                            "budget": budget,
+                            "max_input_tokens": max_tokens,
+                            "sid": self.sid,
+                            "fallback": "all_tool_messages",
+                        },
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    logger.debug(
+                        "event_bus emit on_session_trimmed (fallback) failed",
+                        exc_info=True,
+                    )
+            return [system, *kept]
+
         # A trailing "incomplete" turn = doesn't end in a normal
         # assistant(text) message. Pin it; only completed turns are
         # candidates for dropping.
@@ -385,12 +468,12 @@ class Session:
             # session" — independent of trim. Conflating them would mean
             # a single trim event permanently disables prefix_cache for
             # the rest of the dialogue, which we don't want.
-            if self.cache_warmed:
+            if self.prefix_cache_warmed:
                 logger.info(
                     "session trim invalidates upstream KV cache, "
-                    "clearing cache_warmed (prefix_cache_disabled untouched)"
+                    "clearing prefix_cache_warmed (prefix_cache_disabled untouched)"
                 )
-                self.cache_warmed = False
+                self.prefix_cache_warmed = False
             bus = getattr(self, "event_bus", None)
             if bus is not None:
                 try:

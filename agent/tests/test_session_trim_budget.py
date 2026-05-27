@@ -71,3 +71,86 @@ def test_history_alone_charged_against_budget() -> None:
     assert history_cost <= budget, (
         f"history {history_cost} exceeds dynamic-turn budget {budget}"
     )
+
+
+# ── Plan D item 6: all-tool-message history corner case ─────────────
+
+
+def test_trim_all_tool_messages_fallback_drops_oldest() -> None:
+    """All-tool-message history exceeding budget triggers fallback drop.
+
+    Pre-fix behaviour: regular trim sees turns=[] and returns input as-is
+    even when total tokens > budget. New behaviour: log ERROR + drop
+    oldest non-system messages until under budget; clear cache_warmed.
+    """
+    session = Session(max_input_tokens=200, token_counter=_fake_counter)
+    long_payload = "x" * 80
+    for i in range(20):
+        session.history.append({
+            "role": "tool",
+            "tool_call_id": f"call_{i}",
+            "content": f"{long_payload}-{i}",
+        })
+    session.prefix_cache_warmed = True
+
+    msgs = session.messages("system")
+    assert msgs[0]["role"] == "system"
+    # Some tool messages dropped.
+    assert len(msgs) < 21
+    assert session.prefix_cache_warmed is False
+    # Backward-compat alias mirrors the underlying field.
+    assert session.cache_warmed is False
+
+
+def test_trim_all_tool_messages_under_budget_is_noop() -> None:
+    """If the all-tool history already fits, return unchanged + don't
+    clear cache flags."""
+    session = Session(max_input_tokens=10_000, token_counter=_fake_counter)
+    for i in range(3):
+        session.history.append({
+            "role": "tool",
+            "tool_call_id": f"call_{i}",
+            "content": "tiny",
+        })
+    session.prefix_cache_warmed = True
+    msgs = session.messages("sys")
+    assert len(msgs) == 1 + 3
+    assert session.prefix_cache_warmed is True
+
+
+def test_trim_all_tool_messages_emits_event() -> None:
+    """Fallback emits on_session_trimmed with fallback marker."""
+    from openvoicestream_agent.event_bus import EventBus
+
+    bus = EventBus()
+    received: list[dict] = []
+    bus.subscribe("on_session_trimmed", lambda payload: received.append(payload))
+
+    session = Session(max_input_tokens=200, token_counter=_fake_counter)
+    session.event_bus = bus
+    payload = "y" * 80
+    for i in range(20):
+        session.history.append({
+            "role": "tool",
+            "tool_call_id": f"call_{i}",
+            "content": f"{payload}-{i}",
+        })
+
+    session.messages("sys")
+    assert len(received) == 1
+    evt = received[0]
+    assert evt.get("fallback") == "all_tool_messages"
+    assert evt["dropped_messages"] > 0
+    assert evt["budget"] == int(200 * 0.75)
+
+
+def test_backward_compat_cache_warmed_property() -> None:
+    """Old ``session.cache_warmed`` reads/writes still work post-split."""
+    session = Session()
+    assert session.cache_warmed is False
+    assert session.prefix_cache_warmed is False
+    session.cache_warmed = True
+    assert session.prefix_cache_warmed is True
+    assert session.cache_warmed is True
+    session.prefix_cache_warmed = False
+    assert session.cache_warmed is False
