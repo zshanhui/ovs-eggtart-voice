@@ -353,6 +353,24 @@ async def stream_with_tools(
                 tool_meta = registry._tools.get(tname) if tname else None
                 rmode = getattr(tool_meta, "response_mode", "await") or "await"
                 ctext = getattr(tool_meta, "completion_text", "") or ""
+                # Parallel-mode dispatch budget (Plan D item 2). Tools
+                # declared response_mode="parallel" are expected to do a
+                # fast hand-off (kick off a background task, return a
+                # {"started": True} stub in ~200ms). Anything past 500ms
+                # eats into the LLM-round-2 / TTS budget the parallel
+                # mode is supposed to overlap, defeating the design.
+                # We log a WARNING but never block — the tool result
+                # has already been appended; downgrading to await is
+                # the safe behaviour.
+                _PARALLEL_DISPATCH_BUDGET_MS = 500.0
+                if rmode == "parallel" and dt_ms > _PARALLEL_DISPATCH_BUDGET_MS:
+                    logger.warning(
+                        "tool %r in parallel mode took %.0fms to dispatch "
+                        "(>%.0fms threshold). Verify dispatch_action returns "
+                        "promptly with {\"started\": True}; long-running work "
+                        "belongs in a background task.",
+                        tname, dt_ms, _PARALLEL_DISPATCH_BUDGET_MS,
+                    )
                 dispatched_modes.append((rmode, ctext, result))
 
             # response_mode dispatch:
