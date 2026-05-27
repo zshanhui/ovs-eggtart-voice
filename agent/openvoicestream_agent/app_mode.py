@@ -130,6 +130,12 @@ class ModeContext:
 
         self.session.add_user(text)
         chunks: list[str] = []
+        # Race #5: track ALL text we forwarded to SLV (not just LLM
+        # token chunks). Tool preamble + completion_text also go to
+        # SLV via send_text and must be aborted on cancel/error,
+        # otherwise SLV speaks the preamble of a tool the user just
+        # barged in on.
+        sent_any_text = False
         cancelled = False
         completed = False
         try:
@@ -201,6 +207,7 @@ class ModeContext:
             )
 
             async def _on_token(token: str) -> None:
+                nonlocal sent_any_text
                 chunks.append(token)
                 try:
                     self.events.emit("assistant_token", token)
@@ -208,6 +215,7 @@ class ModeContext:
                     pass
                 await self.broadcast("on_assistant_token", token)
                 await self.slv.send_text(token)
+                sent_any_text = True
 
             async def _on_tool_started(tc: dict) -> None:
                 payload = {
@@ -229,10 +237,12 @@ class ModeContext:
                 # the (potentially slow) tool dispatch is still in
                 # flight. Fail-open — a dropped/reconnecting SLV must
                 # not abort the tool round.
+                nonlocal sent_any_text
                 if not text:
                     return
                 try:
                     await self.slv.send_text(text)
+                    sent_any_text = True  # race #5: track for cancel abort
                     logger.info(
                         "dispatched tool preamble to SLV: %r", text
                     )
@@ -246,10 +256,12 @@ class ModeContext:
                 # end of a "template" response_mode tool round in lieu of
                 # an LLM round 2. Fail-open: TTS drop must not abort
                 # the dialogue.
+                nonlocal sent_any_text
                 if not text:
                     return
                 try:
                     await self.slv.send_text(text)
+                    sent_any_text = True  # race #5: track for cancel abort
                     logger.info(
                         "dispatched tool completion_text to SLV: %r", text
                     )
@@ -330,7 +342,11 @@ class ModeContext:
             # both turns and our state machine sees confused replies.
             # Best-effort; if SLV is unreachable we'll fail open and the
             # next turn at least starts on a fresh connect.
-            if chunks:
+            # Race #5: also abort when only tool preamble / completion_text
+            # was sent (no LLM tokens yet) — those texts are equally
+            # buffered on SLV's TTS pipeline and must not bleed into the
+            # next turn.
+            if chunks or sent_any_text:
                 try:
                     await self.slv.abort()
                 except Exception:  # pragma: no cover - best effort
@@ -349,10 +365,11 @@ class ModeContext:
             # so we don't speak a half-sentence or persist it as an
             # assistant reply. The runner already rolled session.history
             # back on its own exception path for tool rounds.
-            if chunks:
+            # Race #5: include tool preamble / completion_text sends.
+            if chunks or sent_any_text:
                 logger.info(
-                    "LLM stream failed after %d partial token(s); aborting partial TTS",
-                    len(chunks),
+                    "LLM stream failed after %d partial token(s) (sent_any_text=%s); aborting partial TTS",
+                    len(chunks), sent_any_text,
                 )
                 try:
                     await self.slv.abort()
