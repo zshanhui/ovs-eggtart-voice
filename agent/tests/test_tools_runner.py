@@ -297,11 +297,14 @@ async def test_invalid_args_json_continues_loop():
     assert "invalid arguments JSON" in body["error"]
 
 
-# ── (g) iter >0 sets extra_body.prefix_cache=False (must-fix #1) ──────
+# ── (g) iter >0 keeps prefix_cache and asks to save new prefix (A1) ───
 
 
 @pytest.mark.asyncio
-async def test_iter_gt_zero_disables_prefix_cache():
+async def test_iter_gt_zero_keeps_prefix_cache_and_saves():
+    """A1: iter >0 must NOT disable prefix_cache (server cache supports
+    multi-turn prefix match) and SHOULD ask the server to save the
+    grown prefix for the next iter."""
     session = Session()
     registry = ToolRegistry()
 
@@ -328,9 +331,12 @@ async def test_iter_gt_zero_disables_prefix_cache():
     assert "extra_body" not in first_kw or "prefix_cache" not in (
         first_kw.get("extra_body") or {}
     )
-    # Second call (iter >0): extra_body.prefix_cache must be False.
+    # Second call (iter >0): runner must NOT have forced prefix_cache=False,
+    # and SHOULD have asked the server to save the larger prefix.
     second_kw = llm.calls[1]["kwargs"]
-    assert second_kw["extra_body"]["prefix_cache"] is False
+    extra = second_kw["extra_body"]
+    assert extra.get("prefix_cache") is not False
+    assert extra["save_system_prompt_kv_cache"] is True
 
 
 # ── (h) first-token + idle timeout kwargs ─────────────────────────────
@@ -441,8 +447,8 @@ async def test_idle_timeout_after_first_token():
 
 @pytest.mark.asyncio
 async def test_iter_gt_zero_preserves_caller_extra_body():
-    """A caller-supplied extra_body must survive the prefix_cache=False
-    injection on iter >0."""
+    """A caller-supplied extra_body must survive the A1
+    save_system_prompt_kv_cache injection on iter >0."""
     session = Session()
     registry = ToolRegistry()
 
@@ -467,7 +473,9 @@ async def test_iter_gt_zero_preserves_caller_extra_body():
     )
     second_kw = llm.calls[1]["kwargs"]
     assert second_kw["extra_body"]["custom_flag"] == "keep_me"
-    assert second_kw["extra_body"]["prefix_cache"] is False
+    assert second_kw["extra_body"]["save_system_prompt_kv_cache"] is True
+    # And we must NOT have stomped the cache lookup off.
+    assert second_kw["extra_body"].get("prefix_cache") is not False
 
 
 # ── (k) per-tool preamble_text metadata fires on_tool_preamble ────────

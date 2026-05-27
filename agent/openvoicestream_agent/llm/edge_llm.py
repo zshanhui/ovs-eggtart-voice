@@ -68,8 +68,12 @@ class EdgeLLMBackend(OpenAICompatBackend):
             and not session.prefix_cache_disabled
         )
         if use_prefix_cache:
+            # A1: also save this turn's prefix so the *next* turn's
+            # longer-history request can hit it (server cache is a
+            # token-id-prefix map; multiple keys coexist).
             return {
                 "prefix_cache": True,
+                "save_system_prompt_kv_cache": True,
                 "return_cache_metrics": True,
                 "enable_thinking": False,
             }

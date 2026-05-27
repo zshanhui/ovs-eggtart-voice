@@ -135,14 +135,20 @@ async def stream_with_tools(
             kwargs: dict[str, Any] = dict(llm_kwargs or {})
             kwargs["session"] = session
             kwargs["tools"] = tools_schema
-            # Must-fix #1 (codex review): on tool-loop iterations *after*
-            # the first the message list shape has changed
-            # (assistant_tool_calls + tool results appended). The
-            # server-side formatted_request cache was keyed against the
-            # original shape; force the no-prefix path for iter >0.
+            # A1: history KV cache reuse across tool-loop iterations.
+            # The edge-llm server's SystemPromptKVCache is a token-id
+            # prefix-match cache that supports multiple distinct keys
+            # coexisting. On iter >0 the messages list grew by
+            # (assistant_tool_call + tool_result); ``messages[:-1]`` is a
+            # strict superset of the previous iter's saved prefix, so
+            # prefix_cache=True will still hit (server falls back to a
+            # fresh prefill on mismatch — see api_server.py:705 /
+            # llmInferenceSpecDecodeRuntime.cpp:2185-2235). Additionally
+            # ask the server to save this iter's larger prefix so the
+            # next iter (or the next turn's first LLM call) can reuse it.
             if iter_idx > 0:
                 caller_extra = dict(kwargs.get("extra_body") or {})
-                caller_extra["prefix_cache"] = False
+                caller_extra.setdefault("save_system_prompt_kv_cache", True)
                 kwargs["extra_body"] = caller_extra
 
             stream = _open_stream(llm, messages, kwargs)
