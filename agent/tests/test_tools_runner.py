@@ -740,6 +740,56 @@ async def test_response_mode_template_failure_falls_through_to_llm():
 
 
 @pytest.mark.asyncio
+async def test_response_mode_template_empty_completion_text_falls_back_to_await(caplog):
+    """Misconfiguration: response_mode=template but completion_text="".
+
+    Without the fallback, the runner would skip LLM round 2 and return
+    "" — the user gets no spoken reply at all and session history is
+    missing an assistant turn. Fix: detect empty completion_text, log a
+    warning, and let LLM round 2 run as if response_mode were "await".
+    """
+    import logging
+
+    session = Session()
+    registry = ToolRegistry()
+
+    @registry.tool(response_mode="template", completion_text="")
+    def wave() -> dict:
+        return {"success": True}
+
+    llm = _FakeLLM([
+        [_tc(0, id="c1", name="wave", arguments="{}"), _finish("tool_calls")],
+        [_text("sure, waved"), _finish("stop")],
+    ])
+
+    completion_texts: list[str] = []
+
+    async def on_tok(_):
+        pass
+
+    async def on_completion_text(t):
+        completion_texts.append(t)
+
+    msgs: list[dict[str, Any]] = [{"role": "system", "content": "sys"}]
+    with caplog.at_level(logging.WARNING, logger="openvoicestream_agent.tools.runner"):
+        final = await stream_with_tools(
+            llm, msgs,
+            session=session, registry=registry, allowed_tools={"wave"},
+            ctx=_make_ctx(session), on_assistant_token=on_tok,
+            on_tool_completion_text=on_completion_text,
+        )
+    # Fell back to await: LLM round 2 ran and its text is returned.
+    assert final == "sure, waved"
+    assert completion_texts == []  # empty ctext was never emitted
+    assert len(llm.calls) == 2  # round 2 happened
+    # Warning was logged so operator can fix the misconfig.
+    assert any(
+        "completion_text" in r.message and "falling back to await" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_response_mode_parallel_runs_llm_round_2_on_fast_result():
     """``parallel`` mode behaves like await in the runner (no special
     branching) — the contract is that the TOOL BODY returns fast and

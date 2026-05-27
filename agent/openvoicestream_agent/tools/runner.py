@@ -371,8 +371,33 @@ async def stream_with_tools(
                 if not ok:
                     template_handled = False
                     break
+                # Misconfiguration guard: response_mode="template" with no
+                # completion_text would silently suppress LLM round 2 and
+                # return an empty string to the caller (no spoken reply,
+                # no assistant message added to history → next turn looks
+                # like the user spoke twice in a row). Treat it as an
+                # operator error: fall back to "await" semantics so the
+                # LLM can produce a normal response, and emit a warning
+                # so the missing completion_text gets noticed.
+                if not ctext:
+                    tname_warn = next(
+                        (
+                            tc.get("function", {}).get("name") or "<unknown>"
+                            for tc in tc_payload
+                        ),
+                        "<unknown>",
+                    )
+                    logger.warning(
+                        "tool %r declared response_mode=template with empty "
+                        "completion_text; falling back to await (running LLM "
+                        "round 2). Set a completion_text in the tool definition "
+                        "to suppress this fallback.",
+                        tname_warn,
+                    )
+                    template_handled = False
+                    break
                 template_handled = True
-                if ctext and on_tool_completion_text is not None:
+                if on_tool_completion_text is not None:
                     try:
                         await on_tool_completion_text(ctext)
                     except Exception:  # noqa: BLE001
