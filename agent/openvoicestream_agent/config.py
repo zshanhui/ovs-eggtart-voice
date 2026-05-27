@@ -121,10 +121,20 @@ class Config:
     llm_availability_unknowns_to_unknown_state: int = 3
     # Session history trim (A2). When set, the oldest turns are dropped
     # before the prompt is shipped to the LLM so total input tokens stay
-    # below this ceiling. Default 3000 leaves a small margin under the
-    # engines-3072 build's max_seq_len. Set to None to disable (matches
-    # the original append-only invariant).
-    session_max_input_tokens: int | None = 2400
+    # below this ceiling. Trim fires at ``session_max_input_tokens * 0.75``
+    # (see Session._trim_to_budget). The fixed prefix (system_prompt +
+    # tools schema) is charged against the same budget, so this value
+    # must be large enough that the fixed prefix is a small fraction of
+    # ``max * 0.75`` — otherwise every turn trims, clears cache_warmed,
+    # and the upstream KV-cache hot path is permanently defeated.
+    #
+    # Default 7000: assumes engine context window ≥ 8K (8192). Leaves
+    # ~1000 tokens for output. Trim budget = 5250; with a typical
+    # 3-4K system+tools prefix that still leaves ~1500-2000 tokens for
+    # history (~5-6 turns). Set to None to disable trimming (matches the
+    # original append-only invariant). Override per-deployment if the
+    # engine uses a smaller context window.
+    session_max_input_tokens: int | None = 7000
     # Tokenizer used to estimate prompt size. Default matches the most
     # common edge-llm engine; override per-deployment if your engine
     # ships a different vocabulary.

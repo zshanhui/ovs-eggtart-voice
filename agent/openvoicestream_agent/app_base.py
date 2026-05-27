@@ -252,6 +252,79 @@ class BaseApp:
         # Rate-limited stop-word matcher cache (compiled per Config update).
         self._stop_words_cache: tuple[list[str], list[str]] | None = None
 
+    # ── startup budget validation ───────────────────────────────────
+
+    @staticmethod
+    def _approx_tokens(text: str) -> int:
+        """Cheap upper-bound token estimate without loading a tokenizer.
+
+        ``len(text) // 3`` is a conservative bound: Chinese chars ≈ 0.4
+        token, English chars ≈ 0.25 token; 1/3 sits above both. Used
+        only for startup sanity-check logging, not for trim accounting.
+        """
+        if not text:
+            return 0
+        return max(1, len(text) // 3)
+
+    @classmethod
+    def _approx_tokens_for_tools(cls, tools: list[dict] | None) -> int:
+        if not tools:
+            return 0
+        try:
+            import json as _json
+            return cls._approx_tokens(_json.dumps(tools, ensure_ascii=False))
+        except Exception:
+            return 0
+
+    def _validate_session_budget(
+        self, system_prompt: str, tools: list[dict] | None
+    ) -> None:
+        """Sanity-check session_max_input_tokens vs the fixed prefix.
+
+        The trim threshold is ``session_max_input_tokens * 0.75``. The
+        fixed prefix (system_prompt + tools schema) is charged against
+        the same budget on every turn. If the fixed prefix is already
+        at or above the trim threshold, *every* turn trims, which
+        clears ``Session.cache_warmed`` and defeats the upstream
+        KV-cache hot path permanently. This validator surfaces that
+        misconfiguration at startup with an explicit ERROR.
+        """
+        max_input = getattr(self.config, "session_max_input_tokens", None)
+        if not max_input:
+            logger.info(
+                "Session trim disabled (session_max_input_tokens=None); "
+                "skipping budget validation"
+            )
+            return
+        sys_tokens = self._approx_tokens(system_prompt or "")
+        tools_tokens = self._approx_tokens_for_tools(tools)
+        fixed_tokens = sys_tokens + tools_tokens
+        budget = int(max_input * 0.75)
+        pct = (fixed_tokens / budget * 100) if budget else 0.0
+        if fixed_tokens >= budget:
+            recommended = int(fixed_tokens / 0.75) + 2000
+            logger.error(
+                "FIXED PREFIX (system_prompt %d + tools %d = %d tokens) >= trim "
+                "budget %d tokens (%.0f%% of max %d). Every turn will trim, KV "
+                "cache will be invalidated, hot path disabled. Raise "
+                "session_max_input_tokens to at least %d.",
+                sys_tokens, tools_tokens, fixed_tokens, budget, pct,
+                max_input, recommended,
+            )
+        elif fixed_tokens > budget * 0.5:
+            logger.warning(
+                "Fixed prefix uses %.0f%% of trim budget (%d / %d tokens, "
+                "system=%d tools=%d). Few turns of history will fit before "
+                "trim. Consider raising session_max_input_tokens.",
+                pct, fixed_tokens, budget, sys_tokens, tools_tokens,
+            )
+        else:
+            logger.info(
+                "Session budget OK: fixed prefix %d / budget %d tokens "
+                "(%.0f%% used, system=%d tools=%d, max_input=%d).",
+                fixed_tokens, budget, pct, sys_tokens, tools_tokens, max_input,
+            )
+
     # ── v2: state machine + stop intent ─────────────────────────────
 
     def _set_state(self, new: ConvState) -> None:
@@ -470,6 +543,12 @@ class BaseApp:
                 pass
             if not sys_prompt:
                 sys_prompt = getattr(self.config, "system_prompt", "") or ""
+            # Validate session budget BEFORE warmup. If the fixed prefix
+            # (system_prompt + tools schema) is too close to the trim
+            # threshold, every turn will trim → cache_warmed cleared →
+            # KV-cache hot path defeated. Logs ERROR if misconfigured,
+            # WARNING if tight, INFO if healthy.
+            self._validate_session_budget(sys_prompt, tools_payload)
             warmup_result = await self.llm.warmup(
                 system_prompt=sys_prompt,
                 tools=tools_payload,
