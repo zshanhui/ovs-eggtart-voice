@@ -141,3 +141,94 @@ async def test_slv_client_send_methods_emit_correct_payloads():
     assert "asr_eos" in types
     text_frame = next(j for j in json_frames if j["type"] == "text")
     assert text_frame["text"] == "hello"
+
+
+# ── is_healthy / SLVReconnectError ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_is_healthy_false_before_connect():
+    from openvoicestream_agent.slv_client import SLVClient
+
+    client = SLVClient("ws://127.0.0.1:1", {"foo": "bar"})
+    assert client.is_healthy() is False
+
+
+@pytest.mark.asyncio
+async def test_is_healthy_false_after_close():
+    received: list = []
+    ready = asyncio.Event()
+    server = await _mock_server(received, ready)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        client = SLVClient(f"ws://127.0.0.1:{port}", {"foo": "bar"})
+        await client.connect()
+        await asyncio.wait_for(ready.wait(), timeout=2.0)
+        assert client.is_healthy() is True
+        await client.close()
+        assert client.is_healthy() is False
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_is_healthy_false_when_reader_dies():
+    """Server closes the WS → reader exits → is_healthy() returns False."""
+    from openvoicestream_agent.slv_client import SLVClient
+
+    closed = asyncio.Event()
+
+    async def handler(ws):
+        await ws.recv()  # read config
+        # Wait past the limiter-race grace window so connect() returns
+        # healthy first; THEN close so we exercise is_healthy() detecting
+        # a post-connect reader exit.
+        await asyncio.sleep(0.15)
+        await ws.close()
+        closed.set()
+
+    server = await serve(handler, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        client = SLVClient(f"ws://127.0.0.1:{port}", {"foo": "bar"})
+        await client.connect()
+        assert client.is_healthy() is True  # immediately after connect
+        # Drain the queued SLVError so reader has fully exited
+        await asyncio.wait_for(closed.wait(), timeout=2.0)
+        # Give reader a beat to finish its finally block
+        for _ in range(20):
+            if not client.is_healthy():
+                break
+            await asyncio.sleep(0.05)
+        assert client.is_healthy() is False
+    finally:
+        await client.close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_error_when_server_keeps_closing():
+    """All attempts rejected inside grace window → raises SLVReconnectError."""
+    from openvoicestream_agent.slv_client import SLVClient, SLVReconnectError
+
+    async def reject_handler(ws):
+        # Accept, immediately close — triggers reader-done inside grace.
+        try:
+            await asyncio.wait_for(ws.recv(), timeout=0.1)
+        except Exception:
+            pass
+        await ws.close()
+
+    server = await serve(reject_handler, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        client = SLVClient(f"ws://127.0.0.1:{port}", {"foo": "bar"})
+        # Speed up the test — shrink backoffs.
+        client._RECONNECT_BACKOFFS = (0.01, 0.01, 0.01)
+        with pytest.raises(SLVReconnectError):
+            await client.connect()
+    finally:
+        await client.close()
+        server.close()
+        await server.wait_closed()

@@ -92,6 +92,15 @@ class SLVError(V2VEvent):
     message: str
 
 
+class SLVReconnectError(Exception):
+    """Raised when ``SLVClient.reconnect()`` cannot establish a working WS.
+
+    Callers (e.g. ``App.wake()``) catch this to decide policy — most often,
+    refuse the wake and stay SLEEPING so the user notices something is
+    wrong rather than experiencing a silent mute.
+    """
+
+
 # ── Client ───────────────────────────────────────────────────────────
 
 
@@ -130,6 +139,28 @@ class SLVClient:
         if self._ws is not None:
             return  # idempotent
         await self._open_with_retry()
+
+    def is_healthy(self) -> bool:
+        """Best-effort liveness check for the SLV WebSocket.
+
+        Returns False when:
+        - the client is closed
+        - the WS handle is missing (last send observed ``ConnectionClosed``
+          and nulled it)
+        - the reader task is missing or has already exited (server closed
+          the stream, or ``_open_with_retry`` aborted before launching it)
+
+        Cheap to call — no I/O. Used by ``App.wake()`` to decide whether
+        to skip a wake when the previous turn's reconnect fail-silently
+        left us with a dead stream.
+        """
+        if self._closed:
+            return False
+        if self._ws is None:
+            return False
+        if self._reader_task is None or self._reader_task.done():
+            return False
+        return True
 
     async def reconnect(self) -> None:
         """Tear down current WS and open a fresh one, replaying config.
@@ -217,7 +248,7 @@ class SLVClient:
             except Exception:
                 pass
             if backoff is None:
-                raise ConnectionError(
+                raise SLVReconnectError(
                     f"SLV reconnect: server closed within {self._RECONNECT_GRACE_S}s "
                     f"on all {len(attempts)} attempts (limiter race?)"
                 )

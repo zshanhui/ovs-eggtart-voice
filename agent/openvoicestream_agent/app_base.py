@@ -67,6 +67,7 @@ from .slv_client import (
     ASRPartial,
     SLVClient,
     SLVError,
+    SLVReconnectError,
     TTSAudio,
     TTSDone,
     TTSSentenceDone,
@@ -418,10 +419,70 @@ class BaseApp:
         """Transition SLEEPING → IDLE and (re-)arm the sleep timer.
 
         No-op if not currently SLEEPING. Broadcasts on_wake with source.
+
+        SLV stream health is verified before the state transition. The
+        previous turn's proactive ``slv.reconnect()`` (on tts_done) can
+        fail-silently: ``_open_with_retry`` may exhaust its backoff
+        budget while ``send_audio`` / dispatch loop never observe the
+        failure because the timeout is shorter than the retry window
+        (``send_audio`` waits 0.5s, retry budget is up to ~1.75s + 3
+        round-trips). Result was a dead stream with ``_ws=None`` that
+        silently swallowed every post-wake mic chunk — the "mute bug".
+
+        We now health-check on wake, attempt a single reconnect if dead,
+        and *refuse the wake* (stay SLEEPING) if even that fails. Better
+        to make the silence visible (log + on_wake_failed broadcast)
+        than to pretend everything is fine and have the user repeat
+        themselves into the void.
         """
         if getattr(self, "_state", ConvState.IDLE) != ConvState.SLEEPING:
             return
         logger.info("wake from %s", source)
+        # Health-gate the wake. Cheap is_healthy() check first — no I/O.
+        if not self.slv.is_healthy():
+            logger.warning(
+                "wake: SLV stream unhealthy (ws=%r reader_done=%r); reconnecting before listen",
+                self.slv._ws is not None,
+                self.slv._reader_task is not None and self.slv._reader_task.done(),
+            )
+            try:
+                # Generous timeout — wake is rare, _open_with_retry can
+                # legitimately take ~2s on the limiter race. Use 6s so
+                # we cover full backoff schedule (0.25+0.5+1.0=1.75s)
+                # plus 3 attempts of grace window + WS handshake.
+                await asyncio.wait_for(self.slv.reconnect(), timeout=6.0)
+                self._slv_reconnect_count = getattr(self, "_slv_reconnect_count", 0) + 1
+                logger.info(
+                    "wake: SLV reconnected (count=%d)", self._slv_reconnect_count
+                )
+                try:
+                    await self._broadcast(
+                        "on_slv_reconnect",
+                        {"count": self._slv_reconnect_count},
+                    )
+                except Exception:
+                    logger.exception("on_slv_reconnect broadcast failed (wake)")
+            except (SLVReconnectError, asyncio.TimeoutError, ConnectionError) as e:
+                logger.error(
+                    "wake: SLV reconnect failed (%s); staying SLEEPING to avoid silent mute",
+                    e,
+                )
+                try:
+                    await self._broadcast(
+                        "on_wake_failed",
+                        {"source": source, "reason": "slv_unhealthy"},
+                    )
+                except Exception:
+                    logger.exception("on_wake_failed broadcast failed")
+                # Do NOT transition to IDLE — caller (wake_source / dashboard)
+                # observes that we are still SLEEPING and can surface the
+                # failure to the user.
+                return
+            except Exception:
+                logger.exception(
+                    "wake: SLV reconnect raised unexpected error; staying SLEEPING"
+                )
+                return
         try:
             await self._broadcast("on_wake", {"source": source})
         except Exception:
@@ -1604,10 +1665,21 @@ class BaseApp:
                 await self._broadcast(
                     "on_slv_reconnect", {"count": self._slv_reconnect_count}
                 )
-            except asyncio.TimeoutError:
-                logger.warning("SLV reconnect timed out after tts_done")
+            except (asyncio.TimeoutError, SLVReconnectError) as e:
+                # The tts_done reconnect can fail-silently in two ways:
+                # 1) wait_for cancels mid-_open_with_retry, leaving _ws=None
+                #    (the outer dispatch loop catches this via events()
+                #    returning and reconnects again on its own).
+                # 2) SLVReconnectError exhausts the limiter-race backoffs.
+                # In both cases, the next ``wake()`` performs its own
+                # is_healthy() gate + reconnect — that's the cure for the
+                # mute bug. Log at error (not warning) so it's visible.
+                logger.error(
+                    "SLV reconnect failed after tts_done (%s); next wake() will retry",
+                    e,
+                )
             except Exception:
-                logger.exception("SLV reconnect failed after tts_done")
+                logger.exception("SLV reconnect failed after tts_done (unexpected)")
             return
 
         if isinstance(evt, SLVError):
