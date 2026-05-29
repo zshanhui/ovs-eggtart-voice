@@ -1,0 +1,66 @@
+# RK3588 on-device voice chat config.
+#
+# All three components run on the Rockchip NPU:
+#   OpenVoiceStream    :8621  ← ASR (Qwen3-ASR) + TTS (Matcha)
+#   RKLLM chat server  :8001  ← LLM (Qwen3-0.6B or 1.7B via RKLLM)
+#
+# Start the stack:
+#   docker compose -f deploy/docker-compose.radxa.yml up -d
+#
+# Then run the agent:
+#   ovs-agent run apps.rk3588-chat
+
+slv_url: "${OVS_SLV_URL:-ws://localhost:8621/v2v/stream}"
+
+slv_config:
+  asr_language: "auto"
+  tts_language: "zh"
+  tts_speaker_id: null
+  tts_speed: 1.0
+  sample_rate: 16000
+  vad: "silero"
+  vad_silence_ms: 400
+  multi_utterance: true
+
+# Client-side VAD (runs locally, avoids server round-trip for silencing).
+client_vad_backend: "silero"
+client_vad_speech_min_ms: 200
+client_vad_silence_ms: 600
+client_vad_drive_eos: true
+
+# ── LLM (RKLLM chat server) ────────────────────────────────────────────
+llm_backend: "openai_compat"
+llm_base_url: "${OVS_LLM_URL:-http://localhost:8001/v1}"
+llm_api_key: "${OVS_LLM_KEY:-EMPTY}"
+llm_model: "${OVS_LLM_MODEL:-qwen3-0.6b}"
+
+system_prompt: |
+  你是一个运行在瑞芯微芯片上的语音助手。请用简洁自然的中文回答，
+  控制在三句话以内，就像和朋友聊天一样。
+
+# Timeouts tuned for RK3588 (3 NPU cores, first token ~200ms cold, ~80ms warm).
+llm_first_token_timeout_s: 8.0
+llm_stream_idle_timeout_s: 30.0
+
+audio_input_device: null
+audio_output_device: null
+audio_input_sample_rate: 16000
+audio_output_sample_rate: 24000
+
+log_level: "INFO"
+default_mode: "chat"
+
+# Stop words (Chinese + English) — abort TTS when ASR matches.
+stop_words:
+  - "停"
+  - "停下"
+  - "停下来"
+  - "别说了"
+  - "闭嘴"
+  - "安静"
+  - "stop"
+  - "shut up"
+  - "be quiet"
+
+pipeline_mode: "always_on"
+sleep_timeout_s: 30.0

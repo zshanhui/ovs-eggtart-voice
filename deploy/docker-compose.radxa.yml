@@ -92,7 +92,7 @@ services:
       - ../services:/opt/speech/services:ro
     environment:
       # ── Model ──────────────────────────────────────────────────────
-      - RKLLM_MODEL_PATH=${RKLLM_MODEL_PATH:-/opt/models/rkllm/qwen3-0.6b.w8a8.rk3588.rkllm}
+      - RKLLM_MODEL_PATH=${RKLLM_MODEL_PATH:-/opt/models/rkllm/qwen3-0.6b.fp16.rk3588.rkllm}
       # "dummy" for testing without a real model; "real" when wired to librkllmrt.so
       - RKLLM_ENGINE=${RKLLM_ENGINE:-dummy}
       - RKLLM_SYSTEM_PROMPT=${RKLLM_SYSTEM_PROMPT:-You are a helpful assistant.}
