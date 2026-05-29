@@ -2,7 +2,7 @@
 #
 # All three components run on the Rockchip NPU:
 #   OpenVoiceStream    :8621  ← ASR (Qwen3-ASR) + TTS (Matcha)
-#   RKLLM chat server  :8001  ← LLM (Qwen3-0.6B or 1.8B via RKLLM)
+#   RKLLM chat server  :8001  ← LLM (Qwen3-0.6B or 1.7B via RKLLM)
 #
 # Start the stack:
 #   docker compose -f deploy/docker-compose.rk.yml up -d
