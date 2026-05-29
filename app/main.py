@@ -2660,6 +2660,15 @@ async def v2v_stream(ws: WebSocket):
                     msg = await ws.receive()
                     if msg.get("type") == "websocket.disconnect":
                         state["client_closed"] = True
+                        # Fast slot release: cancel the (possibly worker-blocked)
+                        # work tasks so the SessionLimiter slot frees within ~1s
+                        # instead of waiting up to OVS_ASR_TURN_TIMEOUT_S (45s)
+                        # for the per-turn deadline. asr_out_task's blocking
+                        # awaits (finalize / get_partial via run_in_executor) are
+                        # not shielded, so cancellation propagates immediately.
+                        for _wt in work_tasks:
+                            if not _wt.done():
+                                _wt.cancel()
                         break
                     # binary → ASR input
                     data = msg.get("bytes")
@@ -2816,7 +2825,12 @@ async def v2v_stream(ws: WebSocket):
                             state["asr_turn_started_at"] = None
             except WebSocketDisconnect:
                 state["client_closed"] = True
-    
+                # See websocket.disconnect branch above: cancel work tasks so
+                # the SessionLimiter slot releases fast on client disconnect.
+                for _wt in work_tasks:
+                    if not _wt.done():
+                        _wt.cancel()
+
         async def asr_out_task():
             """Drive partial polling + per-utterance finalize via the manager.
     
@@ -3245,7 +3259,16 @@ async def v2v_stream(ws: WebSocket):
         _v2v_server_error = False
         try:
             if work_tasks:
-                await asyncio.gather(*work_tasks, return_exceptions=False)
+                try:
+                    await asyncio.gather(*work_tasks, return_exceptions=False)
+                except asyncio.CancelledError:
+                    # Work tasks were cancelled by the dispatcher on client
+                    # disconnect (fast slot release) — not a server error and
+                    # not a cancellation of this handler. The finally below
+                    # still releases the SessionLimiter slot. Re-raise only if
+                    # THIS handler was genuinely cancelled (no client close).
+                    if not state["client_closed"]:
+                        raise
             else:
                 # No work tasks (shouldn't happen — config rejected earlier),
                 # just keep the dispatcher running until the client closes.

@@ -59,6 +59,36 @@ class Config:
     # utterance boundaries instead. Enable only if Paraformer endpoints
     # arrive too late or not at all for your audio.
     client_vad_drive_eos: bool = False
+
+    # ── continuous-dialogue mic-pump (server-VAD path, client_vad off) ──
+    # All OFF by default so existing deployments are unchanged. A solution
+    # tunes these in its agent.yaml for its specific mic / acoustics.
+    # energy_gate: substitute true-zero PCM for sub-threshold chunks so the
+    # server VAD sees clean silence between utterances and endpoints (else
+    # continuous room/echo audio never reaches speech_end → "silent mute").
+    energy_gate_enabled: bool = False
+    energy_gate_open_rms: float = 0.08        # >= open (raw RMS) → gate opens
+    energy_gate_close_rms: float = 0.05       # < close for hangover_ms → gate shuts
+    energy_gate_hangover_ms: float = 250.0    # bridge word-internal dips
+    # makeup_gain: linear gain on forwarded mic audio so a quiet mic reaches
+    # the server VAD/ASR's trained level range. 1.0 = no-op.
+    mic_makeup_gain: float = 1.0
+    # drive an explicit asr_eos on the gate's open→close edge so the server
+    # finalizes each utterance immediately instead of relying on its own VAD
+    # endpoint (which can wedge). Needs multi_utterance so the session stays
+    # open. Only fires after >= eos_min_speech_ms of real speech.
+    gate_drive_eos: bool = False
+    gate_eos_min_speech_ms: float = 250.0
+    # drop mic audio while the agent is SPEAKING/THINKING (its own TTS echo)
+    # so it can't open a server-VAD segment that never cleanly ends.
+    mic_drop_while_speaking: bool = False
+    # force a fresh SLV session (new ASR worker) on EVERY wake, not just on
+    # long idle. A single streaming-ASR worker can degrade after several
+    # utterances on one persistent multi_utterance session (returns empty
+    # finals); a per-wake reconnect makes the user's natural recovery
+    # action ("say the wake word again") actually fetch a healthy worker.
+    reconnect_on_wake: bool = False
+
     # Stop-intent recognition: when the ASR final exactly matches one of
     # these (after normalisation), abort current TTS, drop the turn, and
     # transition state→IDLE without consulting the LLM. Chinese strings

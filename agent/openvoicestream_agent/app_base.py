@@ -459,7 +459,11 @@ class BaseApp:
         # small and no reconnect fires — avoiding the 4429 limiter race.
         _idle_s = self.slv.seconds_since_activity()
         _healthy = self.slv.is_healthy()
-        should_reconnect = (not _healthy) or _idle_s > 30.0
+        # reconnect_on_wake: a single streaming-ASR worker can degrade after
+        # several utterances on one persistent session (empty finals); force
+        # a fresh worker on every wake so re-saying the wake word recovers.
+        _force_wake_reconnect = bool(getattr(self.config, "reconnect_on_wake", False))
+        should_reconnect = _force_wake_reconnect or (not _healthy) or _idle_s > 30.0
         if should_reconnect:
             try:
                 await asyncio.wait_for(self.slv.reconnect(), timeout=6.0)
@@ -933,13 +937,44 @@ class BaseApp:
             # chunk at chunk_ms=100, every 4th at chunk_ms=50).
             rms_broadcast_every = max(1, 200 // max(chunk_ms, 1))
             rms_chunk_counter = 0
+            # ── continuous-dialogue mic-pump enhancements (opt-in via config) ──
+            # All default OFF so existing deployments are unchanged; a solution
+            # tunes these in its agent.yaml for its specific mic / acoustics.
+            gate_enabled = bool(getattr(self.config, "energy_gate_enabled", False))
+            gate_open = float(getattr(self.config, "energy_gate_open_rms", 0.08))
+            gate_close = float(getattr(self.config, "energy_gate_close_rms", 0.05))
+            gate_hangover_ms = float(getattr(self.config, "energy_gate_hangover_ms", 250.0))
+            makeup_gain = float(getattr(self.config, "mic_makeup_gain", 1.0))
+            drive_eos = bool(getattr(self.config, "gate_drive_eos", False))
+            eos_min_speech_ms = float(getattr(self.config, "gate_eos_min_speech_ms", 250.0))
+            drop_while_speaking = bool(getattr(self.config, "mic_drop_while_speaking", False))
+            need_rms = gate_enabled or makeup_gain != 1.0
+            _gate_open_state = False
+            _gate_opened_at = 0.0
+            _gate_last_loud_ts = 0.0
+            _gate_zeros: bytes | None = None
+            if gate_enabled or makeup_gain != 1.0 or drop_while_speaking:
+                logger.info(
+                    "mic-pump enhancements: gate=%s open=%.4f close=%.4f hangover=%.0fms "
+                    "makeup_gain=%.1f drive_eos=%s drop_while_speaking=%s",
+                    gate_enabled, gate_open, gate_close, gate_hangover_ms,
+                    makeup_gain, drive_eos, drop_while_speaking,
+                )
             async for chunk in self.audio.start_capture():
                 self._last_mic_chunk_ts = time.monotonic()
                 # pipeline_mode gating: drop audio entirely while SLEEPING.
                 # WS stays connected so wake-time reconnect cost is zero.
-                if getattr(self, "_state", ConvState.IDLE) == ConvState.SLEEPING:
-                    # Also clear pre-roll so we don't leak pre-sleep audio
-                    # into the next wake's first utterance.
+                # When mic_drop_while_speaking is set, also drop during
+                # SPEAKING/THINKING (echo gate): the mic captures our own TTS
+                # echo, and forwarding it opens a server-VAD segment that never
+                # cleanly ends → wedges the continuous-dialogue loop.
+                _st = getattr(self, "_state", ConvState.IDLE)
+                if _st == ConvState.SLEEPING or (
+                    drop_while_speaking
+                    and _st in (ConvState.SPEAKING, ConvState.THINKING)
+                ):
+                    # Also clear pre-roll so we don't leak pre-sleep / TTS-echo
+                    # audio into the next user utterance.
                     preroll.clear()
                     continue
                 # Race #3: while SLV is reconnecting, drop chunks and
@@ -951,24 +986,27 @@ class BaseApp:
                 if callable(is_reconn) and is_reconn():
                     preroll.clear()
                     continue
-                # Per-chunk mic RMS for the dashboard. Rate-limited so a
-                # slow WS client doesn't backpressure the mic queue and
-                # starve VAD (which kills barge-in detection during TTS).
+                # Per-chunk mic RMS. The energy gate / makeup gain need it
+                # EVERY chunk; otherwise it's only needed for the rate-limited
+                # dashboard broadcast (a slow WS client must not backpressure
+                # the mic queue and starve VAD → barge-in during TTS).
+                rms = 0.0
+                if need_rms:
+                    try:
+                        _arr = _np.frombuffer(chunk, dtype=_np.int16)
+                        rms = float(_np.sqrt(_np.mean((_arr.astype(_np.float32) / 32768.0) ** 2))) if _arr.size else 0.0
+                    except Exception:  # pragma: no cover - defensive
+                        rms = 0.0
                 rms_chunk_counter = (rms_chunk_counter + 1) % rms_broadcast_every
                 if rms_chunk_counter == 0:
                     try:
-                        arr = _np.frombuffer(chunk, dtype=_np.int16)
-                        if arr.size:
-                            rms = float(_np.sqrt(_np.mean((arr.astype(_np.float32) / 32768.0) ** 2)))
-                        else:
-                            rms = 0.0
+                        if not need_rms:
+                            _arr = _np.frombuffer(chunk, dtype=_np.int16)
+                            rms = float(_np.sqrt(_np.mean((_arr.astype(_np.float32) / 32768.0) ** 2))) if _arr.size else 0.0
                         thr = float(getattr(self.config, "client_vad_threshold", None) or 0.012)
                         self._schedule_mic_rms_broadcast(
                             {"rms": rms, "threshold": thr, "state": self._vad_state}
                         )
-                        # TEMP DIAGNOSTIC: log loud chunks so we can see
-                        # whether mic is even picking up user speech post-TTS.
-                        # 0.03 ≈ ordinary indoor voice at 30cm; <0.01 is silence.
                         if rms > 0.03:
                             logger.info(
                                 "mic chunk loud: rms=%.4f state=%s convstate=%s",
@@ -979,8 +1017,44 @@ class BaseApp:
                         pass
 
                 if self._client_vad is None:
-                    # No VAD configured: stream everything (legacy behaviour).
-                    await self._send_audio_nonblocking(chunk)
+                    # No client VAD: forward raw audio so the SERVER VAD
+                    # segments + finalizes (preserves Qwen3 unbroken framing).
+                    # Optional, all opt-in: energy gate (zero-fill gaps → clean
+                    # silence so the server endpoints), makeup gain (quiet mic →
+                    # the VAD/ASR trained range), and client-driven asr_eos on
+                    # the gate's open→close edge (server finalizes immediately
+                    # instead of relying on its own VAD endpoint, which wedges).
+                    out_chunk = chunk
+                    now_mono = time.monotonic()
+                    if gate_enabled:
+                        if rms >= gate_open:
+                            if not _gate_open_state:
+                                _gate_opened_at = now_mono
+                            _gate_open_state = True
+                            _gate_last_loud_ts = now_mono
+                        elif rms < gate_close:
+                            if (now_mono - _gate_last_loud_ts) * 1000.0 >= gate_hangover_ms:
+                                if _gate_open_state and drive_eos and (
+                                    (_gate_last_loud_ts - _gate_opened_at) * 1000.0 >= eos_min_speech_ms
+                                ):
+                                    # open→close edge after real speech: force
+                                    # the server to finalize this utterance now.
+                                    try:
+                                        await self.send_asr_eos_once()
+                                    except Exception:
+                                        logger.exception("gate-edge asr_eos failed")
+                                _gate_open_state = False
+                        if not _gate_open_state:
+                            if _gate_zeros is None or len(_gate_zeros) != len(chunk):
+                                _gate_zeros = b"\x00" * len(chunk)
+                            out_chunk = _gate_zeros
+                    if makeup_gain != 1.0 and out_chunk is not _gate_zeros and len(out_chunk):
+                        try:
+                            _g = _np.frombuffer(out_chunk, dtype=_np.int16).astype(_np.float32) * makeup_gain
+                            out_chunk = _np.clip(_g, -32768.0, 32767.0).astype(_np.int16).tobytes()
+                        except Exception:  # pragma: no cover - defensive
+                            pass
+                    await self._send_audio_nonblocking(out_chunk)
                     continue
 
                 # Update VAD first; it may transition idle→speech this chunk.
