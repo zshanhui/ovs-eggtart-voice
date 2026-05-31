@@ -85,6 +85,7 @@ RUN pip install --no-cache-dir --index-url ${PIP_INDEX} \
 # ── Application code ──────────────────────────────────────────────────
 
 COPY app/                          /opt/speech/app/
+COPY services/                     /opt/speech/services/
 COPY configs/                      /opt/speech/configs/
 COPY deploy/artifacts/             /opt/speech/deploy/artifacts/
 COPY voices/                       /opt/speech/voices/

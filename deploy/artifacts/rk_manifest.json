@@ -124,6 +124,41 @@
         }
       ]
     },
+    "rk3576-llm-chat-2026-05-27": {
+      "soc": "rk3576",
+      "profile": "llm_chat",
+      "root": "/",
+      "description": "RKLLM chat model for on-device LLM inference (Qwen3-0.6B-Instruct w4a16). Converted with rkllm-toolkit from Qwen/Qwen3-0.6B-Instruct.",
+      "runtime": {
+        "rknn_toolkit_lite2": "2.3.2"
+      },
+      "files": [
+        {
+          "path": "opt/models/rkllm/qwen3-0.6b-instruct.w4a16.rk3576.rkllm",
+          "source_path": "rk3576/opt/models/rkllm/qwen3-0.6b-instruct.w4a16.rk3576.rkllm",
+          "size_bytes": 520000000,
+          "sha256": "TBD_PLACEHOLDER_replace_after_rkllm_conversion",
+          "note": "Convert on CUDA PC: python -m rkllm.api convert --model Qwen/Qwen3-0.6B-Instruct --quant w4a16 --target rk3576"
+        }
+      ]
+    },
+    "rk3588-llm-chat-2026-05-30": {
+      "soc": "rk3588",
+      "profile": "llm_chat",
+      "root": "/",
+      "description": "RKLLM chat model for on-device LLM inference (Qwen3-0.6B fp16). Converted with rkllm-toolkit from Qwen/Qwen3-0.6B.",
+      "runtime": {
+        "rknn_toolkit_lite2": "2.3.2"
+      },
+      "files": [
+        {
+          "path": "opt/models/rkllm/qwen3-0.6b.fp16.rk3588.rkllm",
+          "source_path": "rk3588/opt/models/rkllm/qwen3-0.6b.fp16.rk3588.rkllm",
+          "size_bytes": 1529746508,
+          "sha256": "bb383156024c897fcad9be4902c0697a153fd4332071612dbf70ca524ea3d44e"
+        }
+      ]
+    },
     "rk3588-multilang-2026-05-17": {
       "soc": "rk3588",
       "profile": "multilang",

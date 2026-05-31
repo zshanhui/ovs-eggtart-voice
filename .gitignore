@@ -46,5 +46,7 @@ tests/asr_real_wav_eval/librispeech/
 artifacts/engines/
 artifacts/onnx/
 
+*.rkllm
+
 # Local Claude Code session state (settings, worktrees, lock files)
 .claude/
