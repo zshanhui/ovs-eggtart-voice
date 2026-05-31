@@ -242,15 +242,15 @@ class _RKASRStreamAdapter(ASRStream):
         self._chunks.append(samples)
         inner.accept_waveform(sample_rate, samples)
 
-    def finalize(self) -> str:
+    def finalize(self):
         inner = self._live_inner()
         if not self._chunks:
-            return inner.finalize() or ""
+            return (inner.finalize() or ""), None
         audio = np.concatenate(self._chunks)
         dur_s = len(audio) / max(self._sample_rate, 1)
         if dur_s <= _LONG_AUDIO_THRESHOLD_S:
             text = inner.finalize() or ""
-            return _clean_segment_text(text)
+            return _clean_segment_text(text), None
 
         # Long path: segment + per-segment offline transcribe via inner.
         audio = _resample_to_16k(audio, self._sample_rate)
@@ -288,7 +288,7 @@ class _RKASRStreamAdapter(ASRStream):
         # Discard the inner's sliding-window result entirely — it's the
         # poisoned snowball. Some inners need their state torn down; trust
         # the GC and a fresh stream next call.
-        return _join_segments(texts, self._language)
+        return _join_segments(texts, self._language), None
 
     def prepare_finalize(self) -> None:
         self._live_inner().prepare_finalize()
@@ -317,6 +317,23 @@ class RKASRBackend(ASRBackend):
     Backend selection is delegated to rkvoice-stream itself via the
     ``ASR_BACKEND`` env var (set in the rk3576/rk3588 profile).
     """
+
+    @classmethod
+    def concurrency_capability(cls, profile=None):
+        """Declare concurrency for RK NPU ASR.
+
+        Spec §1 sample row "RK ASR/TTS": rkvoice-stream owns the NPU
+        lifecycle (see ``app/backends/rk/asr.py:380`` hot-reload note)
+        and runs single-session. NPU is an exclusive device.
+        """
+        from app.core.concurrency_capability import ConcurrencyCapability
+        return ConcurrencyCapability(
+            supports_parallel=False,
+            max_concurrent=1,
+            is_stateful=True,
+            requires_exclusive_device=True,
+            scaling_mode="external_managed",
+        )
 
     def __init__(self):
         from rkvoice_stream import create_asr

@@ -64,6 +64,8 @@ class _FakeSLV:
 class _FakeAudio:
     """Yields pre-canned mic chunks then halts."""
 
+    is_playing = False
+
     def __init__(self, chunks: list[bytes], chunk_ms: int = 100) -> None:
         self._chunks = chunks
         self.chunk_ms = chunk_ms
@@ -121,6 +123,14 @@ async def test_mic_pump_fires_asr_eos_on_speech_end() -> None:
     app._vad_speech_ms = 0
     app._vad_silence_ms = 0
     app._vad_eos_sent = False
+    app._eos_sent_this_turn = False
+    app._asr_watchdog_task = None
+    app._thinking_watchdog_task = None
+    app._mic_rms_broadcast_task = None
+    app._state = __import__("openvoicestream_agent.state", fromlist=["ConvState"]).ConvState.IDLE
+    app.events = __import__("openvoicestream_agent.event_bus", fromlist=["EventBus"]).EventBus()
+    app.plugins = []
+    app._last_mic_chunk_ts = 0.0
 
     await app._mic_pump()
 

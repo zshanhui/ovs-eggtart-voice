@@ -61,7 +61,8 @@ class _FakeStream:
 
     def finalize(self):
         self.finalized = True
-        return self._backend._next_final_text()
+        # New ASRStream ABC contract: ``(text, detected_language)``.
+        return self._backend._next_final_text(), None
 
     def cancel(self):
         pass

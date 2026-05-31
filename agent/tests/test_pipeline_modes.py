@@ -59,6 +59,12 @@ def _fresh_app(pipeline_mode: str = "always_on", sleep_timeout_s: float = 30.0) 
     slv = MagicMock()
     slv.abort = AsyncMock()
     slv.asr_eos = AsyncMock()
+    slv.reconnect = AsyncMock()
+    slv.is_healthy = MagicMock(return_value=True)
+    # Default: just had activity → no idle-based reconnect on wake.
+    slv.seconds_since_activity = MagicMock(return_value=0.0)
+    slv._ws = object()  # truthy placeholder used by wake() log line
+    slv._reader_task = None
     app.slv = slv
     audio = MagicMock()
     audio.stop_playback = AsyncMock()
@@ -276,3 +282,80 @@ async def test_shutdown_cancels_pending_sleep_task():
     await app.shutdown()
     assert task_ref.cancelled() or task_ref.done()
     assert app._sleep_task is None
+
+
+# ── wake-time SLV health gate (cures the mute bug) ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_wake_calls_reconnect_when_slv_unhealthy():
+    """Wake on a dead SLV → reconnect is attempted before LISTEN state."""
+    app = _fresh_app("wake_word", sleep_timeout_s=999)
+    app.slv.is_healthy = MagicMock(return_value=False)
+    app.slv.reconnect = AsyncMock()
+
+    await app.wake(source="test")
+
+    app.slv.reconnect.assert_awaited_once()
+    assert app._state == ConvState.IDLE
+    if app._sleep_task is not None:
+        app._sleep_task.cancel()
+        try:
+            await app._sleep_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_wake_stays_sleeping_when_reconnect_fails():
+    """Wake refuses to transition if SLV reconnect raises — no silent mute."""
+    from openvoicestream_agent.slv_client import SLVReconnectError
+
+    app = _fresh_app("wake_word", sleep_timeout_s=999)
+    app.slv.is_healthy = MagicMock(return_value=False)
+    app.slv.reconnect = AsyncMock(side_effect=SLVReconnectError("limiter race"))
+
+    wake_failed_events: list = []
+
+    async def _capture(event_name, payload=None):
+        if event_name == "on_wake_failed":
+            wake_failed_events.append(payload)
+
+    app._broadcast = _capture  # type: ignore[assignment]
+
+    await app.wake(source="test")
+
+    assert app._state == ConvState.SLEEPING, "must stay SLEEPING after reconnect failure"
+    assert len(wake_failed_events) == 1
+    assert wake_failed_events[0]["reason"] == "slv_unhealthy"
+
+
+@pytest.mark.asyncio
+async def test_wake_skips_reconnect_when_healthy():
+    """Happy path: healthy SLV → no reconnect call, normal IDLE transition."""
+    app = _fresh_app("wake_word", sleep_timeout_s=999)
+    app.slv.is_healthy = MagicMock(return_value=True)
+    app.slv.reconnect = AsyncMock()
+
+    await app.wake(source="test")
+
+    app.slv.reconnect.assert_not_awaited()
+    assert app._state == ConvState.IDLE
+    if app._sleep_task is not None:
+        app._sleep_task.cancel()
+        try:
+            await app._sleep_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_wake_stays_sleeping_when_reconnect_times_out():
+    """asyncio.TimeoutError on reconnect → stay SLEEPING."""
+    app = _fresh_app("wake_word", sleep_timeout_s=999)
+    app.slv.is_healthy = MagicMock(return_value=False)
+    app.slv.reconnect = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    await app.wake(source="test")
+
+    assert app._state == ConvState.SLEEPING

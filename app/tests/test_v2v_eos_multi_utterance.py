@@ -88,10 +88,11 @@ class _FakeStream:
         # (and VAD speech-end in the unit-harness half of scenario 3).
         return "", False
 
-    def finalize(self) -> str:
+    def finalize(self):
         self.finalized = True
         text = self._backend._next_final_text()
-        return text
+        # ASRStream finalize ABC now returns ``(text, detected_language)``.
+        return text, None
 
     def cancel(self) -> None:
         self.cancelled = True

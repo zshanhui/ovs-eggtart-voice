@@ -43,7 +43,8 @@ class _Stream:
         if self.delay:
             time.sleep(self.delay)
         self.finalized = True
-        return self.final
+        # New ASRStream ABC contract: ``(text, detected_language)``.
+        return self.final, None
 
     def cancel(self):
         self.cancelled = True

@@ -54,6 +54,11 @@ from .llm import EdgeLLMBackend, LLMBackend, LLMStreamError, OpenAICompatBackend
 from .plugins.llm_availability import LLMUnavailable
 from .session import Session
 from .state import ConvState
+# Importing .tools also imports .tools.builtin which @-decorates the
+# built-in tools onto default_registry as an import side-effect. Cheap
+# (no IO, no model load) so we pay it unconditionally — actual use is
+# gated by config.tools_enabled per turn in app_mode.
+from .tools import default_registry as _default_tool_registry
 from .translator import CTranslate2Translator, NoopTranslator, TranslatorBackend
 from .vad import create_vad
 from .slv_client import (
@@ -62,6 +67,7 @@ from .slv_client import (
     ASRPartial,
     SLVClient,
     SLVError,
+    SLVReconnectError,
     TTSAudio,
     TTSDone,
     TTSSentenceDone,
@@ -159,6 +165,9 @@ class BaseApp:
         )
         self.llm: LLMBackend = _build_llm(config)
         self.translator: TranslatorBackend = _build_translator(config)
+        # Tool registry — single global default. Tests may construct
+        # dedicated `ToolRegistry()` instances and inject via mode_ctx.
+        self.tool_registry = _default_tool_registry
         self.session = Session(
             locale=str(config.slv_config.get("asr_language", "zh")).lower()[:2],
             max_input_tokens=getattr(config, "session_max_input_tokens", None),
@@ -228,12 +237,106 @@ class BaseApp:
         # on mic noise. Started in send_asr_eos_once, cancelled in the
         # ASRFinal / SLVError / reconnect paths.
         self._asr_watchdog_task: asyncio.Task | None = None
+        # Watchdog: SLV in jetson-qwen3asr-matcha-nx (and possibly others)
+        # can silently fail to produce TTS after a successful asr_final →
+        # tool_call → text-stream → tts_flush sequence. State stays
+        # THINKING forever waiting for tts_started that never arrives.
+        # Armed when we transition into THINKING; cancelled by the first
+        # TTSStarted / TTSDone / ASRFinal (real activity) or SLVError.
+        # On fire, force state back to IDLE so the next user turn isn't
+        # blocked. Configurable via ``thinking_timeout_s`` (default 20s).
+        self._thinking_watchdog_task: asyncio.Task | None = None
         # Dashboard mic RMS is a best-effort visualization signal. Never let
         # a slow browser/plugin backpressure the hot mic pump; at most one
         # RMS hook fanout may be in flight and newer samples are dropped.
         self._mic_rms_broadcast_task: asyncio.Task | None = None
         # Rate-limited stop-word matcher cache (compiled per Config update).
         self._stop_words_cache: tuple[list[str], list[str]] | None = None
+
+    # ── startup budget validation ───────────────────────────────────
+
+    @staticmethod
+    def _approx_tokens(text: str) -> int:
+        """Cheap upper-bound token estimate without loading a tokenizer.
+
+        ``len(text) // 3`` is a conservative bound: Chinese chars ≈ 0.4
+        token, English chars ≈ 0.25 token; 1/3 sits above both. Used
+        only for startup sanity-check logging, not for trim accounting.
+        """
+        if not text:
+            return 0
+        return max(1, len(text) // 3)
+
+    @classmethod
+    def _approx_tokens_for_tools(cls, tools: list[dict] | None) -> int:
+        if not tools:
+            return 0
+        try:
+            import json as _json
+            return cls._approx_tokens(_json.dumps(tools, ensure_ascii=False))
+        except Exception:
+            return 0
+
+    # Minimum history headroom we want to leave after the fixed prefix
+    # before we ERROR. Anything below this means even a single user turn
+    # may overflow ``session_max_input_tokens``.
+    _MIN_HISTORY_HEADROOM = 1000
+
+    def _validate_session_budget(
+        self, system_prompt: str, tools: list[dict] | None
+    ) -> None:
+        """Sanity-check session_max_input_tokens vs the fixed prefix.
+
+        A1-step2 semantics: ``Session._trim_to_budget`` only counts
+        dynamic turns (user/assistant/tool) against
+        ``session_max_input_tokens * 0.75``. The fixed prefix
+        (system_prompt + tools schema) is NOT in the trim budget but
+        IS still charged against the engine ``max_seq_len`` on every
+        request. This validator therefore checks whether the fixed
+        prefix leaves enough room inside ``session_max_input_tokens``
+        for a reasonable history window.
+        """
+        max_input = getattr(self.config, "session_max_input_tokens", None)
+        if not max_input:
+            logger.info(
+                "Session trim disabled (session_max_input_tokens=None); "
+                "skipping budget validation"
+            )
+            return
+        sys_tokens = self._approx_tokens(system_prompt or "")
+        tools_tokens = self._approx_tokens_for_tools(tools)
+        fixed_tokens = sys_tokens + tools_tokens
+        history_headroom = max_input - fixed_tokens
+        pct = (fixed_tokens / max_input * 100) if max_input else 0.0
+        if history_headroom < self._MIN_HISTORY_HEADROOM:
+            recommended = fixed_tokens + 2 * self._MIN_HISTORY_HEADROOM
+            logger.error(
+                "FIXED PREFIX (system_prompt %d + tools %d = %d tokens) leaves "
+                "only %d tokens of history headroom inside "
+                "session_max_input_tokens=%d (need >=%d). Even a single user "
+                "turn may overflow. Raise session_max_input_tokens to at "
+                "least %d.",
+                sys_tokens, tools_tokens, fixed_tokens, history_headroom,
+                max_input, self._MIN_HISTORY_HEADROOM, recommended,
+            )
+        elif fixed_tokens > max_input * 0.6:
+            logger.warning(
+                "Fixed prefix uses %.0f%% of session_max_input_tokens "
+                "(%d / %d tokens, system=%d tools=%d). Trim only counts "
+                "dynamic turns so behaviour is OK, but history headroom "
+                "(%d tokens) is tight. Consider raising "
+                "session_max_input_tokens.",
+                pct, fixed_tokens, max_input, sys_tokens, tools_tokens,
+                history_headroom,
+            )
+        else:
+            logger.info(
+                "Session budget OK: fixed prefix %d tokens (system=%d "
+                "tools=%d), history headroom %d, max_input=%d. Trim budget "
+                "(history only) = %d.",
+                fixed_tokens, sys_tokens, tools_tokens, history_headroom,
+                max_input, int(max_input * 0.75),
+            )
 
     # ── v2: state machine + stop intent ─────────────────────────────
 
@@ -316,10 +419,87 @@ class BaseApp:
         """Transition SLEEPING → IDLE and (re-)arm the sleep timer.
 
         No-op if not currently SLEEPING. Broadcasts on_wake with source.
+
+        SLV stream health is verified before the state transition. The
+        previous turn's proactive ``slv.reconnect()`` (on tts_done) can
+        fail-silently: ``_open_with_retry`` may exhaust its backoff
+        budget while ``send_audio`` / dispatch loop never observe the
+        failure because the timeout is shorter than the retry window
+        (``send_audio`` waits 0.5s, retry budget is up to ~1.75s + 3
+        round-trips). Result was a dead stream with ``_ws=None`` that
+        silently swallowed every post-wake mic chunk — the "mute bug".
+
+        We now health-check on wake, attempt a single reconnect if dead,
+        and *refuse the wake* (stay SLEEPING) if even that fails. Better
+        to make the silence visible (log + on_wake_failed broadcast)
+        than to pretend everything is fine and have the user repeat
+        themselves into the void.
         """
         if getattr(self, "_state", ConvState.IDLE) != ConvState.SLEEPING:
             return
         logger.info("wake from %s", source)
+        # Health-gated reconnect on wake. SLV server v1.15+ added an ASR
+        # turn wall-clock timeout (SessionLimiter slot is force-released
+        # even when the Qwen3-ASR worker wedges), so the previous
+        # "always reconnect on wake" workaround is no longer needed —
+        # and was actively causing 4429 too_many_sessions because the
+        # new WS races the just-released slot. Only reconnect when
+        # is_healthy() reports the current WS is actually dead
+        # (ws missing or reader task exited). Healthy WS persists
+        # across multiple turns (correct per SLV multi_utterance
+        # protocol where session_complete=False).
+        # Idle-based reconnect: TCP-alive WS doesn't guarantee SLV's ASR
+        # session is still alive — after long idle (>30s) the server may
+        # have internally recycled the session, in which case is_healthy()
+        # returns True but mic data flows into a dead ASR worker (silent
+        # mute bug, observed 2026-05-26 after tts_done→wake at +4min).
+        # Force a reconnect on long idle to refresh the ASR session.
+        # Hot-turn case (continuous dialogue) stays cheap: activity is
+        # touched on every WS recv/send so seconds_since_activity stays
+        # small and no reconnect fires — avoiding the 4429 limiter race.
+        _idle_s = self.slv.seconds_since_activity()
+        _healthy = self.slv.is_healthy()
+        # reconnect_on_wake: a single streaming-ASR worker can degrade after
+        # several utterances on one persistent session (empty finals); force
+        # a fresh worker on every wake so re-saying the wake word recovers.
+        _force_wake_reconnect = bool(getattr(self.config, "reconnect_on_wake", False))
+        should_reconnect = _force_wake_reconnect or (not _healthy) or _idle_s > 30.0
+        if should_reconnect:
+            try:
+                await asyncio.wait_for(self.slv.reconnect(), timeout=6.0)
+                self._slv_reconnect_count = getattr(self, "_slv_reconnect_count", 0) + 1
+                logger.info(
+                    "wake: SLV reconnect (healthy=%s idle=%.1fs count=%d)",
+                    _healthy, _idle_s, self._slv_reconnect_count,
+                )
+                try:
+                    await self._broadcast(
+                        "on_slv_reconnect",
+                        {"count": self._slv_reconnect_count},
+                    )
+                except Exception:
+                    logger.exception("on_slv_reconnect broadcast failed (wake)")
+            except (SLVReconnectError, asyncio.TimeoutError, ConnectionError) as e:
+                logger.error(
+                    "wake: SLV reconnect failed (%s); staying SLEEPING to avoid silent mute",
+                    e,
+                )
+                try:
+                    await self._broadcast(
+                        "on_wake_failed",
+                        {"source": source, "reason": "slv_unhealthy"},
+                    )
+                except Exception:
+                    logger.exception("on_wake_failed broadcast failed")
+                # Do NOT transition to IDLE — caller (wake_source / dashboard)
+                # observes that we are still SLEEPING and can surface the
+                # failure to the user.
+                return
+            except Exception:
+                logger.exception(
+                    "wake: SLV reconnect raised unexpected error; staying SLEEPING"
+                )
+                return
         try:
             await self._broadcast("on_wake", {"source": source})
         except Exception:
@@ -399,8 +579,16 @@ class BaseApp:
         self.plugins.append(plugin)
         return True
 
-    async def on_user_utterance(self, text: str) -> None:
-        """Subclasses MUST override. Default raises."""
+    async def on_user_utterance(
+        self, text: str, detected_language: str | None = None
+    ) -> None:
+        """Subclasses MUST override. Default raises.
+
+        ``detected_language`` is the ASR-reported language for this turn
+        (e.g. ``"Chinese"``) or ``None`` if the backend doesn't do LID.
+        Passed per-call so mode lifecycle hooks (enter/exit) never see a
+        stale value.
+        """
         raise NotImplementedError("Subclass BaseApp and implement on_user_utterance")
 
     async def run(self) -> None:
@@ -420,6 +608,95 @@ class BaseApp:
             self._mic_watchdog(), name="mic-watchdog"
         )
         self._dispatch_task = asyncio.create_task(self._slv_dispatch(), name="slv-dispatch")
+
+        # LLM backend warmup — runs after all plugins have registered
+        # (so tool_registry is fully populated) and BEFORE any plugin
+        # start() so the very first user turn never pays cold-start
+        # cost. EdgeLLMBackend warms both the prefix KV cache and the
+        # TRT-LLM CUDA graph; other backends inherit the default no-op.
+        try:
+            tools_payload = None
+            registry = getattr(self, "tool_registry", None)
+            if registry is not None and hasattr(registry, "list_openai_tools"):
+                try:
+                    tools_payload = registry.list_openai_tools(allow=None) or None
+                except Exception:
+                    logger.debug("warmup: tool_registry lookup failed", exc_info=True)
+                    tools_payload = None
+            sys_prompt = ""
+            try:
+                overrides = getattr(self.config, "mode_overrides", {}) or {}
+                mode_cfg = overrides.get("chat") if isinstance(overrides, dict) else None
+                if isinstance(mode_cfg, dict):
+                    sys_prompt = mode_cfg.get("system_prompt") or ""
+            except Exception:
+                pass
+            if not sys_prompt:
+                sys_prompt = getattr(self.config, "system_prompt", "") or ""
+            # Validate session budget BEFORE warmup. If the fixed prefix
+            # (system_prompt + tools schema) is too close to the trim
+            # threshold, every turn will trim → cache_warmed cleared →
+            # KV-cache hot path defeated. Logs ERROR if misconfigured,
+            # WARNING if tight, INFO if healthy.
+            self._validate_session_budget(sys_prompt, tools_payload)
+            warmup_result = await self.llm.warmup(
+                system_prompt=sys_prompt,
+                tools=tools_payload,
+                enable_thinking=False,
+            )
+            if warmup_result:
+                logger.info("LLM backend warmup result: %s", warmup_result)
+                if self.session is not None:
+                    if warmup_result.get("cache_warmed"):
+                        self.session.prefix_cache_warmed = True
+                        logger.info(
+                            "session.prefix_cache_warmed=True after backend "
+                            "warmup; first turn will use prefix_cache"
+                        )
+                    if warmup_result.get("graph_warmed"):
+                        self.session.graph_warmed = True
+                # Partial warmup hint (Plan D item 7): prefix is hot but
+                # graph isn't — first tool_call decode may still pay JIT
+                # / CUDA-graph capture cost. Surface so operators can
+                # diagnose unexpected first-turn latency.
+                if (
+                    warmup_result.get("cache_warmed")
+                    and not warmup_result.get("graph_warmed")
+                ):
+                    logger.info(
+                        "partial warmup: prefix cached but engine graph "
+                        "not warmed; first tool_call decode may be slow"
+                    )
+                # Plan D item 4: validate session_max_input_tokens vs
+                # observed engine max_seq_len (when available).
+                engine_max = warmup_result.get("engine_max_seq_len")
+                cfg_max = getattr(self.config, "session_max_input_tokens", None)
+                if isinstance(engine_max, int) and isinstance(cfg_max, int):
+                    if cfg_max > engine_max - 1000:
+                        logger.warning(
+                            "session budget tight: session_max_input_tokens=%d "
+                            "is within 1000 of engine max_seq_len=%d. After "
+                            "trim+output the request may still hit the engine "
+                            "ceiling. Consider lowering to ~%d.",
+                            cfg_max, engine_max, max(1024, engine_max - 1500),
+                        )
+                    elif cfg_max < engine_max // 2:
+                        logger.info(
+                            "session budget conservative: "
+                            "session_max_input_tokens=%d is <50%% of engine "
+                            "max_seq_len=%d. You could raise it for longer "
+                            "conversation history (user config takes priority "
+                            "— not auto-adjusting).",
+                            cfg_max, engine_max,
+                        )
+                    else:
+                        logger.info(
+                            "session budget OK vs engine: "
+                            "session_max_input_tokens=%d, engine_max_seq_len=%d",
+                            cfg_max, engine_max,
+                        )
+        except Exception:
+            logger.warning("LLM warmup failed; first turn may be cold", exc_info=True)
 
         for p in self.plugins:
             try:
@@ -600,8 +877,17 @@ class BaseApp:
         chunks. Pre-roll is still preserved for the *current* speech
         segment whose onset already won the VAD race.
         """
+        # Race #3 fast path: while SLV is actively reconnecting, skip the
+        # send_lock entirely — otherwise every mic chunk queues behind the
+        # reconnect's grace+_open_with_retry chain (~50-2000ms), the 0.5s
+        # ceiling was too tight (false-positive drop log floods) and 2.0s
+        # is still too long if a hundred chunks pile up.
+        is_reconn = getattr(self.slv, "is_reconnecting", None)
+        if callable(is_reconn) and is_reconn():
+            logger.debug("send_audio skipped (slv reconnecting)")
+            return
         try:
-            await asyncio.wait_for(self.slv.send_audio(pcm), timeout=0.5)
+            await asyncio.wait_for(self.slv.send_audio(pcm), timeout=2.0)
         except asyncio.TimeoutError:
             # SLV is mid-reconnect / unreachable; don't wedge the mic pump.
             # Logged at debug to avoid floods during normal reconnect blips.
@@ -651,36 +937,124 @@ class BaseApp:
             # chunk at chunk_ms=100, every 4th at chunk_ms=50).
             rms_broadcast_every = max(1, 200 // max(chunk_ms, 1))
             rms_chunk_counter = 0
+            # ── continuous-dialogue mic-pump enhancements (opt-in via config) ──
+            # All default OFF so existing deployments are unchanged; a solution
+            # tunes these in its agent.yaml for its specific mic / acoustics.
+            gate_enabled = bool(getattr(self.config, "energy_gate_enabled", False))
+            gate_open = float(getattr(self.config, "energy_gate_open_rms", 0.08))
+            gate_close = float(getattr(self.config, "energy_gate_close_rms", 0.05))
+            gate_hangover_ms = float(getattr(self.config, "energy_gate_hangover_ms", 250.0))
+            makeup_gain = float(getattr(self.config, "mic_makeup_gain", 1.0))
+            drive_eos = bool(getattr(self.config, "gate_drive_eos", False))
+            eos_min_speech_ms = float(getattr(self.config, "gate_eos_min_speech_ms", 250.0))
+            drop_while_speaking = bool(getattr(self.config, "mic_drop_while_speaking", False))
+            need_rms = gate_enabled or makeup_gain != 1.0
+            _gate_open_state = False
+            _gate_opened_at = 0.0
+            _gate_last_loud_ts = 0.0
+            _gate_zeros: bytes | None = None
+            if gate_enabled or makeup_gain != 1.0 or drop_while_speaking:
+                logger.info(
+                    "mic-pump enhancements: gate=%s open=%.4f close=%.4f hangover=%.0fms "
+                    "makeup_gain=%.1f drive_eos=%s drop_while_speaking=%s",
+                    gate_enabled, gate_open, gate_close, gate_hangover_ms,
+                    makeup_gain, drive_eos, drop_while_speaking,
+                )
             async for chunk in self.audio.start_capture():
                 self._last_mic_chunk_ts = time.monotonic()
                 # pipeline_mode gating: drop audio entirely while SLEEPING.
                 # WS stays connected so wake-time reconnect cost is zero.
-                if getattr(self, "_state", ConvState.IDLE) == ConvState.SLEEPING:
-                    # Also clear pre-roll so we don't leak pre-sleep audio
-                    # into the next wake's first utterance.
+                # When mic_drop_while_speaking is set, also drop during
+                # SPEAKING/THINKING (echo gate): the mic captures our own TTS
+                # echo, and forwarding it opens a server-VAD segment that never
+                # cleanly ends → wedges the continuous-dialogue loop.
+                _st = getattr(self, "_state", ConvState.IDLE)
+                if _st == ConvState.SLEEPING or (
+                    drop_while_speaking
+                    and _st in (ConvState.SPEAKING, ConvState.THINKING)
+                ):
+                    # Also clear pre-roll so we don't leak pre-sleep / TTS-echo
+                    # audio into the next user utterance.
                     preroll.clear()
                     continue
-                # Per-chunk mic RMS for the dashboard. Rate-limited so a
-                # slow WS client doesn't backpressure the mic queue and
-                # starve VAD (which kills barge-in detection during TTS).
+                # Race #3: while SLV is reconnecting, drop chunks and
+                # clear pre-roll. Carrying pre-reconnect audio into the
+                # new WS produces partial garbled finals on the next turn
+                # (audio fragment from before + speech after the gap →
+                # ASR sees one mashed utterance).
+                is_reconn = getattr(self.slv, "is_reconnecting", None)
+                if callable(is_reconn) and is_reconn():
+                    preroll.clear()
+                    continue
+                # Per-chunk mic RMS. The energy gate / makeup gain need it
+                # EVERY chunk; otherwise it's only needed for the rate-limited
+                # dashboard broadcast (a slow WS client must not backpressure
+                # the mic queue and starve VAD → barge-in during TTS).
+                rms = 0.0
+                if need_rms:
+                    try:
+                        _arr = _np.frombuffer(chunk, dtype=_np.int16)
+                        rms = float(_np.sqrt(_np.mean((_arr.astype(_np.float32) / 32768.0) ** 2))) if _arr.size else 0.0
+                    except Exception:  # pragma: no cover - defensive
+                        rms = 0.0
                 rms_chunk_counter = (rms_chunk_counter + 1) % rms_broadcast_every
                 if rms_chunk_counter == 0:
                     try:
-                        arr = _np.frombuffer(chunk, dtype=_np.int16)
-                        if arr.size:
-                            rms = float(_np.sqrt(_np.mean((arr.astype(_np.float32) / 32768.0) ** 2)))
-                        else:
-                            rms = 0.0
+                        if not need_rms:
+                            _arr = _np.frombuffer(chunk, dtype=_np.int16)
+                            rms = float(_np.sqrt(_np.mean((_arr.astype(_np.float32) / 32768.0) ** 2))) if _arr.size else 0.0
                         thr = float(getattr(self.config, "client_vad_threshold", None) or 0.012)
                         self._schedule_mic_rms_broadcast(
                             {"rms": rms, "threshold": thr, "state": self._vad_state}
                         )
+                        if rms > 0.03:
+                            logger.info(
+                                "mic chunk loud: rms=%.4f state=%s convstate=%s",
+                                rms, self._vad_state,
+                                getattr(self, "_state", ConvState.IDLE).value,
+                            )
                     except Exception:  # pragma: no cover - defensive
                         pass
 
                 if self._client_vad is None:
-                    # No VAD configured: stream everything (legacy behaviour).
-                    await self._send_audio_nonblocking(chunk)
+                    # No client VAD: forward raw audio so the SERVER VAD
+                    # segments + finalizes (preserves Qwen3 unbroken framing).
+                    # Optional, all opt-in: energy gate (zero-fill gaps → clean
+                    # silence so the server endpoints), makeup gain (quiet mic →
+                    # the VAD/ASR trained range), and client-driven asr_eos on
+                    # the gate's open→close edge (server finalizes immediately
+                    # instead of relying on its own VAD endpoint, which wedges).
+                    out_chunk = chunk
+                    now_mono = time.monotonic()
+                    if gate_enabled:
+                        if rms >= gate_open:
+                            if not _gate_open_state:
+                                _gate_opened_at = now_mono
+                            _gate_open_state = True
+                            _gate_last_loud_ts = now_mono
+                        elif rms < gate_close:
+                            if (now_mono - _gate_last_loud_ts) * 1000.0 >= gate_hangover_ms:
+                                if _gate_open_state and drive_eos and (
+                                    (_gate_last_loud_ts - _gate_opened_at) * 1000.0 >= eos_min_speech_ms
+                                ):
+                                    # open→close edge after real speech: force
+                                    # the server to finalize this utterance now.
+                                    try:
+                                        await self.send_asr_eos_once()
+                                    except Exception:
+                                        logger.exception("gate-edge asr_eos failed")
+                                _gate_open_state = False
+                        if not _gate_open_state:
+                            if _gate_zeros is None or len(_gate_zeros) != len(chunk):
+                                _gate_zeros = b"\x00" * len(chunk)
+                            out_chunk = _gate_zeros
+                    if makeup_gain != 1.0 and out_chunk is not _gate_zeros and len(out_chunk):
+                        try:
+                            _g = _np.frombuffer(out_chunk, dtype=_np.int16).astype(_np.float32) * makeup_gain
+                            out_chunk = _np.clip(_g, -32768.0, 32767.0).astype(_np.int16).tobytes()
+                        except Exception:  # pragma: no cover - defensive
+                            pass
+                    await self._send_audio_nonblocking(out_chunk)
                     continue
 
                 # Update VAD first; it may transition idle→speech this chunk.
@@ -782,6 +1156,74 @@ class BaseApp:
         self._eos_sent_this_turn = False
         self._cancel_asr_watchdog()
         self._first_tts_seen = False
+
+    def _arm_thinking_watchdog(self) -> None:
+        """Re-arm the THINKING-state watchdog.
+
+        Idempotent: a prior task is cancelled. Called every time we
+        transition INTO THINKING (real asr_final, dashboard text inject).
+        """
+        if self._thinking_watchdog_task is not None and not self._thinking_watchdog_task.done():
+            self._thinking_watchdog_task.cancel()
+        self._thinking_watchdog_task = asyncio.create_task(
+            self._thinking_watchdog(), name="thinking-watchdog",
+        )
+
+    def _cancel_thinking_watchdog(self) -> None:
+        """Cancel the THINKING watchdog if armed. Idempotent."""
+        if self._thinking_watchdog_task is not None and not self._thinking_watchdog_task.done():
+            self._thinking_watchdog_task.cancel()
+        self._thinking_watchdog_task = None
+
+    async def _thinking_watchdog(self) -> None:
+        """Force state back to IDLE if THINKING never resolves into
+        SPEAKING (no ``tts_started`` event from SLV).
+
+        Observed failure on jetson-qwen3asr-matcha-nx: after a successful
+        ASR → LLM → tool_call → text-stream → flush_tts cycle, the SLV
+        server occasionally fails to start TTS playback (no further
+        events from the WS even though it stays connected). Without this
+        watchdog the FSM stays THINKING forever and every subsequent
+        user utterance is ignored. On fire we reconnect SLV (which gives
+        a fresh worker) and reset state to IDLE so the next turn can
+        proceed.
+        """
+        timeout = float(getattr(self.config, "thinking_timeout_s", 20.0))
+        try:
+            await asyncio.sleep(timeout)
+        except asyncio.CancelledError:
+            return
+        if getattr(self, "_state", ConvState.IDLE) != ConvState.THINKING:
+            return  # state moved on naturally; nothing to do
+        logger.warning(
+            "thinking watchdog fired (no tts_started in %.1fs after asr_final); "
+            "resetting state to IDLE and reconnecting SLV",
+            timeout,
+        )
+        # Drop any LLM turn task that's still believed to be in flight.
+        if self._llm_turn_task is not None and not self._llm_turn_task.done():
+            self._llm_turn_task.cancel()
+            try:
+                await self._llm_turn_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Force a fresh WS — the server-side TTS pipeline is likely
+        # wedged on the current session. Best-effort.
+        try:
+            await asyncio.wait_for(self.slv.reconnect(), timeout=3.0)
+            self._slv_reconnect_count = getattr(self, "_slv_reconnect_count", 0) + 1
+            await self._broadcast(
+                "on_slv_reconnect", {"count": self._slv_reconnect_count}
+            )
+        except Exception:
+            logger.exception("SLV reconnect failed during thinking-watchdog recovery")
+        self._first_tts_seen = False
+        # Symmetric latch reset with the SLVError / dispatch-reconnect
+        # paths. Without clearing this, the next utterance could
+        # short-circuit ``send_asr_eos_once`` and never receive a final.
+        self._eos_sent_this_turn = False
+        self._set_state(ConvState.IDLE)
+        self._reset_sleep_timer()
 
     async def _asr_final_watchdog(self) -> None:
         """Force state back to IDLE if asr_final never arrives after asr_eos.
@@ -891,6 +1333,10 @@ class BaseApp:
                                 {"ts": int(_t.time() * 1000), "drove_eos": False},
                             )
                         self._set_state(ConvState.THINKING)
+                        # Arm the thinking-watchdog so a wedged SLV TTS
+                        # can't strand the FSM. (Symmetric with the
+                        # server-VAD path at _dispatch_one.)
+                        self._arm_thinking_watchdog()
                         self._vad_eos_sent = True
                     self._vad_state = "idle"
                     self._vad_speech_ms = 0
@@ -990,10 +1436,51 @@ class BaseApp:
             # SLV's silero VAD can fire spurious empty endpoints from breath/
             # ambient noise; ignore empty partials so we don't trigger
             # bogus barge-ins or noise the dashboard.
-            if not (evt.text or "").strip():
+            partial_text = (evt.text or "").strip()
+            if not partial_text:
                 return
-            # Barge-in: user spoke (real text) while we were playing.
-            if self.audio.is_playing:
+            # Barge-in: user spoke (real text) while we were SPEAKING.
+            #
+            # We gate on FSM state, NOT audio.is_playing alone. Reason: a
+            # TTSDone event flips state SPEAKING→IDLE the moment SLV says
+            # "no more frames", but audio_io is still draining buffered
+            # PCM through the speaker for another 100-500ms. During that
+            # window, a fresh ASRPartial from a NEW user utterance (a
+            # legitimate new turn, NOT a barge-in over a still-playing
+            # reply) would fire barge-in, abort SLV, and cancel a brand
+            # new LLM turn that hadn't even started — wedging the agent
+            # into a loop of fake barge-ins on garbled partials. By
+            # requiring SPEAKING/BARGED_IN here we treat a partial during
+            # IDLE/THINKING as the start of a normal utterance.
+            #
+            # ALSO: require a MINIMUM partial length AND a minimum delay
+            # since TTS began. The reSpeaker XVF3800's hardware AEC isn't
+            # perfect — the speaker's first 200-500ms of output bleeds
+            # into the open mic, server silero triggers, and the FIRST
+            # partial we see is the agent's own "好的。" coming back. If
+            # we honour that as barge-in we cancel our own turn before
+            # the user could possibly speak. Min length (2 chars) +
+            # min delay since TTS started (500ms) suppresses the echo
+            # blip; a real barge-in of "Hey Jarvis ..." easily meets both.
+            now_ts = time.monotonic()
+            barge_min_chars = int(getattr(self.config, "barge_in_min_chars", 2))
+            barge_min_speaking_ms = int(getattr(self.config, "barge_in_min_speaking_ms", 500))
+            speaking_since = getattr(self, "_speaking_since_ts", 0.0)
+            elapsed_ms = (now_ts - speaking_since) * 1000 if speaking_since else 99999
+            if len(partial_text) < barge_min_chars:
+                logger.debug(
+                    "barge-in skipped: partial too short (len=%d < %d): %r",
+                    len(partial_text), barge_min_chars, partial_text,
+                )
+                return
+            if elapsed_ms < barge_min_speaking_ms:
+                logger.debug(
+                    "barge-in skipped: elapsed only %.0fms since TTS start (need >=%dms) — "
+                    "treating partial %r as echo",
+                    elapsed_ms, barge_min_speaking_ms, partial_text,
+                )
+                return
+            if self._state in (ConvState.SPEAKING, ConvState.BARGED_IN) and self.audio.is_playing:
                 logger.info(
                     "BARGE-IN fired (state=%s, partial=%r)",
                     self._state.value, evt.text[:40]
@@ -1022,6 +1509,11 @@ class BaseApp:
             # later reset state out from under whatever dispatch we're
             # about to run.
             self._cancel_asr_watchdog()
+            # Snapshot whether the agent had just sent client-side EOS —
+            # if a low-signal/empty final follows, that final IS the
+            # response to our EOS and there's no LLM turn in flight to
+            # protect (race #2: stuck in THINKING).
+            _had_pending_eos = self._eos_sent_this_turn
             # Clear the per-turn EOS dedupe flag for ALL final paths
             # (duplicate-of-streamed, empty, and real). Previously it was
             # only reset in the non-empty branch below, so a duplicate or
@@ -1079,25 +1571,70 @@ class BaseApp:
                 or stripped_for_signal in _INTERJECTIONS
             ):
                 logger.info(
-                    "low-signal asr_final ignored (text=%r, signal=%r)",
+                    "low-signal asr_final ignored (text=%r, signal=%r, state=%s)",
                     (evt.text or "")[:30], stripped_for_signal,
+                    getattr(self, "_state", ConvState.IDLE).name,
                 )
-                # State must NOT stay stuck in THINKING when no real text
-                # arrives. Reset back to IDLE so the next user turn can
-                # transition cleanly via LISTENING.
-                # Also clear the discard latch: a prior barge-in may have
-                # set it, and the next intent (which might be typed text
-                # via the dashboard, with no ASRFinal) needs audible TTS.
+                # Clear the discard latch so a later legitimate turn
+                # (including dashboard-typed text with no ASRFinal) gets
+                # audible TTS — a prior barge-in / abort may have armed it.
                 try:
                     arm = getattr(self.audio, "arm_for_next_turn", None)
                     if callable(arm):
                         arm()
                 except Exception:  # pragma: no cover - defensive
                     pass
-                self._set_state(ConvState.IDLE)
-                self._reset_sleep_timer()
+                # State transitions — be conservative. A noise / silence
+                # asr_final must NOT cancel an in-flight LLM/TTS turn
+                # belonging to a PREVIOUS real utterance. Symptom: with
+                # always-on mic, server VAD frequently emits empty
+                # asr_finals while the model is mid-tool-call; forcing
+                # state back to IDLE here was cancelling the runner, which
+                # then re-fired text-only completions, looped tool
+                # invocations, and ultimately stranded the agent in a
+                # broken speaking↔idle ping-pong that needed a restart.
+                #
+                # State transitions on low-signal final:
+                #   LISTENING — agent was waiting for THIS final and it
+                #     turned out to be noise; recover to IDLE.
+                #   BARGED_IN — barge-in fired (cancelled TTS+LLM)
+                #     expecting the user's actual command; got noise
+                #     instead. Treat as cancelled barge-in: clear back
+                #     to IDLE so the next real utterance flows cleanly.
+                #     Without this the agent stays in BARGED_IN forever
+                #     when the barge-in audio produces only short noise
+                #     finals ('Yeah.', '头', etc.).
+                #   THINKING / SPEAKING — a noise final mid-turn must
+                #     NOT cancel the in-flight LLM/TTS belonging to a
+                #     PREVIOUS real utterance.
+                #   IDLE / SLEEPING — already terminal; no transition.
+                cur_state = getattr(self, "_state", ConvState.IDLE)
+                if cur_state in (ConvState.LISTENING, ConvState.BARGED_IN):
+                    self._set_state(ConvState.IDLE)
+                    self._reset_sleep_timer()
+                elif cur_state == ConvState.THINKING and _had_pending_eos:
+                    # Race #2: we sent client-EOS expecting a real
+                    # final but SLV returned an empty/low-signal one
+                    # (server VAD coalesced silence). There is no
+                    # in-flight LLM turn to protect — sit in THINKING
+                    # forever otherwise. Force back to IDLE so the
+                    # next utterance can flow.
+                    logger.info(
+                        "empty asr_final after pending EOS while THINKING; "
+                        "resetting to IDLE (race #2)"
+                    )
+                    self._set_state(ConvState.IDLE)
+                    self._reset_sleep_timer()
+                elif cur_state in (ConvState.THINKING, ConvState.SPEAKING):
+                    logger.debug(
+                        "low-signal final arrived during %s; FSM left alone "
+                        "(in-flight turn keeps running)",
+                        cur_state.name,
+                    )
                 return
-            logger.info("asr_final received: %r", evt.text)
+            logger.info(
+                "asr_final received: %r (language=%r)", evt.text, evt.language
+            )
             # Re-enable speaker playback for the next turn. stop_playback
             # latched discard=True on the prior barge-in / sleep so SLV's
             # tail-end TTS didn't keep playing; clear that now so the new
@@ -1162,12 +1699,20 @@ class BaseApp:
             # set it). Idempotent for client-VAD path which already set
             # THINKING in _update_vad.
             self._set_state(ConvState.THINKING)
+            # Arm the thinking watchdog so a wedged SLV TTS pipeline
+            # can't strand the FSM here forever (see _thinking_watchdog
+            # docstring). Cancelled by the first tts_started/tts_done
+            # event or by SLVError, whichever comes first.
+            self._arm_thinking_watchdog()
             self._llm_turn_task = asyncio.create_task(
-                self._run_user_utterance(evt.text), name="llm-turn"
+                self._run_user_utterance(evt.text, evt.language),
+                name="llm-turn",
             )
             return
 
         if isinstance(evt, TTSStarted):
+            # Real TTS started — thinking watchdog can stand down.
+            self._cancel_thinking_watchdog()
             await self._broadcast("on_assistant_sentence_start", evt.sentence)
             return
 
@@ -1178,14 +1723,25 @@ class BaseApp:
             # latch, but skip the state flip here too).
             if self._state == ConvState.BARGED_IN:
                 return
+            first_frame = False
             if not self._first_tts_seen:
                 self._first_tts_seen = True
+                first_frame = True
                 self.audio.set_output_sample_rate(evt.sample_rate)
                 self._set_state(ConvState.SPEAKING)
-                await self._broadcast(
-                    "on_tts_audio_frame",
-                    {"sample_rate": evt.sample_rate, "frame_len": len(evt.pcm)},
-                )
+                # Stamp the moment TTS playback actually began so the
+                # barge-in gate (see ASRPartial handler) can suppress the
+                # echo blip from the speaker's first 200-500ms output
+                # leaking back through the open mic.
+                self._speaking_since_ts = time.monotonic()
+            await self._broadcast(
+                "on_tts_audio_frame",
+                {
+                    "sample_rate": evt.sample_rate,
+                    "frame_len": len(evt.pcm),
+                    "first": first_frame,
+                },
+            )
             await self.audio.play(evt.pcm)
             return
 
@@ -1194,8 +1750,16 @@ class BaseApp:
             return
 
         if isinstance(evt, TTSDone):
+            # Race #4: preserve and log session_complete so downstream
+            # reconnect logic can branch on True (session ends, slot
+            # released) vs False (turn done, slot held for continuation).
+            session_complete = getattr(evt, "session_complete", True)
+            logger.debug(
+                "TTSDone received (session_complete=%s)", session_complete
+            )
             # Reset first-frame flag so the NEXT turn re-emits SPEAKING.
             self._first_tts_seen = False
+            self._cancel_thinking_watchdog()
             # Authoritative is_playing reset (audio_io stopped doing this on
             # transient empty queue to keep barge-in checks reliable).
             mark = getattr(self.audio, "mark_playback_done", None)
@@ -1209,25 +1773,28 @@ class BaseApp:
                 self._set_state(ConvState.IDLE)
                 self._reset_sleep_timer()
             await self._broadcast("on_assistant_done")
-            # SLV closes /v2v/stream after honoring tts_flush. Reconnect
-            # proactively here so the next mic turn does not send ASR/text
-            # frames into a closing transport and silently lose TTS.
-            try:
-                await asyncio.wait_for(self.slv.reconnect(), timeout=2.0)
-                self._slv_reconnect_count = getattr(self, "_slv_reconnect_count", 0) + 1
-                await self._broadcast(
-                    "on_slv_reconnect", {"count": self._slv_reconnect_count}
-                )
-            except asyncio.TimeoutError:
-                logger.warning("SLV reconnect timed out after tts_done")
-            except Exception:
-                logger.exception("SLV reconnect failed after tts_done")
+            # NO proactive reconnect on tts_done. SLV server v1.15+ added
+            # an ASR turn wall-clock timeout that force-releases the
+            # SessionLimiter slot even when Qwen3-ASR worker wedges, so
+            # the worker-stuck workaround that this proactive reconnect
+            # was guarding against is now handled server-side. Keeping
+            # the reconnect here was actively causing 4429
+            # too_many_sessions because the new WS races the
+            # just-released slot. The WS stays alive across turns (per
+            # SLV multi_utterance protocol where session_complete=False
+            # means dialog continues). Real WS death is caught by the
+            # outer dispatch loop's events()-returns / reader-exit path,
+            # which reconnects on its own.
+            self._first_tts_seen = False
+            self._eos_sent_this_turn = False
             return
 
         if isinstance(evt, SLVError):
-            # Transport died — any pending asr_final watchdog is moot;
-            # SLVError handling below already drives state back to IDLE.
+            # Transport died — any pending asr_final / thinking watchdog
+            # is moot; SLVError handling below already drives state
+            # back to IDLE.
             self._cancel_asr_watchdog()
+            self._cancel_thinking_watchdog()
             old_state = getattr(self, "_state", ConvState.IDLE)
             await self._broadcast(
                 "on_error",
@@ -1252,12 +1819,23 @@ class BaseApp:
                 self._set_state(ConvState.IDLE)
             else:
                 logger.info("SLVError while SLEEPING; staying SLEEPING")
+            # No proactive reconnect here — same race as TTSDone (the SLV
+            # server immediately closes a fresh connection that arrives
+            # while it's still tearing the previous session down).
+            # ``SLVClient.send_audio`` / ``_send_json`` already auto-call
+            # ``connect()`` when ``_ws is None``, and the dead-WS detection
+            # in those paths nulls _ws on ``ConnectionClosed``. The next
+            # mic chunk (or text send) naturally reopens the transport
+            # ~100ms later — enough headroom for SLV to finalize the prior
+            # session cleanly.
             return
 
-    async def _run_user_utterance(self, text: str) -> None:
+    async def _run_user_utterance(
+        self, text: str, detected_language: str | None = None
+    ) -> None:
         """Wrap on_user_utterance so a crashing LLM turn doesn't kill the task silently."""
         try:
-            await self.on_user_utterance(text)
+            await self.on_user_utterance(text, detected_language=detected_language)
             # Success path: tell the availability plugin so a transient
             # failure that earlier flipped us to DEGRADED gets cleared.
             # Skip if LLM is disabled (noop backend).

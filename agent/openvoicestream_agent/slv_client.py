@@ -59,6 +59,11 @@ class ASRFinal(V2VEvent):
     text: str
     session_complete: bool = True
     duplicate_of_streamed: bool = False
+    # Per-utterance detected language as reported by the ASR backend
+    # (e.g. "Chinese", "English"). None when the backend doesn't perform
+    # language ID. Modes (e.g. InterpreterMode) consume this to pick a
+    # translator src language at runtime.
+    language: "str | None" = None
 
 
 @dataclass
@@ -73,7 +78,13 @@ class TTSSentenceDone(V2VEvent):
 
 @dataclass
 class TTSDone(V2VEvent):
-    pass
+    # SLV signals session_complete=True when the TTS turn ended at a
+    # session boundary (slot will release, WS may close), False when
+    # the turn ended cleanly but the slot is still held (multi-utterance
+    # continuation expected). Race #4: previously this field was dropped
+    # by the dataclass and the app treated every TTSDone as session-end,
+    # producing spurious reconnects.
+    session_complete: bool = True
 
 
 @dataclass
@@ -85,6 +96,15 @@ class TTSAudio(V2VEvent):
 @dataclass
 class SLVError(V2VEvent):
     message: str
+
+
+class SLVReconnectError(Exception):
+    """Raised when ``SLVClient.reconnect()`` cannot establish a working WS.
+
+    Callers (e.g. ``App.wake()``) catch this to decide policy — most often,
+    refuse the wake and stay SLEEPING so the user notices something is
+    wrong rather than experiencing a silent mute.
+    """
 
 
 # ── Client ───────────────────────────────────────────────────────────
@@ -108,49 +128,224 @@ class SLVClient:
         # Set when reader exits for any reason; events() uses this to
         # break out of `await queue.get()` instead of hanging forever.
         self._reader_done: asyncio.Event = asyncio.Event()
+        # Track wall-clock of last WS activity (recv from server OR send
+        # audio/json from us). is_healthy() only checks TCP layer; the
+        # server-side ASR session may be GC'd after long idle while the
+        # TCP socket stays open. wake() consults seconds_since_activity()
+        # to decide whether to force a reconnect (refresh ASR session)
+        # even when is_healthy() reports True. See app_base.wake().
+        self._last_activity_ts: float = 0.0
+        # Race #3: set True while reconnect() is tearing down + reopening.
+        # mic_pump consults is_reconnecting() to skip forwarding audio
+        # during the outage (otherwise chunks queue up on _send_lock,
+        # 0.5s send_audio timeout starves the mic pump, dropped-chunk
+        # logs flood, and post-reconnect first utterance still carries
+        # pre-reconnect preroll).
+        self._reconnecting: bool = False
+
+    def _touch_activity(self) -> None:
+        try:
+            self._last_activity_ts = asyncio.get_event_loop().time()
+        except RuntimeError:
+            # No running loop (e.g. unit test using time module). Fall back
+            # gracefully — treat as if we just had activity.
+            import time as _time
+            self._last_activity_ts = _time.monotonic()
+
+    def seconds_since_activity(self) -> float:
+        """Wall-clock seconds since last observed WS activity.
+
+        Returns inf if no activity has ever been recorded (fresh client
+        with no traffic yet — caller should treat as "stale" / reconnect
+        candidate after the first turn).
+        """
+        if self._last_activity_ts == 0:
+            return float("inf")
+        try:
+            now = asyncio.get_event_loop().time()
+        except RuntimeError:
+            import time as _time
+            now = _time.monotonic()
+        return now - self._last_activity_ts
 
     # ── lifecycle ───────────────────────────────────────────────────
+
+    # Time we wait after sending CLIENT_CONFIG before declaring a fresh
+    # WS healthy. If the server closes within this window the limiter
+    # almost certainly rejected us (SLV's per-client WS slot is still
+    # busy with the previous session's teardown); back off and retry.
+    _RECONNECT_GRACE_S = 0.05
+    # Backoff schedule for the limiter race. Empirically the slot
+    # releases inside ~40ms, but Jetson under thermal throttle can be
+    # slower; cover up to ~1.75s of contention before giving up.
+    _RECONNECT_BACKOFFS = (0.25, 0.5, 1.0)
 
     async def connect(self) -> None:
         if self._ws is not None:
             return  # idempotent
-        self._reader_done.clear()
-        self._tts_sample_rate = None
-        self._ws = await ws_connect(self.url, max_size=None)
-        await self._ws.send(json.dumps({"type": CLIENT_CONFIG, **self.config}))
-        self._reader_task = asyncio.create_task(self._reader_loop(), name="slv-reader")
+        await self._open_with_retry()
+
+    def is_healthy(self) -> bool:
+        """Best-effort liveness check for the SLV WebSocket.
+
+        Returns False when:
+        - the client is closed
+        - the WS handle is missing (last send observed ``ConnectionClosed``
+          and nulled it)
+        - the reader task is missing or has already exited (server closed
+          the stream, or ``_open_with_retry`` aborted before launching it)
+
+        Cheap to call — no I/O. Used by ``App.wake()`` to decide whether
+        to skip a wake when the previous turn's reconnect fail-silently
+        left us with a dead stream.
+        """
+        if self._closed:
+            return False
+        if self._ws is None:
+            return False
+        if self._reader_task is None or self._reader_task.done():
+            return False
+        return True
 
     async def reconnect(self) -> None:
         """Tear down current WS and open a fresh one, replaying config.
 
-        SLV closes the session after asr_eos (even in multi_utterance), so
-        the agent must reopen for the next utterance. Audio capture stays
-        alive; only the SLV transport flips. Holds _send_lock so concurrent
-        send_audio() blocks until reconnect completes.
+        Self-healing against SLV's session-limiter race (server `app/main.py`
+        ``try_acquire_ws`` admission): the previous session's WS slot is
+        held until a teardown chain (dispatcher cancel → ASR cancel →
+        ws.close → manager unregister → token release) completes. A
+        reconnect that arrives inside that 3–40 ms window is closed with
+        WS code 4429. We detect the immediate close by waiting on the
+        reader-done signal for ``_RECONNECT_GRACE_S`` after sending the
+        config frame; if reader fires inside the grace, we back off and
+        retry.
         """
         if self._closed:
             return
-        async with self._send_lock:
-            old_reader = self._reader_task
-            old_ws = self._ws
-            self._ws = None
-            self._reader_task = None
-            if old_reader is not None and not old_reader.done():
-                old_reader.cancel()
-                try:
-                    await old_reader
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if old_ws is not None:
-                try:
-                    await old_ws.close()
-                except Exception:
-                    pass
+        self._reconnecting = True
+        try:
+            async with self._send_lock:
+                old_reader = self._reader_task
+                old_ws = self._ws
+                self._ws = None
+                self._reader_task = None
+                if old_reader is not None and not old_reader.done():
+                    old_reader.cancel()
+                    try:
+                        await old_reader
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                if old_ws is not None:
+                    try:
+                        await old_ws.close()
+                    except Exception:
+                        pass
+                # Grace: let server SessionLimiter (limit=1, Qwen3-ASR
+                # worker is single-concurrent) observe the close + release
+                # the slot before we open a fresh WS. With proactive
+                # reconnects on tts_done / wake reverted (SLV server
+                # v1.15+ ASR turn timeout handles stuck workers),
+                # reconnect now only fires on genuine WS death — close-
+                # before-open races are no longer densely triggered, so
+                # 50ms of defensive grace is sufficient (was 150ms when
+                # proactive reconnect was active).
+                await asyncio.sleep(0.05)
+                self._reader_done.clear()
+                self._tts_sample_rate = None
+                await self._open_with_retry()
+        finally:
+            self._reconnecting = False
+
+    def is_reconnecting(self) -> bool:
+        """True while reconnect() is mid-flight (race #3 gate)."""
+        return self._reconnecting
+
+    async def _open_with_retry(self) -> None:
+        """Open a WS and verify it survived the limiter grace window.
+
+        Must be called with ``self._send_lock`` already held by the
+        caller (or in a single-threaded init path like ``connect``).
+        """
+        attempts = list(self._RECONNECT_BACKOFFS) + [None]
+        for attempt_idx, backoff in enumerate(attempts):
             self._reader_done.clear()
             self._tts_sample_rate = None
             self._ws = await ws_connect(self.url, max_size=None)
-            await self._ws.send(json.dumps({"type": CLIENT_CONFIG, **self.config}))
-            self._reader_task = asyncio.create_task(self._reader_loop(), name="slv-reader")
+            try:
+                await self._ws.send(json.dumps({"type": CLIENT_CONFIG, **self.config}))
+            except websockets.ConnectionClosed as e:
+                # Server slammed the door before we could send config
+                # (4429 limiter race, etc.). Treat as failed attempt and
+                # fall through to backoff. Without this catch the
+                # exception escapes wake() as "unexpected error".
+                logger.info(
+                    "SLV reconnect attempt %d: send(config) closed by server (%s)",
+                    attempt_idx + 1, e,
+                )
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+                if backoff is None:
+                    raise SLVReconnectError(
+                        f"SLV reconnect: server closed CLIENT_CONFIG send on all "
+                        f"{len(attempts)} attempts ({e})"
+                    )
+                await asyncio.sleep(backoff)
+                continue
+            self._reader_task = asyncio.create_task(
+                self._reader_loop(), name="slv-reader"
+            )
+            try:
+                # If the server rejects this connection (limiter race,
+                # bad config, etc.) the reader sees ConnectionClosed
+                # almost immediately and sets _reader_done. Survive the
+                # grace window → connection is healthy, return.
+                await asyncio.wait_for(
+                    self._reader_done.wait(), timeout=self._RECONNECT_GRACE_S
+                )
+            except asyncio.TimeoutError:
+                # Healthy: reader is still running after grace window.
+                # Mark fresh WS as just-active so the next wake doesn't
+                # see "infinite idle" and immediately re-reconnect on top
+                # of our brand new session (and trip the limiter).
+                self._touch_activity()
+                return
+            # Reader fired → connection died inside grace window.
+            # Tear down what we just built and back off.
+            dead_reader = self._reader_task
+            dead_ws = self._ws
+            self._ws = None
+            self._reader_task = None
+            if dead_reader is not None and not dead_reader.done():
+                dead_reader.cancel()
+                try:
+                    await dead_reader
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if dead_ws is not None:
+                try:
+                    await dead_ws.close()
+                except Exception:
+                    pass
+            # Drain any SLVError the reader may have queued so subsequent
+            # events() consumers don't see this rejection.
+            try:
+                while not self._queue.empty():
+                    _ = self._queue.get_nowait()
+            except Exception:
+                pass
+            if backoff is None:
+                raise SLVReconnectError(
+                    f"SLV reconnect: server closed within {self._RECONNECT_GRACE_S}s "
+                    f"on all {len(attempts)} attempts (limiter race?)"
+                )
+            logger.warning(
+                "SLV reconnect attempt %d rejected within %.0fms; retrying in %.2fs",
+                attempt_idx + 1, self._RECONNECT_GRACE_S * 1000, backoff,
+            )
+            await asyncio.sleep(backoff)
 
     async def close(self) -> None:
         self._closed = True
@@ -191,6 +386,10 @@ class SLVClient:
                 await self.connect()
             try:
                 await self._ws.send(pcm)
+                # Do NOT touch activity on outgoing audio — the mute bug
+                # is exactly "we keep sending into a dead session". Only
+                # server-originated frames (handled in _handle_json /
+                # _handle_binary) signal that the SLV session is alive.
             except websockets.ConnectionClosed:
                 # Reader will notice and signal _reader_done; dispatch can
                 # decide to reconnect. Audio chunks during reconnect are
@@ -284,6 +483,7 @@ class SLVClient:
             self._reader_done.set()
 
     async def _handle_binary(self, data: bytes) -> None:
+        self._touch_activity()
         if self._tts_sample_rate is None:
             if len(data) < 4:
                 await self._queue.put(SLVError("first binary frame < 4 bytes"))
@@ -299,12 +499,16 @@ class SLVClient:
         await self._queue.put(TTSAudio(pcm=data, sample_rate=self._tts_sample_rate))
 
     async def _handle_json(self, raw: str) -> None:
+        self._touch_activity()
         try:
             evt = json.loads(raw)
         except json.JSONDecodeError as e:
             await self._queue.put(SLVError(f"bad json: {e}"))
             return
         t = evt.get("type")
+        # TEMP DEBUG: log every event type so we can see what SLV emits
+        # between turns. Cheap because events are sparse compared to PCM.
+        logger.info("SLV evt: %s", {k: v for k, v in evt.items() if k != "text" or len(str(v)) < 100})
         if t == SERVER_ASR_PARTIAL:
             await self._queue.put(
                 ASRPartial(text=evt.get("text", ""), is_stable=bool(evt.get("is_stable", False)))
@@ -317,6 +521,7 @@ class SLVClient:
                     text=evt.get("text", ""),
                     session_complete=bool(evt.get("session_complete", True)),
                     duplicate_of_streamed=bool(evt.get("duplicate_of_streamed", False)),
+                    language=evt.get("language"),
                 )
             )
         elif t == SERVER_TTS_STARTED:
@@ -325,8 +530,9 @@ class SLVClient:
         elif t == SERVER_TTS_SENTENCE_DONE:
             await self._queue.put(TTSSentenceDone(sentence=evt.get("sentence", "")))
         elif t == SERVER_TTS_DONE:
-            logger.info("SLV tts_done")
-            await self._queue.put(TTSDone())
+            session_complete = bool(evt.get("session_complete", True))
+            logger.info("SLV tts_done session_complete=%s", session_complete)
+            await self._queue.put(TTSDone(session_complete=session_complete))
         elif t == SERVER_ERROR:
             await self._queue.put(SLVError(evt.get("error", "unknown")))
         else:

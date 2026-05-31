@@ -6,8 +6,8 @@
 # and runs the ASR streaming gate.
 set -euo pipefail
 
-IMAGE="${IMAGE:-openvoicestream:jetson-v1.12-highperf}"
-REGISTRY_IMAGE="${REGISTRY_IMAGE:-sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.12-highperf}"
+IMAGE="${IMAGE:-openvoicestream:jetson-v1.14-hotswap}"
+REGISTRY_IMAGE="${REGISTRY_IMAGE:-sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.14-hotswap}"
 ARTIFACT_SET="${QWEN3_ARTIFACT_SET:-orin-nano-highperf-2026-05-10}"
 ARTIFACT_ROOT="${QWEN3_ARTIFACT_ROOT:-/opt/models/qwen3-edgellm}"
 SERVICE_PORT="${SERVICE_PORT:-18621}"

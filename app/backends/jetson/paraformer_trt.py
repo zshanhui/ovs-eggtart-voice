@@ -354,6 +354,72 @@ def _load_trt_engine(path: str):
 
 
 # ---------------------------------------------------------------------------
+# Per-stream context bundle (N>=2 concurrency safety)
+# ---------------------------------------------------------------------------
+
+
+class _ParaformerCtxBundle:
+    """Per-stream TRT execution contexts + device buffer cache.
+
+    TRT IExecutionContext is not thread-safe. Each ParaformerTRTStream owns
+    one bundle so concurrent streams never share a context or device
+    allocation. The encoder/decoder engines (weights) are still shared and
+    immutable on the backend.
+
+    Buffer cache is keyed by shape, reused across utterances within the same
+    stream (matches the pre-refactor self._bindings behaviour) — only the
+    cross-stream sharing is removed.
+    """
+
+    def __init__(self, enc_engine, dec_engine):
+        self.enc_ctx = enc_engine.create_execution_context() if enc_engine is not None else None
+        self.dec_ctx = dec_engine.create_execution_context() if dec_engine is not None else None
+        self.enc_bindings: dict[str, dict] = {}
+        self.dec_bindings: dict[str, dict] = {}
+        self.enc_active_profile: Optional[int] = None
+        self._allocations: list[int] = []
+        self._destroyed = False
+
+    def alloc(self, nbytes: int) -> int:
+        err, ptr = cudart.cudaMalloc(nbytes)
+        if int(err) != 0:
+            raise RuntimeError(f"cudaMalloc({nbytes}) failed: {err}")
+        self._allocations.append(int(ptr))
+        return int(ptr)
+
+    def destroy(self) -> None:
+        if self._destroyed:
+            return
+        self._destroyed = True
+        try:
+            cudart.cudaDeviceSynchronize()
+        except Exception:
+            pass
+        for ptr in self._allocations:
+            try:
+                cudart.cudaFree(ptr)
+            except Exception:
+                pass
+        self._allocations.clear()
+        self.enc_bindings.clear()
+        self.dec_bindings.clear()
+        try:
+            self.enc_ctx = None
+        except Exception:
+            pass
+        try:
+            self.dec_ctx = None
+        except Exception:
+            pass
+
+    def __del__(self):
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # ParaformerTRTStream
 # ---------------------------------------------------------------------------
 
@@ -398,6 +464,30 @@ class ParaformerTRTStream(ASRStream):
         # Barge-in cancel state
         self._cancelled = False
         self._final_text_cache = ""
+
+        # Per-stream TRT context + device buffer bundle (N>=2 safety).
+        # Engines stay shared on the backend; only contexts/buffers per stream.
+        self._ctx_bundle: Optional[_ParaformerCtxBundle] = backend.create_context_bundle()
+
+    def close(self) -> None:
+        """Release per-stream TRT contexts and device buffers.
+
+        Idempotent. Called by the upper layer when the WS session ends.
+        Stream is unusable after close().
+        """
+        bundle = self._ctx_bundle
+        self._ctx_bundle = None
+        if bundle is not None:
+            try:
+                bundle.destroy()
+            except Exception:
+                logger.exception("ParaformerTRTStream.close: bundle.destroy raised")
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _reset_utterance_state(self) -> None:
         self._audio_buf = initial_preroll_audio()
@@ -470,7 +560,7 @@ class ParaformerTRTStream(ASRStream):
         new_stacked = new_lfr
 
         t1 = time.perf_counter()
-        enc, alphas = self._backend._run_encoder(feats)
+        enc, alphas = self._backend._run_encoder(feats, self._ctx_bundle)
         enc_time = (time.perf_counter() - t1) * 1000
         self._total_enc_ms += enc_time
 
@@ -519,6 +609,7 @@ class ParaformerTRTStream(ASRStream):
             enc, enc.shape[1],
             acoustic_embeds, len(acoustic_embeds),
             self._cache,
+            self._ctx_bundle,
         )
         dec_time = (time.perf_counter() - t2) * 1000
         self._total_dec_ms += dec_time
@@ -556,13 +647,15 @@ class ParaformerTRTStream(ASRStream):
         # Drop residual audio so a follow-up finalize() never touches encoder.
         self._audio_buf = np.array([], dtype=np.float32)
 
-    def finalize(self) -> str:
+    def finalize(self):
         """Process remaining audio tail + flush CIF -> final text.
 
         Bug G fix: full-utterance CMVN, slice (history+new) for encoder.
+
+        Returns ``(text, None)`` — Paraformer is single-language (zh).
         """
         if self._cancelled:
-            return self._final_text_cache
+            return self._final_text_cache, None
         residual_audio = self._audio_buf
         if len(residual_audio) > 0:
             self._all_audio = np.concatenate([self._all_audio, residual_audio])
@@ -576,7 +669,7 @@ class ParaformerTRTStream(ASRStream):
             # cap) and drain ALL pending CIF frames (no right-defer — there's
             # no more future audio).
             feats = all_lfr if cur_total_lfr <= 400 else all_lfr[-400:]
-            enc, alphas = self._backend._run_encoder(feats)
+            enc, alphas = self._backend._run_encoder(feats, self._ctx_bundle)
             if enc is not None and alphas is not None:
                 # CIF from where streaming left off to the very end
                 cif_start = max(self._cif_processed_lfr,
@@ -598,6 +691,7 @@ class ParaformerTRTStream(ASRStream):
                         enc, enc.shape[1],
                         acoustic_embeds, len(acoustic_embeds),
                         self._cache,
+                        self._ctx_bundle,
                     )
                     if sample_ids is not None:
                         self._all_token_ids.extend(sample_ids.tolist())
@@ -618,7 +712,7 @@ class ParaformerTRTStream(ASRStream):
             "Paraformer finalize: %d chunks, enc=%.0fms dec=%.0fms, text='%s'",
             chunk_count, total_enc_ms, total_dec_ms, text,
         )
-        return text
+        return text, None
 
     def _flush_cif_tail(self) -> None:
         """Fire final token for accumulated CIF weight if above threshold."""
@@ -630,6 +724,7 @@ class ParaformerTRTStream(ASRStream):
                 dummy_enc, 1,
                 acoustic_embeds, 1,
                 self._cache,
+                self._ctx_bundle,
             )
             if sample_ids is not None:
                 new_ids = sample_ids.tolist()
@@ -651,16 +746,54 @@ class ParaformerTRTStream(ASRStream):
 
 class ParaformerTRTBackend(ASRBackend):
 
+    @classmethod
+    def concurrency_capability(cls, profile=None):
+        from app.core.concurrency_capability import ConcurrencyCapability
+
+        # Per-stream _ParaformerCtxBundle: each ASRStream owns its own enc/dec
+        # TRT execution contexts + buffer cache. Backend only holds shared
+        # engines (weights). There is no fixed pool — concurrency scales with
+        # the number of open streams, bounded only by VRAM. See spec Section 1
+        # row "paraformer_trt" and ASRStream.close()/__del__ in
+        # app/core/asr_backend.py for bundle lifetime.
+        return ConcurrencyCapability(
+            supports_parallel=True,
+            max_concurrent=None,
+            is_stateful=True,
+            requires_exclusive_device=True,
+            scaling_mode="multi_runtime_per_slot",
+        )
+
     def __init__(self):
+        # Per-stream concurrency rework (N>=2 safety): TRT IExecutionContext
+        # is not thread-safe. Backend keeps shared engines (weights) only;
+        # contexts + device buffer cache live in a per-stream
+        # _ParaformerCtxBundle owned by ParaformerTRTStream. The legacy
+        # self._contexts / self._bindings / self._enc_active_profile attrs
+        # are removed entirely — callers must use create_context_bundle().
         self._engines: dict[str, trt.IEngine] = {}
-        self._contexts: dict[str, trt.IExecutionContext] = {}
-        self._bindings: dict[str, dict] = {}
         self._enc_ort_session = None  # ORT fallback for encoder
         self._enc_provider = "trt"  # "trt" or "ort_cuda"
         self._tokens: list[str] = []
         self._ready = False
-        self._enc_active_profile: Optional[int] = None
         self._enc_profile_ranges: list[tuple[int, int, int]] = []
+
+    def create_context_bundle(self) -> "_ParaformerCtxBundle":
+        """Build a fresh per-stream execution context + buffer cache.
+
+        Called by ParaformerTRTStream.__init__. Returns a bundle that owns
+        its own enc/dec contexts and a private device-buffer dict, so
+        concurrent streams never share TRT state. Bundle must be
+        destroy()ed via ParaformerTRTStream.close() / __del__ to release
+        device memory.
+        """
+        enc_eng = self._engines.get("enc")
+        dec_eng = self._engines.get("dec")
+        if dec_eng is None:
+            raise RuntimeError(
+                "Paraformer TRT decoder engine not loaded; call preload() first"
+            )
+        return _ParaformerCtxBundle(enc_eng, dec_eng)
 
     # -- Properties ----------------------------------------------------------
 
@@ -708,52 +841,58 @@ class ParaformerTRTBackend(ASRBackend):
         tensor_names = [eng.get_tensor_name(i) for i in range(eng.num_io_tensors)]
         logger.info("Encoder engine (%d I/O): %s", len(tensor_names), tensor_names)
         self._enc_profile_ranges = self._load_encoder_profile_ranges(eng)
-        self._contexts["enc"] = eng.create_execution_context()
 
-        # Validate encoder TRT engine with a warmup run. Use a low-level sine
-        # signal instead of zeros — zero audio causes LayerNorm division-by-zero
-        # in TRT's FP16/BF16 kernels (ORT adds epsilon, TRT may not).
+        # -- Load decoder TRT engine (needed to build the warmup bundle) --
+        self._engines["dec"] = _load_trt_engine(DEC_ENGINE_PATH)
+        dec_eng = self._engines["dec"]
+        dec_tensor_names = [dec_eng.get_tensor_name(i) for i in range(dec_eng.num_io_tensors)]
+        logger.info("Decoder engine (%d I/O): %s", len(dec_tensor_names), dec_tensor_names)
+
+        # Validate encoder TRT engine with a warmup run via a temporary bundle.
+        # Use a low-level sine signal instead of zeros — zero audio causes
+        # LayerNorm division-by-zero in TRT's FP16/BF16 kernels (ORT adds
+        # epsilon, TRT may not).
         warmup_audio = (np.sin(2 * np.pi * 440 * np.arange(SAMPLE_RATE) / SAMPLE_RATE) * 0.3).astype(np.float32)
         warmup_feats = compute_fbank(warmup_audio)
         warmup_feats = stack_frames(warmup_feats)
         n_warmup = min(warmup_feats.shape[0], 40)
         warmup_feats = warmup_feats[:n_warmup]
 
-        enc, alphas = self._run_encoder_trt(warmup_feats)
-        if enc is not None and alphas is not None and not np.isnan(alphas).any():
-            logger.info("Encoder TRT engine validated (no NaN)")
-            self._enc_provider = "trt"
-        else:
-            logger.warning(
-                "Encoder TRT engine produces NaN, falling back to ORT CUDA EP. "
-                "Rebuild the encoder in FP32 to restore TRT."
-            )
-            self._enc_provider = "ort_cuda"
-            import onnxruntime
-            enc_ort_opts = onnxruntime.SessionOptions()
-            enc_ort_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-            enc_ort_opts.log_severity_level = 3
-            self._enc_ort_session = onnxruntime.InferenceSession(
-                ENC_ONNX_PATH,
-                sess_options=enc_ort_opts,
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-            )
-            logger.info("Encoder ORT session loaded (providers: %s)", self._enc_ort_session.get_providers())
-            # Warmup ORT encoder
-            self._run_encoder_ort(warmup_feats)
+        warmup_bundle = self.create_context_bundle()
+        try:
+            enc, alphas = self._run_encoder_trt(warmup_feats, warmup_bundle)
+            if enc is not None and alphas is not None and not np.isnan(alphas).any():
+                logger.info("Encoder TRT engine validated (no NaN)")
+                self._enc_provider = "trt"
+            else:
+                logger.warning(
+                    "Encoder TRT engine produces NaN, falling back to ORT CUDA EP. "
+                    "Rebuild the encoder in FP32 to restore TRT."
+                )
+                self._enc_provider = "ort_cuda"
+                import onnxruntime
+                enc_ort_opts = onnxruntime.SessionOptions()
+                enc_ort_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+                enc_ort_opts.log_severity_level = 3
+                self._enc_ort_session = onnxruntime.InferenceSession(
+                    ENC_ONNX_PATH,
+                    sess_options=enc_ort_opts,
+                    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+                )
+                logger.info("Encoder ORT session loaded (providers: %s)", self._enc_ort_session.get_providers())
+                # Warmup ORT encoder
+                self._run_encoder_ort(warmup_feats)
 
-        # -- Load decoder TRT engine --
-        self._engines["dec"] = _load_trt_engine(DEC_ENGINE_PATH)
-        dec_eng = self._engines["dec"]
-        dec_tensor_names = [dec_eng.get_tensor_name(i) for i in range(dec_eng.num_io_tensors)]
-        logger.info("Decoder engine (%d I/O): %s", len(dec_tensor_names), dec_tensor_names)
-        self._contexts["dec"] = dec_eng.create_execution_context()
-
-        # Warmup decoder
-        dummy_enc = np.zeros((1, 1, 512), dtype=np.float32)
-        dummy_ae = np.zeros((1, 512), dtype=np.float32)
-        dummy_cache = [np.zeros((1, 512, 10), dtype=np.float32) for _ in range(16)]
-        self._run_decoder(dummy_enc, 1, dummy_ae, 1, dummy_cache)
+            # Warmup decoder via the same temp bundle
+            dummy_enc = np.zeros((1, 1, 512), dtype=np.float32)
+            dummy_ae = np.zeros((1, 512), dtype=np.float32)
+            dummy_cache = [np.zeros((1, 512, 10), dtype=np.float32) for _ in range(16)]
+            self._run_decoder(dummy_enc, 1, dummy_ae, 1, dummy_cache, warmup_bundle)
+        finally:
+            try:
+                warmup_bundle.destroy()
+            except Exception:
+                logger.exception("paraformer preload: warmup_bundle destroy raised")
 
         logger.info("Paraformer TRT backend ready (encoder=%s, decoder=trt)", self._enc_provider)
         self._ready = True
@@ -803,43 +942,53 @@ class ParaformerTRTBackend(ASRBackend):
         carry_e = np.zeros(512, dtype=np.float32)
         cache = [np.zeros((1, 512, 10), dtype=np.float32) for _ in range(16)]
 
-        for start in range(0, feats.shape[0], chunk_frames):
-            chunk = feats[start:start + chunk_frames]
-            if chunk.shape[0] < chunk_frames:
-                pad = np.zeros((chunk_frames - chunk.shape[0], 560), dtype=np.float32)
-                chunk = np.concatenate([chunk, pad], axis=0)
+        # Non-streaming path: own a transient per-call bundle so we never
+        # touch a stream's TRT state.
+        bundle = self.create_context_bundle()
+        try:
+            for start in range(0, feats.shape[0], chunk_frames):
+                chunk = feats[start:start + chunk_frames]
+                if chunk.shape[0] < chunk_frames:
+                    pad = np.zeros((chunk_frames - chunk.shape[0], 560), dtype=np.float32)
+                    chunk = np.concatenate([chunk, pad], axis=0)
 
-            enc, alphas = self._run_encoder(chunk)
-            if enc is None:
-                continue
+                enc, alphas = self._run_encoder(chunk, bundle)
+                if enc is None:
+                    continue
 
-            enc_t = enc[0]
-            alphas_t = alphas[0]
+                enc_t = enc[0]
+                alphas_t = alphas[0]
 
-            acoustic_embeds, carry_w, carry_e = cif(
-                enc_t, alphas_t, carry_weight=carry_w, carry_embed=carry_e,
-            )
+                acoustic_embeds, carry_w, carry_e = cif(
+                    enc_t, alphas_t, carry_weight=carry_w, carry_embed=carry_e,
+                )
 
-            if len(acoustic_embeds) == 0:
-                continue
+                if len(acoustic_embeds) == 0:
+                    continue
 
-            sample_ids = self._run_decoder(
-                enc, alphas.shape[1],
-                acoustic_embeds, len(acoustic_embeds),
-                cache,
-            )
-            if sample_ids is not None:
-                all_token_ids.extend(sample_ids.tolist())
+                sample_ids = self._run_decoder(
+                    enc, alphas.shape[1],
+                    acoustic_embeds, len(acoustic_embeds),
+                    cache,
+                    bundle,
+                )
+                if sample_ids is not None:
+                    all_token_ids.extend(sample_ids.tolist())
 
-        # Flush tail
-        if carry_w >= CIF_TAIL_THRESHOLD:
-            acoustic_embeds = (carry_e / carry_w)[np.newaxis, :]
-            dummy_enc = np.zeros((1, 1, 512), dtype=np.float32)
-            sample_ids = self._run_decoder(
-                dummy_enc, 1, acoustic_embeds, 1, cache,
-            )
-            if sample_ids is not None:
-                all_token_ids.extend(sample_ids.tolist())
+            # Flush tail
+            if carry_w >= CIF_TAIL_THRESHOLD:
+                acoustic_embeds = (carry_e / carry_w)[np.newaxis, :]
+                dummy_enc = np.zeros((1, 1, 512), dtype=np.float32)
+                sample_ids = self._run_decoder(
+                    dummy_enc, 1, acoustic_embeds, 1, cache, bundle,
+                )
+                if sample_ids is not None:
+                    all_token_ids.extend(sample_ids.tolist())
+        finally:
+            try:
+                bundle.destroy()
+            except Exception:
+                logger.exception("paraformer transcribe: bundle destroy raised")
 
         full_text = decode_ids(all_token_ids, self._tokens)
         return TranscriptionResult(text=full_text, language=language)
@@ -860,48 +1009,56 @@ class ParaformerTRTBackend(ASRBackend):
         carry_e = np.zeros(512, dtype=np.float32)
         cache = [np.zeros((1, 512, 10), dtype=np.float32) for _ in range(16)]
 
-        for start in range(0, feats.shape[0], chunk_frames):
-            chunk = feats[start:start + chunk_frames]
-            if chunk.shape[0] < chunk_frames:
-                pad = np.zeros((chunk_frames - chunk.shape[0], 560), dtype=np.float32)
-                chunk = np.concatenate([chunk, pad], axis=0)
+        bundle = self.create_context_bundle()
+        try:
+            for start in range(0, feats.shape[0], chunk_frames):
+                chunk = feats[start:start + chunk_frames]
+                if chunk.shape[0] < chunk_frames:
+                    pad = np.zeros((chunk_frames - chunk.shape[0], 560), dtype=np.float32)
+                    chunk = np.concatenate([chunk, pad], axis=0)
 
-            enc, alphas = self._run_encoder(chunk)
-            if enc is None:
-                continue
+                enc, alphas = self._run_encoder(chunk, bundle)
+                if enc is None:
+                    continue
 
-            enc_t = enc[0]
-            alphas_t = alphas[0]
+                enc_t = enc[0]
+                alphas_t = alphas[0]
 
-            acoustic_embeds, carry_w, carry_e = cif(
-                enc_t, alphas_t, carry_weight=carry_w, carry_embed=carry_e,
-            )
+                acoustic_embeds, carry_w, carry_e = cif(
+                    enc_t, alphas_t, carry_weight=carry_w, carry_embed=carry_e,
+                )
 
-            if len(acoustic_embeds) == 0:
-                continue
+                if len(acoustic_embeds) == 0:
+                    continue
 
-            sample_ids = self._run_decoder(
-                enc, alphas.shape[1],
-                acoustic_embeds, len(acoustic_embeds),
-                cache,
-            )
-            if sample_ids is not None:
-                new_ids = sample_ids.tolist()
-                text = decode_ids(new_ids, self._tokens)
-                if text:
-                    all_text_parts.append(text)
+                sample_ids = self._run_decoder(
+                    enc, alphas.shape[1],
+                    acoustic_embeds, len(acoustic_embeds),
+                    cache,
+                    bundle,
+                )
+                if sample_ids is not None:
+                    new_ids = sample_ids.tolist()
+                    text = decode_ids(new_ids, self._tokens)
+                    if text:
+                        all_text_parts.append(text)
 
-        # Flush tail (mirror of transcribe() L674-684)
-        if carry_w >= CIF_TAIL_THRESHOLD:
-            acoustic_embeds = (carry_e / carry_w)[np.newaxis, :]
-            dummy_enc = np.zeros((1, 1, 512), dtype=np.float32)
-            sample_ids = self._run_decoder(
-                dummy_enc, 1, acoustic_embeds, 1, cache,
-            )
-            if sample_ids is not None:
-                text = decode_ids(sample_ids.tolist(), self._tokens)
-                if text:
-                    all_text_parts.append(text)
+            # Flush tail (mirror of transcribe() L674-684)
+            if carry_w >= CIF_TAIL_THRESHOLD:
+                acoustic_embeds = (carry_e / carry_w)[np.newaxis, :]
+                dummy_enc = np.zeros((1, 1, 512), dtype=np.float32)
+                sample_ids = self._run_decoder(
+                    dummy_enc, 1, acoustic_embeds, 1, cache, bundle,
+                )
+                if sample_ids is not None:
+                    text = decode_ids(sample_ids.tolist(), self._tokens)
+                    if text:
+                        all_text_parts.append(text)
+        finally:
+            try:
+                bundle.destroy()
+            except Exception:
+                logger.exception("paraformer transcribe_audio: bundle destroy raised")
 
         full_text = "".join(all_text_parts)
         return TranscriptionResult(text=full_text, language=language)
@@ -920,11 +1077,19 @@ class ParaformerTRTBackend(ASRBackend):
             return result[0]
         return result
 
-    def _run_encoder(self, feats: np.ndarray) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Dispatch encoder to TRT or ORT based on runtime validation."""
+    def _run_encoder(
+        self,
+        feats: np.ndarray,
+        bundle: "_ParaformerCtxBundle",
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Dispatch encoder to TRT or ORT based on runtime validation.
+
+        ``bundle`` is the per-stream TRT context + buffer cache. ORT path
+        ignores it (CPU/CUDA EP own their own session state).
+        """
         if self._enc_provider == "ort_cuda":
             return self._run_encoder_ort(feats)
-        return self._run_encoder_trt(feats)
+        return self._run_encoder_trt(feats, bundle)
 
     def _run_encoder_ort(self, feats: np.ndarray) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Run encoder via ONNX Runtime CUDA EP.
@@ -961,11 +1126,21 @@ class ParaformerTRTBackend(ASRBackend):
 
         return enc_out, alphas_out
 
-    def _run_encoder_trt(self, feats: np.ndarray) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def _run_encoder_trt(
+        self,
+        feats: np.ndarray,
+        bundle: "_ParaformerCtxBundle",
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Run encoder TRT inference via set_tensor_address + execute_async_v3.
 
         TRT 10.x requires explicit tensor address registration before execute_async_v3.
         execute_v2(bindings) does NOT work with dynamic shapes in TRT 10.3.
+
+        Per-stream concurrency: ``bundle`` owns the IExecutionContext, the
+        device-buffer cache (bundle.enc_bindings) and the
+        per-context active-profile state (bundle.enc_active_profile). Two
+        concurrent streams have independent bundles so they can't race on
+        TRT context state or stomp each other's buffers.
 
         Args:
             feats: [feats_length, 560] float32
@@ -974,7 +1149,7 @@ class ParaformerTRTBackend(ASRBackend):
             enc: [1, feats_length, 512] or None on failure
             alphas: [1, feats_length] or None on failure
         """
-        ctx = self._contexts["enc"]
+        ctx = bundle.enc_ctx
         n_frames = feats.shape[0]
         profile_idx, enc_min_frames, enc_max_frames = self._select_encoder_profile(n_frames)
         if n_frames > enc_max_frames:
@@ -992,10 +1167,10 @@ class ParaformerTRTBackend(ASRBackend):
             n_frames = enc_min_frames
 
         key = f"enc_p{profile_idx}_{n_frames}"
-        if key not in self._bindings:
-            self._bindings[key] = self._alloc_enc_buffers(n_frames)
+        if key not in bundle.enc_bindings:
+            bundle.enc_bindings[key] = self._alloc_enc_buffers(n_frames, bundle)
 
-        bufs = self._bindings[key]
+        bufs = bundle.enc_bindings[key]
 
         # Execute on a fresh CUDA stream. Profile changes are asynchronous in
         # TRT 10, so synchronize the previous work before switching and the
@@ -1005,7 +1180,7 @@ class ParaformerTRTBackend(ASRBackend):
             logger.error("cudaStreamCreate failed: %s", err)
             return None, None
 
-        if self._enc_active_profile != profile_idx:
+        if bundle.enc_active_profile != profile_idx:
             cudart.cudaDeviceSynchronize()
             if hasattr(ctx, "set_optimization_profile_async"):
                 success = ctx.set_optimization_profile_async(profile_idx, stream)
@@ -1020,7 +1195,7 @@ class ParaformerTRTBackend(ASRBackend):
                 cudart.cudaStreamSynchronize(stream)
             elif hasattr(ctx, "active_optimization_profile"):
                 ctx.active_optimization_profile = profile_idx
-            self._enc_active_profile = profile_idx
+            bundle.enc_active_profile = profile_idx
 
         # TRT 10.x: register tensor addresses
         ctx.set_tensor_address("speech", bufs["speech"])
@@ -1123,20 +1298,14 @@ class ParaformerTRTBackend(ASRBackend):
 
         return max(ranges, key=lambda item: item[2])
 
-    def _alloc_enc_buffers(self, n_frames: int) -> dict:
+    def _alloc_enc_buffers(self, n_frames: int, bundle: "_ParaformerCtxBundle") -> dict:
         bufs = {}
-        bufs["speech"] = self._cuda_malloc(1 * n_frames * 560 * 4)
-        bufs["speech_lengths"] = self._cuda_malloc(4)
-        bufs["enc"] = self._cuda_malloc(1 * n_frames * 512 * 4)
-        bufs["enc_len"] = self._cuda_malloc(4)
-        bufs["alphas"] = self._cuda_malloc(1 * n_frames * 4)
+        bufs["speech"] = bundle.alloc(1 * n_frames * 560 * 4)
+        bufs["speech_lengths"] = bundle.alloc(4)
+        bufs["enc"] = bundle.alloc(1 * n_frames * 512 * 4)
+        bufs["enc_len"] = bundle.alloc(4)
+        bufs["alphas"] = bundle.alloc(1 * n_frames * 4)
         return bufs
-
-    def _cuda_malloc(self, nbytes: int) -> int:
-        err, ptr = cudart.cudaMalloc(nbytes)
-        if err != 0:
-            raise RuntimeError(f"cudaMalloc({nbytes}) failed: {err}")
-        return int(ptr)
 
     # -- Internal: Decoder ORT-CUDA inference ------------------------------
 
@@ -1147,6 +1316,7 @@ class ParaformerTRTBackend(ASRBackend):
         acoustic_embeds: np.ndarray,
         acoustic_embeds_len: int,
         cache: list[np.ndarray],
+        bundle: "_ParaformerCtxBundle",
     ) -> Optional[np.ndarray]:
         """Run decoder via TensorRT engine.
 
@@ -1160,9 +1330,9 @@ class ParaformerTRTBackend(ASRBackend):
         Returns:
             sample_ids: [n_tokens] int64 token IDs, or None on failure
         """
-        ctx = self._contexts.get("dec")
+        ctx = bundle.dec_ctx if bundle is not None else None
         if ctx is None:
-            logger.error("Decoder TRT context not available")
+            logger.error("Decoder TRT context not available (bundle missing or destroyed)")
             return None
 
         n_tokens = acoustic_embeds.shape[0]
@@ -1172,9 +1342,9 @@ class ParaformerTRTBackend(ASRBackend):
         enc_nframes = enc.shape[1]
         key = f"dec_{enc_nframes}_{n_tokens}"
 
-        if key not in self._bindings:
-            self._bindings[key] = self._alloc_dec_buffers(enc_nframes, n_tokens)
-        bufs = self._bindings[key]
+        if key not in bundle.dec_bindings:
+            bundle.dec_bindings[key] = self._alloc_dec_buffers(enc_nframes, n_tokens, bundle)
+        bufs = bundle.dec_bindings[key]
 
         # Register tensor addresses (TRT 10.x requirement)
         ctx.set_tensor_address("enc", bufs["enc"])
@@ -1245,18 +1415,18 @@ class ParaformerTRTBackend(ASRBackend):
 
         return sample_ids[0]
 
-    def _alloc_dec_buffers(self, enc_nframes: int, n_tokens: int) -> dict:
+    def _alloc_dec_buffers(self, enc_nframes: int, n_tokens: int, bundle: "_ParaformerCtxBundle") -> dict:
         """Allocate device buffers for decoder TRT inference."""
         bufs = {}
-        bufs["enc"] = self._cuda_malloc(1 * enc_nframes * 512 * 4)
-        bufs["enc_len"] = self._cuda_malloc(4)
-        bufs["acoustic_embeds"] = self._cuda_malloc(1 * n_tokens * 512 * 4)
-        bufs["acoustic_embeds_len"] = self._cuda_malloc(4)
-        bufs["pad_mask"] = self._cuda_malloc(n_tokens * 4)
-        bufs["enc_pad_mask"] = self._cuda_malloc(enc_nframes * 4)
+        bufs["enc"] = bundle.alloc(1 * enc_nframes * 512 * 4)
+        bufs["enc_len"] = bundle.alloc(4)
+        bufs["acoustic_embeds"] = bundle.alloc(1 * n_tokens * 512 * 4)
+        bufs["acoustic_embeds_len"] = bundle.alloc(4)
+        bufs["pad_mask"] = bundle.alloc(n_tokens * 4)
+        bufs["enc_pad_mask"] = bundle.alloc(enc_nframes * 4)
         for i in range(16):
-            bufs[f"in_cache_{i}"] = self._cuda_malloc(1 * 512 * 10 * 4)
-            bufs[f"out_cache_{i}"] = self._cuda_malloc(1 * 512 * 10 * 4)
-        bufs["logits"] = self._cuda_malloc(1 * n_tokens * 8404 * 4)  # float32
-        bufs["sample_ids"] = self._cuda_malloc(1 * n_tokens * 8)  # int64
+            bufs[f"in_cache_{i}"] = bundle.alloc(1 * 512 * 10 * 4)
+            bufs[f"out_cache_{i}"] = bundle.alloc(1 * 512 * 10 * 4)
+        bufs["logits"] = bundle.alloc(1 * n_tokens * 8404 * 4)  # float32
+        bufs["sample_ids"] = bundle.alloc(1 * n_tokens * 8)  # int64
         return bufs

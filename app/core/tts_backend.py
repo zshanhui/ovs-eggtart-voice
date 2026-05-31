@@ -13,6 +13,8 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Dict, Optional, Tuple
 
+from app.core.concurrency_capability import ConcurrencyCapability
+
 logger = logging.getLogger(__name__)
 
 
@@ -126,12 +128,26 @@ class TTSBackend(ABC):
         """Release GPU/NPU resources. See ASRBackend.unload() for semantics."""
         pass
 
+    @classmethod
+    def concurrency_capability(
+        cls, profile: Optional[dict] = None
+    ) -> ConcurrencyCapability:
+        """Describe runtime concurrency properties.
+
+        Classmethod (not instance property) so the scheduler can read the
+        ceiling before ``preload()``. Default is conservative (N=1,
+        serialized) — backends opt in by overriding. See
+        ``docs/specs/concurrency-capability-framework.md`` Section 2.
+        """
+        return ConcurrencyCapability.default()
+
 
 _TTS_REGISTRY: Dict[str, Tuple[str, str]] = {
     "jetson.trt_edge_llm": ("app.backends.jetson.trt_edge_llm_tts", "TRTEdgeLLMTTSBackend"),
     "jetson.matcha_trt":   ("app.backends.jetson.matcha_trt",       "MatchaTRTBackend"),
     "jetson.kokoro_trt":   ("app.backends.jetson.kokoro_trt",       "KokoroTRTBackend"),
     "jetson.qwen3_trt":    ("app.backends.jetson.qwen3_trt",        "Qwen3TRTBackend"),
+    "jetson.moss_tts_nano":("app.backends.jetson.moss_tts_nano",    "MossTtsNanoBackend"),
     "cpu.sherpa":          ("app.backends.cpu.sherpa",              "SherpaBackend"),
     "rk.tts":              ("app.backends.rk.tts",                  "RKTTSBackend"),
 }

@@ -27,6 +27,7 @@ from typing import Optional
 import numpy as np
 
 from app.core.asr_backend import ASRBackend, ASRCapability, ASRStream, TranscriptionResult
+from app.core.worker_io import WorkerIO, WorkerExitError as _WIOExitError
 
 from app.backends.jetson.trt_edge_llm_ipc import (
     ASR_BINARY,
@@ -41,12 +42,14 @@ from app.backends.jetson.trt_edge_llm_ipc import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MAX_GENERATE_LENGTH = int(
-    os.environ.get("ASR_MAX_GENERATE_LENGTH", "200")
-)
-_DEFAULT_TEMPERATURE = float(os.environ.get("ASR_TEMPERATURE", "1.0"))
-_DEFAULT_TOP_P = float(os.environ.get("ASR_TOP_P", "1.0"))
-_DEFAULT_TOP_K = int(os.environ.get("ASR_TOP_K", "1"))
+# Sampling defaults — read fresh per backend instance via _load_config().
+# The module-level fallbacks below are kept for the rare external importer
+# (none currently) and historical introspection; ALL request-time code must
+# pull from self._config so hot reload of ASR_TEMPERATURE etc. is honored.
+_DEFAULT_MAX_GENERATE_LENGTH = 200
+_DEFAULT_TEMPERATURE = 1.0
+_DEFAULT_TOP_P = 1.0
+_DEFAULT_TOP_K = 1
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -131,19 +134,40 @@ def _classify_worker_response(output_data: dict, *, request_event: str | None = 
 class TRTEdgeLLMASRBackend(ASRBackend):
     """ASR via TRT-Edge-LLM llm_inference subprocess."""
 
+    # supports_hot_reload: True when running in worker subprocess mode
+    # (kill+respawn releases all GPU memory cleanly). When use_worker=False
+    # the engine is held in-process and we have no clean release path.
+    @property
+    def supports_hot_reload(self) -> bool:  # type: ignore[override]
+        return self._use_worker()
+
     def __init__(self):
         self._config = self._load_config()
         self._ready = False
         self._worker: Optional[subprocess.Popen] = None
+        # ``_worker_lock`` guards the lifecycle gate (``_ensure_worker``)
+        # only — it no longer wraps the request stdin/stdout cycle.
+        # Per the WorkerIO migration (capability-followups #5), request
+        # demux is delegated to ``self._wio`` (single ``_stdin_lock`` +
+        # daemon reader thread). This mirrors the TTS backend shape and
+        # keeps the C++ ``qwen3_asr_worker`` single-session contract
+        # (the worker still rejects a second concurrent session).
         self._worker_lock = threading.Lock()
-        # Separate lock so restart_worker() can preempt a request thread
-        # that is blocked on stdout.readline() while holding _worker_lock.
-        # restart_worker() snapshots self._worker WITHOUT acquiring
-        # _worker_lock, then calls proc.kill() so the blocked readline
-        # returns and the request thread can release _worker_lock.
+        # Separate lock so restart_worker() can preempt a slow spawn
+        # without blocking on _worker_lock. Post-WorkerIO migration,
+        # request threads no longer hold _worker_lock during IO — they
+        # block on WorkerIO's per-request queue.get instead. The lock
+        # remaining here is purely the spawn gate.
         self._restart_lock = threading.Lock()
         self._worker_ready_meta: dict = {}
         self._worker_stderr_tail: deque[str] = deque(maxlen=80)
+        # WorkerIO multiplexer — bound to ``self._worker`` on each spawn.
+        # Concurrency=1 to match the C++ worker's single-session limit
+        # (qwen3_asr_worker.cpp ~line 78 hard-rejects a second session).
+        # The WorkerIO semaphore is what serializes concurrent callers
+        # in the Python layer; we do NOT broaden this without first
+        # making the C++ worker multi-session.
+        self._wio: Optional[WorkerIO] = None
 
     def _load_config(self) -> dict:
         manifest: dict = {}
@@ -218,6 +242,14 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 "EDGE_LLM_ASR_MEL_FILTERS",
                 manifest.get("mel_filters_path", ""),
             ),
+            # Sampling defaults — captured per-instance so a fresh backend
+            # built after profile reload (BackendManager rebuilds on every
+            # apply_profile) honors the new ASR_TEMPERATURE / ASR_TOP_P /
+            # ASR_TOP_K / ASR_MAX_GENERATE_LENGTH values.
+            "temperature": float(os.environ.get("ASR_TEMPERATURE", "1.0")),
+            "top_p": float(os.environ.get("ASR_TOP_P", "1.0")),
+            "top_k": int(os.environ.get("ASR_TOP_K", "1")),
+            "max_generate_length": int(os.environ.get("ASR_MAX_GENERATE_LENGTH", "200")),
             "manifest_path": manifest_path,
         }
 
@@ -239,7 +271,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         return self._ready
 
     def preload(self) -> None:
-        """Verify all required files exist."""
+        """Verify all required files exist (auto-download missing artifacts if enabled)."""
         worker_binary = self._config["worker_binary"]
         asr_binary = self._config["asr_binary"]
         plugin_path = self._config["plugin_path"]
@@ -257,13 +289,24 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 audio_encoder_dir, "audio", "audio_encoder.engine"
             ), "audio encoder engine"),
         ]
-        missing = []
-        for path, label in required:
-            if not os.path.exists(path):
-                missing.append(f"{label}: {path}")
+        missing = [(path, label) for path, label in required if not os.path.exists(path)]
+        if missing:
+            # Switching to a jetson-qwen3asr-* profile on a fresh image leaves
+            # the engine dirs empty — auto-download them so the user doesn't
+            # have to know to run deploy_qwen3_artifacts.py manually.
+            try:
+                from app.core.qwen3_artifact_downloader import ensure_artifacts
+                ensure_artifacts([p for p, _ in missing])
+            except Exception:
+                logger.exception(
+                    "Qwen3 artifact auto-download raised; will report original "
+                    "missing files below"
+                )
+            missing = [(p, l) for p, l in missing if not os.path.exists(p)]
         if missing:
             raise FileNotFoundError(
-                "ASR preload failed — missing:\n  " + "\n  ".join(missing)
+                "ASR preload failed — missing:\n  "
+                + "\n  ".join(f"{l}: {p}" for p, l in missing)
             )
         self._require_streaming_worker_assets()
 
@@ -276,6 +319,22 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         self._ready = True
         if self._use_worker():
             self._warm_worker()
+
+    def unload(self) -> None:
+        """Kill the resident ASR worker subprocess to fully release GPU memory.
+
+        Mirrors TRTEdgeLLMTTSBackend.unload(). Idempotent; safe to call from
+        BackendManager.reload() rollback. The actual SIGKILL+pipe-close happens
+        in restart_worker(); we just mark not-ready afterward.
+        """
+        if not self._ready and self._worker is None:
+            return
+        try:
+            self.restart_worker()
+        except Exception:
+            logger.exception("TRTEdgeLLMASRBackend.unload failed; continuing")
+        finally:
+            self._ready = False
 
     def _warm_worker(self) -> None:
         """Pre-warm TRT audio_encoder optimization profile for batch shapes 1..N.
@@ -421,27 +480,69 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         if ready.get("event") != "ready":
             raise RuntimeError(f"ASR worker did not become ready: {ready}")
         self._worker_ready_meta = ready
+        # Bind a fresh WorkerIO multiplexer to the new subprocess. concurrency=1
+        # matches the C++ worker's single-session limit (see __init__ note).
+        # NB: ``_ensure_worker`` reads the worker's initial ``ready`` line
+        # itself (above) BEFORE handing stdout to the WorkerIO reader thread,
+        # so the reader thread only sees subsequent per-request events.
+        self._wio = WorkerIO(self._worker, concurrency=1)
 
     def _worker_request(self, input_data: dict) -> dict:
+        """Send one streaming protocol line to the worker, return its single reply.
+
+        Streaming events emitted by ``qwen3_asr_worker`` (``begin_ack``,
+        ``partial``, ``final``, ``segment_rotation``, ``chunk_ack``,
+        ``end_ack``, ``error``) are one-line responses keyed by the
+        request's ``id`` — exactly one event per input line. We route the
+        write + read through ``WorkerIO.request()`` (so the daemon reader
+        thread demuxes by ``id``) but break out of the iterator after the
+        first event since none of the streaming events are the ``done``/
+        ``cancelled`` terminals that ``request()`` would otherwise loop
+        for. ``request()``'s finally arm still unregisters the inflight
+        queue and releases the semaphore on early break.
+
+        The same ``id`` is reused across begin → N×chunk → end, but the
+        WorkerIO inflight queue is registered fresh on each ``request()``
+        call (and popped in finally), so the lifecycle aligns as long as
+        these calls are strictly serialized — which they are: WorkerIO's
+        ``Semaphore(1)`` enforces this.
+        """
         req_event = input_data.get("event") if isinstance(input_data, dict) else None
+        # Lifecycle gate only.
         with self._worker_lock:
             self._ensure_worker()
-            assert self._worker is not None and self._worker.stdin is not None and self._worker.stdout is not None
+            wio = self._wio
+        assert wio is not None
+        try:
+            output_data: Optional[dict] = None
+            gen = wio.request(input_data)
             try:
-                self._worker.stdin.write(json.dumps(input_data, ensure_ascii=False) + "\n")
-                self._worker.stdin.flush()
-            except (BrokenPipeError, OSError) as exc:
-                stderr = self._stderr_tail_text()
-                self._worker = None
-                raise WorkerExitError(
-                    f"ASR worker stdin broken (likely killed): {exc}: {stderr}"
-                ) from exc
-            line = self._worker.stdout.readline()
-        if not line:
+                for ev in gen:
+                    output_data = ev
+                    break
+            finally:
+                gen.close()
+        except _WIOExitError as exc:
+            stderr = self._stderr_tail_text()
+            self._worker = None
+            raise WorkerExitError(
+                f"ASR worker exited before response: {exc}: {stderr}"
+            ) from exc
+        except (BrokenPipeError, OSError) as exc:
+            # WorkerIO surfaces a stdin write failure (worker subprocess
+            # already dead, pipe broken) by letting the OSError propagate
+            # out of ``request()``. Translate into the legacy
+            # WorkerExitError contract that ASRSessionManager recovery
+            # logic depends on (commit `bf24284` multi-utterance fix).
+            stderr = self._stderr_tail_text()
+            self._worker = None
+            raise WorkerExitError(
+                f"ASR worker stdin broken (likely killed): {exc}: {stderr}"
+            ) from exc
+        if output_data is None:
             stderr = self._stderr_tail_text()
             self._worker = None
             raise WorkerExitError(f"ASR worker exited before response: {stderr}")
-        output_data = json.loads(line)
         typed = _classify_worker_response(output_data, request_event=req_event)
         if typed is not None:
             raise typed
@@ -452,33 +553,51 @@ class TRTEdgeLLMASRBackend(ASRBackend):
     def restart_worker(self) -> None:
         """Forcibly kill the worker subprocess so the next request rebuilds it.
 
-        Crucially, this method MUST NOT acquire ``_worker_lock``. A request
-        thread may be blocked on ``stdout.readline()`` while holding
-        ``_worker_lock`` (typical "stuck cancel" scenario where the worker
-        is wedged and not emitting an ack). Acquiring the same lock here
-        would deadlock — the only way to release the readline is to kill
-        the subprocess so its stdout pipe EOFs.
+        Crucially, this method MUST NOT acquire ``_worker_lock``. After the
+        WorkerIO migration (capability-followups #5), ``_worker_lock`` only
+        gates ``_ensure_worker`` (spawn) — request threads now block on
+        ``WorkerIO``'s queue.get rather than on bare ``stdout.readline()``.
+        We still avoid taking ``_worker_lock`` here because a slow spawn
+        (cold start of qwen3_asr_worker is multiple seconds) holds it and
+        we want restart_worker() to be non-blocking from the caller's POV.
+
+        ``wio.close()`` (below) wakes any in-flight callers waiting on
+        ``WorkerIO``'s per-request queues with the ``_worker_exit``
+        sentinel; they surface ``WorkerExitError`` and unwind cleanly.
 
         Concurrent callers collapse to a single restart via
         ``_restart_lock`` (cheap, doesn't block on IO).
         """
-        # Snapshot WITHOUT _worker_lock — the lock holder is what we're
-        # trying to unstick. _restart_lock only serializes restarts.
+        # Snapshot WITHOUT _worker_lock — see docstring. _restart_lock
+        # only serializes concurrent restarts.
         with self._restart_lock:
             worker = self._worker
             if worker is None:
                 return
-            # Clear our reference first so other threads that finish their
-            # blocked readline (now EOF) see _worker = None and don't try
-            # to talk to a dead pipe.
+            # Clear our reference first so other threads that wake from
+            # WorkerIO's ``_worker_exit`` sentinel see ``_worker = None``
+            # and don't try to talk to a dead pipe.
             self._worker = None
             self._worker_ready_meta = {}
+            # Drop the WorkerIO multiplexer first so its daemon reader
+            # thread sees EOF cleanly when the subprocess is killed, and
+            # any in-flight callers wake with the ``_worker_exit`` sentinel
+            # raising ``WorkerExitError`` rather than hanging on q.get.
+            wio = self._wio
+            self._wio = None
+            if wio is not None:
+                try:
+                    wio.close()
+                except Exception:
+                    logger.debug("WorkerIO.close() during restart raised", exc_info=True)
             try:
                 if worker.poll() is None:
                     # Use kill() directly (SIGKILL on POSIX) so a wedged
                     # worker can't ignore SIGTERM. This force-closes its
-                    # stdout pipe, unblocking any readline holder of
-                    # _worker_lock so they release it on next op.
+                    # stdout pipe; the WorkerIO daemon reader thread sees
+                    # EOF and (defensively) wakes any remaining inflight
+                    # callers — though ``wio.close()`` above already did
+                    # so explicitly via the ``_worker_exit`` sentinel.
                     try:
                         worker.kill()
                     except Exception:
@@ -487,9 +606,9 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                         worker.wait(timeout=1.0)
                     except subprocess.TimeoutExpired:
                         pass
-                # Close pipes after kill so the readline-blocked thread
-                # definitely unblocks. close() on a stdout already EOF'd
-                # is a no-op.
+                # Close pipes after kill for hygiene. WorkerIO's reader
+                # thread will exit on stdout EOF; this is purely defensive.
+                # close() on a stdout already EOF'd is a no-op.
                 for fh in (worker.stdin, worker.stdout, worker.stderr):
                     try:
                         if fh is not None and not fh.closed:
@@ -550,27 +669,35 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 }
             ],
             "batch_size": 1,
-            "temperature": _DEFAULT_TEMPERATURE,
-            "top_p": _DEFAULT_TOP_P,
-            "top_k": _DEFAULT_TOP_K,
-            "max_generate_length": _DEFAULT_MAX_GENERATE_LENGTH,
+            "temperature": self._config["temperature"],
+            "top_p": self._config["top_p"],
+            "top_k": self._config["top_k"],
+            "max_generate_length": self._config["max_generate_length"],
             "apply_chat_template": True,
             "add_generation_prompt": True,
         }
+        # Lifecycle gate only — request demux is delegated to WorkerIO.
         with self._worker_lock:
             self._ensure_worker()
-            assert self._worker is not None and self._worker.stdin is not None and self._worker.stdout is not None
-            t0 = time.time()
-            self._worker.stdin.write(json.dumps(input_data, ensure_ascii=False) + "\n")
-            self._worker.stdin.flush()
-            line = self._worker.stdout.readline()
-            elapsed_worker = time.time() - t0
-
-        if not line:
+            wio = self._wio
+        assert wio is not None
+        t0 = time.time()
+        try:
+            # The legacy one-shot transcribe path emits exactly one terminal
+            # event (``done`` on success, ``error`` on failure) with the
+            # matching ``id``. ``wio.request()`` loops until ``done`` /
+            # ``cancelled``, which aligns naturally here.
+            output_data: dict = {}
+            for ev in wio.request(input_data):
+                output_data = ev
+        except _WIOExitError as exc:
             stderr = self._stderr_tail_text()
             self._worker = None
-            raise RuntimeError(f"ASR worker exited before response: {stderr}")
-        output_data = json.loads(line)
+            raise RuntimeError(
+                f"ASR worker exited before response: {exc}: {stderr}"
+            ) from exc
+        elapsed_worker = time.time() - t0
+
         if not output_data.get("ok"):
             raise RuntimeError(f"ASR worker failed: {output_data}")
 
@@ -667,10 +794,10 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                     }
                 ],
                 "batch_size": 1,
-                "temperature": _DEFAULT_TEMPERATURE,
-                "top_p": _DEFAULT_TOP_P,
-                "top_k": _DEFAULT_TOP_K,
-                "max_generate_length": _DEFAULT_MAX_GENERATE_LENGTH,
+                "temperature": self._config["temperature"],
+                "top_p": self._config["top_p"],
+                "top_k": self._config["top_k"],
+                "max_generate_length": self._config["max_generate_length"],
                 "apply_chat_template": True,
                 "add_generation_prompt": True,
             }
@@ -969,11 +1096,11 @@ class _TRTEdgeLLMAccumulatingASRStream(ASRStream):
         self._cancelled = True
         self._chunks = []
 
-    def finalize(self) -> str:
+    def finalize(self) -> tuple[str, Optional[str]]:
         if self._cancelled:
-            return self._final_text_cache
+            return self._final_text_cache, None
         if not self._chunks:
-            return ""
+            return "", None
         audio = np.concatenate(self._chunks)
         # The TRT audio_encoder engine is built with a fixed optimization profile
         # (~800-1500 mel frames ≈ 10-15s). Forwarding >10s of audio in one shot
@@ -999,6 +1126,7 @@ class _TRTEdgeLLMAccumulatingASRStream(ASRStream):
         # — natural speech segments split by the VAD are >=1.0s by design.
         MIN_SEG_S = 0.4
         texts: list[str] = []
+        detected_language: Optional[str] = None
         for seg in segments:
             if len(seg) / 16000 < MIN_SEG_S:
                 continue
@@ -1018,6 +1146,11 @@ class _TRTEdgeLLMAccumulatingASRStream(ASRStream):
                 # over-eagerly punctuated the end. Keeps "变得 更善于"
                 # instead of "变得。 更善于".
                 texts.append(result.text)
+                # Take the first non-empty segment's detected language as
+                # the utterance language. (Mixed-language utterances are
+                # rare; first-segment language is a safe default.)
+                if detected_language is None and getattr(result, "language", None):
+                    detected_language = result.language
 
         # Join: use the request language to pick separator. CJK languages
         # never use spaces; everything else does. Don't infer from output
@@ -1035,7 +1168,7 @@ class _TRTEdgeLLMAccumulatingASRStream(ASRStream):
                     cleaned.append(t)
             texts = cleaned
         separator = "" if is_cjk else " "
-        return separator.join(texts).strip()
+        return separator.join(texts).strip(), detected_language
 
     def get_partial(self) -> tuple[str, bool]:
         return "", False
@@ -1060,6 +1193,7 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         self._samples_since_hop = 0
         self._partial_text = ""
         self._final_text = ""
+        self._detected_language: Optional[str] = None
         self._cancelled = False
         self._closed = False
         self._begin()
@@ -1097,14 +1231,20 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
                 self._audio_accum = self._audio_accum[-carry_samples:].copy()
             return resp
         if event == "partial":
-            self._partial_text = self._backend._strip_language_prefix(
+            stripped, lang = self._backend._strip_language_prefix(
                 resp.get("text", "") or ""
-            )[0].strip()
+            )
+            self._partial_text = stripped.strip()
+            if lang:
+                self._detected_language = lang
             return resp
         if event == "final":
-            self._final_text = self._backend._strip_language_prefix(
+            stripped, lang = self._backend._strip_language_prefix(
                 resp.get("text", "") or ""
-            )[0].strip()
+            )
+            self._final_text = stripped.strip()
+            if lang:
+                self._detected_language = lang
             self._closed = True
             return resp
         raise RuntimeError(f"unexpected ASR streaming worker event: {resp}")
@@ -1133,15 +1273,15 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         # the last=true event and returns the final text.
         pass
 
-    def finalize(self) -> str:
+    def finalize(self) -> tuple[str, Optional[str]]:
         if self._cancelled or self._closed:
-            return self._final_text
+            return self._final_text, self._detected_language
         if len(self._audio_accum) == 0:
             self._backend._worker_request({"event": "end", "id": self._session_id})
             self._closed = True
-            return ""
+            return "", self._detected_language
         self._send_chunk(last=True)
-        return self._final_text
+        return self._final_text, self._detected_language
 
     def cancel_and_finalize(self) -> None:
         self._final_text = self._partial_text
@@ -1152,6 +1292,19 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         # ``with ThreadPoolExecutor`` context manager here — its __exit__
         # waits for outstanding futures, so a wedged worker_request would
         # hold the cancel path forever, defeating the timeout.
+        #
+        # NB: post-WorkerIO migration (capability-followups #5), the
+        # leaked worker thread blocks inside ``wio.request()``'s q.get
+        # (60s timeout). When ``restart_worker()`` fires, ``wio.close()``
+        # wakes it with the ``_worker_exit`` sentinel and it exits with
+        # ``WorkerExitError`` — same end state, just unblocked sooner.
+        # We do NOT use ``wio.cancel(session_id)`` here: the C++
+        # ``qwen3_asr_worker`` (third_party/...qwen3_asr_worker.cpp ~L1395)
+        # has no cancel-event handler; a stray ``{"type":"cancel",...}``
+        # line lacking an ``event`` field would route to the legacy
+        # one-shot handler and corrupt session state. Cancel semantics
+        # remain unchanged from pre-migration ("end" event + Python-side
+        # timeout) per the spec zero-behavior-change requirement.
         import concurrent.futures as _cf
         pool = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr-cancel")
         try:

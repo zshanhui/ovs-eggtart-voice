@@ -52,12 +52,13 @@ class FakeStream:
     def accept_waveform(self, sr: int, samples) -> None:
         self.accept_calls.append(samples)
 
-    def finalize(self) -> str:
+    def finalize(self):
         self.finalize_called = True
         if self._finalize_delay:
             import time as _t
             _t.sleep(self._finalize_delay)
-        return self._final_text
+        # New ABC contract: ``(text, detected_language)``.
+        return self._final_text, None
 
     def cancel(self) -> None:
         self.cancel_called = True

@@ -408,3 +408,52 @@ canvas.spark { display: block; }
 }
 .badge.hidden { display: none; }
 @keyframes llm-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+/* TTS 声音卡 + 克隆面板 */
+#ttsVoiceCard h3 { display: flex; align-items: center; justify-content: space-between; }
+.voice-reload-btn { font-size: 11px; padding: 2px 8px; }
+.voice-row { margin: 6px 0; }
+.voice-select { width: 100%; padding: 4px 6px; box-sizing: border-box; }
+.voice-meta { display: flex; gap: 10px; justify-content: space-between; }
+.voice-clone-btn { width: 100%; margin-top: 8px; }
+.voice-hint { margin-top: 4px; min-height: 14px; }
+
+.vc-record-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+#vcRecBtn.recording { background: #ef4444; }
+.vc-preview { margin: 6px 0; }
+.vc-preview audio { width: 100%; }
+#vcStatus { margin-top: 6px; min-height: 14px; }
+
+/* Sections inside the mode-settings overlay */
+.ms-divider { border: none; border-top: 1px solid var(--border, #2a2a2a); margin: 14px 0 10px; }
+.ms-section { display: flex; flex-direction: column; gap: 6px; }
+.ms-section-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-weight: 600; font-size: 13px; margin-bottom: 4px;
+}
+.ms-section .voice-select { width: 100%; }
+.ms-section .voice-meta { display: flex; gap: 10px; justify-content: space-between; margin-top: 2px; }
+.ms-section .voice-clone-btn { width: 100%; margin-top: 6px; }
+
+/* Translator card (NLLB Phase 2b) */
+#translatorBackendBadge {
+  margin-left: 8px; padding: 0 6px;
+  background: rgba(100, 100, 100, 0.15); border-radius: 4px;
+  font-weight: 400;
+}
+#translatorBackendBadge.noop { color: #888; }
+#translatorBackendBadge.ctranslate2 { background: rgba(106, 169, 240, 0.25); color: #2266aa; }
+#translatorCard #setTranslatorTgtLang { width: 100%; }
+
+/* Subtitle bubble in chat stream */
+.bubble.subtitle {
+  border-left: 3px solid #6aa9f0;
+  background: rgba(106, 169, 240, 0.05);
+}
+.sub-orig { line-height: 1.4; }
+.sub-trans { line-height: 1.4; font-size: 1.05em; font-weight: 500; margin-top: 2px; }
+.sub-tag {
+  display: inline-block; padding: 0 6px; margin-left: 4px;
+  font-size: 0.75em; background: rgba(100, 100, 100, 0.15);
+  border-radius: 4px; vertical-align: middle;
+}

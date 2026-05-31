@@ -21,11 +21,11 @@ def test_one_shot_tts_passes_code_predictor_dir(monkeypatch):
 
     captured = {}
     monkeypatch.setenv("EDGE_LLM_TTS_WORKER", "0")
+    monkeypatch.setenv("EDGE_LLM_TTS_TALKER_DIR", "/models/talker")
+    monkeypatch.setenv("EDGE_LLM_TTS_CP_DIR", "/models/code_predictor")
+    monkeypatch.setenv("EDGE_LLM_TTS_TOKENIZER_DIR", "/models/tokenizer")
+    monkeypatch.setenv("EDGE_LLM_TTS_CODE2WAV_DIR", "/models/code2wav")
     monkeypatch.setattr(tts_mod, "TTS_BINARY", "/tmp/qwen3_tts_inference")
-    monkeypatch.setattr(tts_mod, "TTS_TALKER_DIR", "/models/talker")
-    monkeypatch.setattr(tts_mod, "TTS_CODE_PREDICTOR_DIR", "/models/code_predictor")
-    monkeypatch.setattr(tts_mod, "TTS_CODE2WAV_DIR", "/models/code2wav")
-    monkeypatch.setattr(tts_mod, "TTS_TOKENIZER_DIR", "/models/tokenizer")
 
     def fake_run_binary(binary, args, timeout):
         captured["binary"] = binary
@@ -153,11 +153,11 @@ def test_segmented_tts_concatenates_one_shot_wavs(monkeypatch):
 
     calls = []
     monkeypatch.setenv("EDGE_LLM_TTS_WORKER", "0")
+    monkeypatch.setenv("EDGE_LLM_TTS_TALKER_DIR", "/models/talker")
+    monkeypatch.setenv("EDGE_LLM_TTS_CP_DIR", "/models/code_predictor")
+    monkeypatch.setenv("EDGE_LLM_TTS_TOKENIZER_DIR", "/models/tokenizer")
+    monkeypatch.setenv("EDGE_LLM_TTS_CODE2WAV_DIR", "/models/code2wav")
     monkeypatch.setattr(tts_mod, "TTS_BINARY", "/tmp/qwen3_tts_inference")
-    monkeypatch.setattr(tts_mod, "TTS_TALKER_DIR", "/models/talker")
-    monkeypatch.setattr(tts_mod, "TTS_CODE_PREDICTOR_DIR", "/models/code_predictor")
-    monkeypatch.setattr(tts_mod, "TTS_CODE2WAV_DIR", "/models/code2wav")
-    monkeypatch.setattr(tts_mod, "TTS_TOKENIZER_DIR", "/models/tokenizer")
 
     def fake_run_binary(binary, args, timeout):
         input_path = args[args.index("--inputFile") + 1]
@@ -415,10 +415,10 @@ def test_old_native_fallback_env_no_longer_changes_backend(monkeypatch, tmp_path
     monkeypatch.setenv("EDGE_LLM_TTS_NATIVE_FALLBACK", "1")
     monkeypatch.delenv("OVS_TTS_BACKEND", raising=False)
     monkeypatch.delenv("EDGE_LLM_TTS_BACKEND", raising=False)
-    monkeypatch.setattr(tts_mod, "TTS_WORKER_BINARY", str(tmp_path / "worker"))
+    monkeypatch.setenv("EDGE_LLM_TTS_WORKER_BIN", str(tmp_path / "worker"))
     monkeypatch.setattr(tts_mod, "PLUGIN_PATH", str(tmp_path / "plugin.so"))
-    monkeypatch.setattr(tts_mod, "TTS_TALKER_DIR", str(tmp_path / "talker"))
-    monkeypatch.setattr(tts_mod, "TTS_TOKENIZER_DIR", str(tmp_path / "tokenizer"))
+    monkeypatch.setenv("EDGE_LLM_TTS_TALKER_DIR", str(tmp_path / "talker"))
+    monkeypatch.setenv("EDGE_LLM_TTS_TOKENIZER_DIR", str(tmp_path / "tokenizer"))
     monkeypatch.setattr(tts_mod.TRTEdgeLLMTTSBackend, "_ensure_worker", lambda self: None)
 
     backend = tts_mod.TRTEdgeLLMTTSBackend()

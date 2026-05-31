@@ -106,40 +106,68 @@ def _download_and_extract(url: str, dest_dir: str) -> None:
 
 
 def ensure_models(language_mode: str = "zh_en", model_dir: str = "/opt/models") -> None:
-    """Ensure all required models for the given language mode are present."""
+    """Ensure all required models for the given language mode are present.
+
+    Routing is profile-driven first, language_mode-driven second. When a
+    profile is loaded, its ``asr_backend`` / ``tts_backend`` fields decide
+    which backend-specific artifacts to fetch (Qwen3 ASR, Matcha TTS,
+    Kokoro TTS). Profile-triggered requirements are UNIONED with the
+    legacy language_mode requirements so callers without a profile keep
+    working unchanged (e.g. plain ``LANGUAGE_MODE=en``).
+    """
     try:
         from app.core.profile_loader import current_profile
-        tts_backend = (current_profile() or {}).get("tts_backend")
+        profile = current_profile() or {}
     except Exception:
-        tts_backend = None
+        profile = {}
 
-    if tts_backend == "jetson.kokoro_trt":
-        kokoro = MODELS.get("en", {}).get("kokoro-multi-lang-v1_0")
-        required = {"kokoro-multi-lang-v1_0": kokoro} if kokoro else {}
+    asr_backend = profile.get("asr_backend")
+    tts_backend = profile.get("tts_backend")
 
-    elif language_mode == "rk":
+    # Profile-driven extras (UNIONed with language_mode-driven requirements
+    # further down). Pure profile users (no LANGUAGE_MODE set) end up with
+    # only the entries triggered here.
+    extra_required: dict = {}
+    matcha = MODELS.get("zh_en", {}).get("matcha-icefall-zh-en")
+    kokoro = MODELS.get("en", {}).get("kokoro-multi-lang-v1_0")
+    if tts_backend == "jetson.matcha_trt" and matcha:
+        extra_required["matcha-icefall-zh-en"] = matcha
+    if tts_backend == "jetson.kokoro_trt" and kokoro:
+        extra_required["kokoro-multi-lang-v1_0"] = kokoro
+    if asr_backend == "jetson.trt_edge_llm":
+        # Qwen3 artifacts are deployed via an external script, not via the
+        # MODELS/CDN tarball mechanism — fire it as a side-effect here.
+        _ensure_qwen3_artifacts()
+
+    if language_mode == "rk":
         _ensure_rk_artifacts()
         if os.environ.get("RK_ENSURE_MATCHA_RESOURCES", "1").lower() in ("0", "false", "no"):
             return
-        matcha = MODELS.get("zh_en", {}).get("matcha-icefall-zh-en")
         required = {"matcha-icefall-zh-en": matcha} if matcha else {}
+        required.update(extra_required)
         model_dir = os.environ.get("TTS_MODEL_DIR") or model_dir
 
     elif language_mode == "multilanguage":
+        # Preserve legacy behavior: multilanguage mode triggers Qwen3
+        # artifacts even when no profile is loaded. When a profile is
+        # active, _ensure_qwen3_artifacts may have already run above —
+        # the second call is cheap (re-verify) but harmless.
         _ensure_qwen3_artifacts()
+        required: dict = {}
         # Some multilanguage profiles pair Qwen3 ASR with Matcha TTS. Only
         # those need the Matcha acoustic ONNX + lexicon; pure Qwen3 profiles
         # should not download or validate Matcha assets during startup.
-        matcha = MODELS.get("zh_en", {}).get("matcha-icefall-zh-en")
         if tts_backend == "jetson.matcha_trt" and matcha:
-            required = {"matcha-icefall-zh-en": matcha}
-        else:
+            required["matcha-icefall-zh-en"] = matcha
+        required.update(extra_required)
+        if not required:
             return
     else:
         required = {}
         required.update(MODELS.get(language_mode, {}))
         if os.environ.get("ENSURE_OFFLINE_ASR", "").lower() in ("1", "true", "yes"):
             required.update(MODELS.get("shared", {}))
+        required.update(extra_required)
     if not required:
         return
 

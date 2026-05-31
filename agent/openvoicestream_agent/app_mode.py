@@ -46,6 +46,30 @@ class ModeContext:
     broadcast: Callable[..., Awaitable[None]]
     translator: Any = None  # TranslatorBackend; optional (defaults to None for backward compat)
     mode_manager: "ModeManager | None" = None  # Optional ModeManager handle
+    # ASR-reported language for the utterance currently being handled
+    # (human-readable name like "Chinese" / "English"). None when the
+    # backend doesn't perform language ID, or when no utterance is being
+    # processed (e.g. enter/exit hooks). InterpreterMode uses this to
+    # auto-pick the translator src language.
+    detected_language: "str | None" = None
+
+    async def speak(self, text: str) -> None:
+        """Stream a pre-composed ``text`` to TTS without invoking the LLM.
+
+        Used by modes that produce assistant text by some non-LLM path
+        (e.g. InterpreterMode → NLLB translation). The text is pushed
+        verbatim to SLV's text channel and flushed; no history append,
+        no system prompt, no token streaming.
+        """
+        if not text or not text.strip():
+            logger.info("ModeContext.speak: empty text — skipping")
+            return
+        try:
+            await self.slv.send_text(text)
+            await self.slv.flush_tts()
+        except Exception:  # pragma: no cover - best effort
+            logger.exception("ModeContext.speak: send/flush failed")
+            raise
 
     async def run_default_dialogue_turn(
         self,
@@ -106,37 +130,84 @@ class ModeContext:
 
         self.session.add_user(text)
         chunks: list[str] = []
-        first_token_received = False
-        stream = None
+        # Race #5: track ALL text we forwarded to SLV (not just LLM
+        # token chunks). Tool preamble + completion_text also go to
+        # SLV via send_text and must be aborted on cancel/error,
+        # otherwise SLV speaks the preamble of a tool the user just
+        # barged in on.
+        sent_any_text = False
         cancelled = False
         completed = False
         try:
-            llm_kwargs = {"session": self.session}
+            llm_kwargs: dict[str, Any] = {}
             if temperature is not None:
                 llm_kwargs["temperature"] = temperature
             cfg = self.config
             first_timeout = float(getattr(cfg, "llm_first_token_timeout_s", 15.0))
             idle_timeout = float(getattr(cfg, "llm_stream_idle_timeout_s", 30.0))
 
-            stream = self.llm.stream(
-                self.session.messages(system_prompt),
-                **llm_kwargs,
+            # Resolve tools_enabled + allowlist per-turn (mode override
+            # > global default). Empty allowlist + tools_enabled=True is
+            # equivalent to tools disabled (no tools schema sent to LLM).
+            #
+            # NOTE (codex review HIGH #1): distinguish "override not set"
+            # from "override explicitly set to False". Truthy fallback
+            # broke per-mode opt-out: a mode with tools_enabled=False
+            # would still inherit the global True. Use None sentinel.
+            override = self._resolve_mode_value("tools_enabled")
+            if override is None:
+                tools_enabled = bool(getattr(cfg, "tools_enabled", False))
+            else:
+                tools_enabled = bool(override)
+            allowlist_raw = self._resolve_mode_value("tools_allowlist")
+            if allowlist_raw is None:
+                allowlist_raw = getattr(cfg, "tools_default_allowlist", []) or []
+            # Semantics matrix:
+            #   tools_enabled=False                      → no tools (set())
+            #   tools_enabled=True  + allowlist non-empty → that subset (set(...))
+            #   tools_enabled=True  + allowlist empty     → ALL registered (None)
+            #
+            # `None` flows through to ``ToolRegistry.list_openai_tools(None)``
+            # which already exposes the full registry. The empty-list-means-all
+            # branch was documented in the user guide ("expose every
+            # registered tool") but the original implementation collapsed
+            # it to ``set()`` (no tools). That made
+            # ``tools_enabled=True + allowlist=[]`` operationally identical
+            # to ``tools_enabled=False`` — a footgun for solutions like
+            # voice-arm where every action a plugin registers should be
+            # callable without re-listing each name in YAML.
+            allowed_tools: set[str] | None
+            if not tools_enabled:
+                allowed_tools = set()
+            elif allowlist_raw:
+                allowed_tools = set(allowlist_raw)
+            else:
+                allowed_tools = None
+            max_iters = int(getattr(cfg, "tools_max_iterations", 5))
+
+            # Resolve registry: prefer the BaseApp-owned registry (so
+            # tests can inject), else the global default.
+            registry = None
+            bc_app = getattr(self.broadcast, "__self__", None)
+            if bc_app is not None:
+                registry = getattr(bc_app, "tool_registry", None)
+            if registry is None:
+                # Lazy import to avoid a cycle when tools module imports
+                # only at first call (cheap once cached).
+                from .tools import default_registry as _r  # noqa
+                registry = _r
+
+            from .tools import ToolCallCtx, stream_with_tools
+
+            tool_ctx = ToolCallCtx(
+                session=self.session,
+                mode_manager=self.mode_manager,
+                event_bus=self.events,
+                config=cfg,
             )
-            # Manual async-iteration so we can wrap each __anext__ in
-            # asyncio.wait_for and distinguish first-token vs stream-idle
-            # timeouts.
-            it = stream.__aiter__()
-            while True:
-                wait_timeout = first_timeout if not first_token_received else idle_timeout
-                try:
-                    token = await asyncio.wait_for(it.__anext__(), timeout=wait_timeout)
-                except StopAsyncIteration:
-                    completed = True
-                    break
-                except asyncio.TimeoutError:
-                    kind = "first_token" if not first_token_received else "stream_idle"
-                    raise LLMTimeoutError(kind, wait_timeout, "".join(chunks))
-                first_token_received = True
+
+            async def _on_token(token: str) -> None:
+                nonlocal sent_any_text
                 chunks.append(token)
                 try:
                     self.events.emit("assistant_token", token)
@@ -144,23 +215,161 @@ class ModeContext:
                     pass
                 await self.broadcast("on_assistant_token", token)
                 await self.slv.send_text(token)
+                sent_any_text = True
+
+            async def _on_tool_started(tc: dict) -> None:
+                payload = {
+                    "id": tc.get("id"),
+                    "name": tc.get("function", {}).get("name"),
+                    "arguments_json": tc.get("function", {}).get("arguments"),
+                }
+                try:
+                    self.events.emit("tool_call_started", payload)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+                await self.broadcast("on_tool_call_started", payload)
+
+            async def _on_tool_preamble(text: str) -> None:
+                # Stream the per-tool preamble verbatim to SLV. The
+                # server's sentence-boundary accumulator will synthesise
+                # this immediately (punctuation terminates the
+                # sentence) so the user hears an acknowledgement while
+                # the (potentially slow) tool dispatch is still in
+                # flight. Fail-open — a dropped/reconnecting SLV must
+                # not abort the tool round.
+                nonlocal sent_any_text
+                if not text:
+                    return
+                try:
+                    await self.slv.send_text(text)
+                    sent_any_text = True  # race #5: track for cancel abort
+                    logger.info(
+                        "dispatched tool preamble to SLV: %r", text
+                    )
+                except Exception:  # pragma: no cover - best effort
+                    logger.warning(
+                        "tool preamble send_text failed", exc_info=True
+                    )
+
+            async def _on_tool_completion_text(text: str) -> None:
+                # Counterpart to _on_tool_preamble — synthesised at the
+                # end of a "template" response_mode tool round in lieu of
+                # an LLM round 2. Fail-open: TTS drop must not abort
+                # the dialogue.
+                nonlocal sent_any_text
+                if not text:
+                    return
+                try:
+                    await self.slv.send_text(text)
+                    sent_any_text = True  # race #5: track for cancel abort
+                    logger.info(
+                        "dispatched tool completion_text to SLV: %r", text
+                    )
+                except Exception:  # pragma: no cover - best effort
+                    logger.warning(
+                        "tool completion_text send_text failed", exc_info=True
+                    )
+
+            async def _on_tool_completed(
+                tc: dict, result: dict, dt_ms: float
+            ) -> None:
+                ok = not (
+                    isinstance(result, dict) and result.get("success") is False
+                )
+                name = tc.get("function", {}).get("name")
+                cid = tc.get("id")
+                completed_payload = {
+                    "id": cid,
+                    "name": name,
+                    "ok": ok,
+                    "duration_ms": dt_ms,
+                }
+                try:
+                    self.events.emit("tool_call_completed", completed_payload)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+                await self.broadcast("on_tool_call_completed", completed_payload)
+                if not ok:
+                    err_payload = {
+                        "id": cid,
+                        "name": name,
+                        "error": str(result.get("error")) if isinstance(result, dict) else "",
+                    }
+                    try:
+                        self.events.emit("tool_call_error", err_payload)
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                    await self.broadcast("on_tool_call_error", err_payload)
+
+            def _on_timeout(kind: str, t_used: float, partial: str) -> BaseException:
+                return LLMTimeoutError(kind, t_used, partial)
+
+            messages_for_llm = self.session.messages(system_prompt)
+            # Inject `session` kwarg under llm_kwargs so it reaches the
+            # backend (legacy contract for prefix_cache control).
+            llm_kwargs["session"] = self.session
+
+            await stream_with_tools(
+                self.llm,
+                messages_for_llm,
+                session=self.session,
+                registry=registry,
+                allowed_tools=allowed_tools,
+                ctx=tool_ctx,
+                max_iterations=max_iters,
+                on_assistant_token=_on_token,
+                # ``allowed_tools`` may be ``None`` (= all registered) so
+                # the truthy check below would skip the callbacks. Gate on
+                # ``tools_enabled`` directly — that's the real semantic.
+                on_tool_started=_on_tool_started if tools_enabled else None,
+                on_tool_preamble=_on_tool_preamble if tools_enabled else None,
+                on_tool_completion_text=_on_tool_completion_text if tools_enabled else None,
+                on_tool_completed=_on_tool_completed if tools_enabled else None,
+                llm_kwargs=llm_kwargs,
+                first_token_timeout_s=first_timeout,
+                idle_timeout_s=idle_timeout,
+                on_timeout=_on_timeout,
+            )
+            completed = True
         except asyncio.CancelledError:
             cancelled = True
-            close = getattr(stream, "aclose", None)
-            if callable(close):
+            # CRITICAL: tell SLV to drop the per-turn text buffer.
+            # Tokens already streamed via ``slv.send_text()`` sit on the
+            # server until a ``tts_flush`` or ``abort``. If this cancel
+            # was a barge-in (or a thinking-watchdog recovery, or a new
+            # asr_final pre-empting an in-flight turn), the next turn's
+            # tokens get APPENDED to ours → server TTSes the merge of
+            # both turns and our state machine sees confused replies.
+            # Best-effort; if SLV is unreachable we'll fail open and the
+            # next turn at least starts on a fresh connect.
+            # Race #5: also abort when only tool preamble / completion_text
+            # was sent (no LLM tokens yet) — those texts are equally
+            # buffered on SLV's TTS pipeline and must not bleed into the
+            # next turn.
+            if chunks or sent_any_text:
                 try:
-                    await close()
+                    await self.slv.abort()
                 except Exception:  # pragma: no cover - best effort
-                    logger.debug("LLM stream aclose failed during cancel", exc_info=True)
+                    logger.debug("SLV abort during cancel failed", exc_info=True)
+                stop = getattr(self.audio, "stop_playback", None)
+                if callable(stop):
+                    try:
+                        await stop()
+                    except Exception:  # pragma: no cover - best effort
+                        logger.debug(
+                            "stop_playback during cancel failed", exc_info=True
+                        )
             raise
         except Exception:
-            # If upstream fails after yielding partial tokens, those tokens may
-            # already be queued in SLV's TTS buffer. Do not flush them into an
-            # audible half-sentence or persist them as an assistant reply.
-            if chunks:
+            # Partial tokens already flushed to SLV's TTS buffer — abort
+            # so we don't speak a half-sentence or persist it as an
+            # assistant reply. The runner already rolled session.history
+            # back on its own exception path for tool rounds.
+            # Race #5: include tool preamble / completion_text sends.
+            if chunks or sent_any_text:
                 logger.info(
-                    "LLM stream failed after %d partial token(s); aborting partial TTS",
-                    len(chunks),
+                    "LLM stream failed after %d partial token(s) (sent_any_text=%s); aborting partial TTS",
+                    len(chunks), sent_any_text,
                 )
                 try:
                     await self.slv.abort()
@@ -182,8 +391,6 @@ class ModeContext:
                     await self.slv.flush_tts()
                 except Exception:  # pragma: no cover - best effort
                     pass
-            if chunks and completed and not cancelled:
-                self.session.add_assistant("".join(chunks))
             cm = getattr(self.llm, "last_cache_metrics", None)
             if cm:
                 try:

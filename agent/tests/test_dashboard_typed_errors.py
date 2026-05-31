@@ -55,7 +55,7 @@ async def test_generic_llm_failure_emits_typed_llm_failure():
     cap = _CaptureErrPlugin()
     app.plugins.append(cap)
 
-    async def boom(text: str) -> None:
+    async def boom(text: str, detected_language: str | None = None) -> None:
         raise RuntimeError("edge-llm down")
 
     app.on_user_utterance = boom  # type: ignore[assignment]
@@ -81,7 +81,7 @@ async def test_llm_stream_error_emits_typed_llm_stream_error():
     cap = _CaptureErrPlugin()
     app.plugins.append(cap)
 
-    async def boom(text: str) -> None:
+    async def boom(text: str, detected_language: str | None = None) -> None:
         raise LLMStreamError("finish_reason=error")
 
     app.on_user_utterance = boom  # type: ignore[assignment]
@@ -99,7 +99,7 @@ async def test_llm_timeout_emits_typed_llm_timeout():
     cap = _CaptureErrPlugin()
     app.plugins.append(cap)
 
-    async def boom(text: str) -> None:
+    async def boom(text: str, detected_language: str | None = None) -> None:
         raise LLMTimeoutError("first_token", 15.0)
 
     app.on_user_utterance = boom  # type: ignore[assignment]
@@ -121,7 +121,7 @@ async def test_llm_unavailable_emits_typed_llm_unavailable():
     cap = _CaptureErrPlugin()
     app.plugins.append(cap)
 
-    async def boom(text: str) -> None:
+    async def boom(text: str, detected_language: str | None = None) -> None:
         raise LLMUnavailable("breaker open: DOWN")
 
     app.on_user_utterance = boom  # type: ignore[assignment]

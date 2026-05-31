@@ -253,6 +253,101 @@
           "source": "Seeed CDN models-matcha.tar.gz via model_downloader"
         }
       ]
+    },
+    "rk3588-kokoro-hybrid-2026-05-23": {
+      "soc": "rk3588",
+      "profile": "kokoro-rknn",
+      "root": "/",
+      "runtime": {
+        "rknn_toolkit_lite2": "2.3.2"
+      },
+      "runtime_contract": {
+        "tts_path": "kokoro_hybrid",
+        "closed_loop_validated": true,
+        "env": {
+          "TTS_BACKEND": "kokoro_rknn",
+          "KOKORO_RKNN_MODE": "hybrid",
+          "KOKORO_PREFIX_ONNX": "kokoro-prefix-cpu.onnx",
+          "KOKORO_FRONT_RKNN": "rk3588/kokoro-decoder-front.int8.rknn",
+          "KOKORO_TAIL_ONNX": "kokoro-generator-tail-cpu.onnx"
+        }
+      },
+      "files": [
+        {
+          "path": "opt/kokoro-rknn/kokoro-prefix-cpu.onnx",
+          "source_path": "rk3588/kokoro-hybrid-v1/kokoro-prefix-cpu.onnx",
+          "size_bytes": 22922434,
+          "sha256": "549fece07d8696ae9ea60f4667e2680b5ca1f41735af545489a378eed3fe1f1c"
+        },
+        {
+          "path": "opt/kokoro-rknn/kokoro-generator-tail-cpu.onnx",
+          "source_path": "rk3588/kokoro-hybrid-v1/kokoro-generator-tail-cpu.onnx",
+          "size_bytes": 89009749,
+          "sha256": "1bdbb9fdea62922e79fa29891471e7797047f16636bff9bfb8944b28ee451bcb"
+        },
+        {
+          "path": "opt/kokoro-rknn/rk3588/kokoro-decoder-front.int8.rknn",
+          "source_path": "rk3588/kokoro-hybrid-v1/rk3588/kokoro-decoder-front.int8.rknn",
+          "size_bytes": 40599018,
+          "sha256": "a6de7a2512d83a22cfba8e1793b1f463108126dfee4eb8592a28fe7c268d6861"
+        }
+      ]
+    },
+    "rk3588-kokoro-hybrid-34pct-2026-05-23": {
+      "soc": "rk3588",
+      "profile": "kokoro-rknn-34pct",
+      "root": "/",
+      "runtime": {
+        "rknn_toolkit_lite2": "2.3.2"
+      },
+      "runtime_contract": {
+        "tts_path": "kokoro_hybrid_4stage",
+        "closed_loop_validated": true,
+        "production_validated_at": "2026-05-23",
+        "validation_status": "http_rtf_pass",
+        "closed_loop_phrase": "Hello, how are you today?",
+        "env": {
+          "TTS_BACKEND": "kokoro_rknn",
+          "KOKORO_RKNN_MODE": "hybrid",
+          "KOKORO_PREFIX_ONNX": "kokoro-prefix-cpu.onnx",
+          "KOKORO_FRONT_RKNN": "rk3588/kokoro-decoder-front.int8.rknn",
+          "KOKORO_TAIL_ONNX": "kokoro-generator-tail-cpu.onnx",
+          "KOKORO_RKNN_VOCODER_FRONT_PATH": "rk3588/kokoro-vocoder-front-half.native.fp16.rknn",
+          "KOKORO_RKNN_TAIL_REST_PATH": "kokoro-vocoder-tail-rest-cpu.onnx"
+        }
+      },
+      "files": [
+        {
+          "path": "opt/kokoro-rknn/kokoro-prefix-cpu.onnx",
+          "source_path": "rk3588/kokoro-hybrid-v1/kokoro-prefix-cpu.onnx",
+          "size_bytes": 22922434,
+          "sha256": "549fece07d8696ae9ea60f4667e2680b5ca1f41735af545489a378eed3fe1f1c"
+        },
+        {
+          "path": "opt/kokoro-rknn/kokoro-generator-tail-cpu.onnx",
+          "source_path": "rk3588/kokoro-hybrid-v1/kokoro-generator-tail-cpu.onnx",
+          "size_bytes": 89009749,
+          "sha256": "1bdbb9fdea62922e79fa29891471e7797047f16636bff9bfb8944b28ee451bcb"
+        },
+        {
+          "path": "opt/kokoro-rknn/rk3588/kokoro-decoder-front.int8.rknn",
+          "source_path": "rk3588/kokoro-hybrid-v1/rk3588/kokoro-decoder-front.int8.rknn",
+          "size_bytes": 40599018,
+          "sha256": "a6de7a2512d83a22cfba8e1793b1f463108126dfee4eb8592a28fe7c268d6861"
+        },
+        {
+          "path": "opt/kokoro-rknn/rk3588/kokoro-vocoder-front-half.native.fp16.rknn",
+          "source_path": "rk3588/kokoro-hybrid-v1/rk3588/kokoro-vocoder-front-half.native.fp16.rknn",
+          "size_bytes": 42971539,
+          "sha256": "8ae6b6284d39f60390dd65634105c1c6703488b54e372c54efca823a196d090e"
+        },
+        {
+          "path": "opt/kokoro-rknn/kokoro-vocoder-tail-rest-cpu.onnx",
+          "source_path": "rk3588/kokoro-hybrid-v1/kokoro-vocoder-tail-rest-cpu.onnx",
+          "size_bytes": 27676816,
+          "sha256": "e6d3407939f389b14525f76cfd90262bcddeba52119ecf851694b4127767aae4"
+        }
+      ]
     }
   }
 }

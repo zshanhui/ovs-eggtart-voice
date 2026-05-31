@@ -7,7 +7,7 @@ from typing import Any, AsyncIterator
 
 from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI
 
-from .base import LLMBackend
+from .base import LLMBackend, LLMEvent
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,20 @@ def _is_retryable(exc: BaseException) -> bool:
     return False
 
 
+def _has_event_payload(ev: LLMEvent) -> bool:
+    """A stream event 'counts' as first-token for retry-cutoff purposes
+    when it carries either text or tool-call payload (mirrors the
+    warehouse_system ``_has_payload_delta`` trick — a role-only delta
+    must not lock out the retry path)."""
+    if ev.kind == "text" and ev.text:
+        return True
+    if ev.kind == "tool_call_delta" and (
+        ev.tool_call_id or ev.name or ev.arguments
+    ):
+        return True
+    return False
+
+
 class OpenAICompatBackend(LLMBackend):
     def __init__(
         self,
@@ -53,9 +67,9 @@ class OpenAICompatBackend(LLMBackend):
         self._retry_backoff_s = max(0.0, float(retry_backoff_s))
 
     async def _do_stream(
-        self, messages: list[dict[str, str]], **kw: Any
-    ) -> AsyncIterator[str]:
-        """One full attempt at the upstream call. Yields text deltas.
+        self, messages: list[dict[str, Any]], **kw: Any
+    ) -> AsyncIterator[LLMEvent]:
+        """One full attempt at the upstream call. Yields :class:`LLMEvent`.
 
         Detects upstream SSE error frames (``finish_reason="error"``)
         emitted mid-stream and converts them into ``LLMStreamError`` so
@@ -63,6 +77,7 @@ class OpenAICompatBackend(LLMBackend):
         """
         params: dict[str, Any] = {**self.default_params, **kw}
         extra_body = params.pop("extra_body", None)
+        tools = params.pop("tools", None)
         request_kwargs: dict[str, Any] = {
             "model": params.pop("model", self.model),
             "messages": messages,
@@ -70,6 +85,8 @@ class OpenAICompatBackend(LLMBackend):
         }
         if extra_body:
             request_kwargs["extra_body"] = extra_body
+        if tools:
+            request_kwargs["tools"] = tools
         # Forward any remaining caller params (temperature, max_tokens...).
         request_kwargs.update(params)
 
@@ -103,32 +120,48 @@ class OpenAICompatBackend(LLMBackend):
                     self.last_cache_metrics = cm
             except Exception:  # pragma: no cover - defensive
                 pass
+            try:
+                choice0 = chunk.choices[0] if chunk.choices else None
+            except (IndexError, AttributeError):
+                choice0 = None
+            if choice0 is None:
+                continue
+            delta = getattr(choice0, "delta", None)
+            finish_reason = getattr(choice0, "finish_reason", None)
             # Detect upstream "I gave up" SSE frame. edge-llm's
             # api_server.py emits `finish_reason="error"` with an empty
             # delta when streaming generation blows up after HTTP 200.
-            try:
-                choice0 = chunk.choices[0] if chunk.choices else None
-                finish_reason = getattr(choice0, "finish_reason", None)
-            except (IndexError, AttributeError):
-                choice0 = None
-                finish_reason = None
             if finish_reason == "error":
                 raise LLMStreamError(
                     "upstream emitted finish_reason=error mid-stream"
                 )
-            try:
-                delta = chunk.choices[0].delta.content
-            except (IndexError, AttributeError):
-                delta = None
-            if delta:
-                yield delta
+            if delta is not None:
+                content = getattr(delta, "content", None)
+                if content:
+                    yield LLMEvent(kind="text", text=content)
+                tool_calls = getattr(delta, "tool_calls", None) or []
+                for tc in tool_calls:
+                    idx = getattr(tc, "index", None)
+                    if idx is None:
+                        idx = 0
+                    fn = getattr(tc, "function", None)
+                    yield LLMEvent(
+                        kind="tool_call_delta",
+                        tool_call_index=idx,
+                        tool_call_id=getattr(tc, "id", None),
+                        name=getattr(fn, "name", None) if fn else None,
+                        arguments=getattr(fn, "arguments", None) if fn else None,
+                    )
+            if finish_reason:
+                yield LLMEvent(kind="finish", finish_reason=finish_reason)
 
-    async def stream(
-        self, messages: list[dict[str, str]], **kw: Any
-    ) -> AsyncIterator[str]:
-        """Public stream entry — wraps ``_do_stream`` with transient-failure
-        retry. We only retry while we have *not yet yielded a token*: once
-        the caller sees any text we must not duplicate it on a re-attempt.
+    async def stream_events(
+        self, messages: list[dict[str, Any]], **kw: Any
+    ) -> AsyncIterator[LLMEvent]:
+        """Public event-stream entry — wraps ``_do_stream`` with
+        transient-failure retry. We only retry while we have *not yet
+        yielded any payload* (text or tool-call info): once the caller
+        sees content we must not duplicate it on a re-attempt.
 
         ``LLMStreamError`` is never retried — by definition it surfaces
         after the upstream has already produced (or tried to produce)
@@ -138,49 +171,63 @@ class OpenAICompatBackend(LLMBackend):
             When ``True``, the A3 transient-failure retry loop is bypassed
             (single attempt). EdgeLLMBackend's A4 fallback path passes this
             so we don't end up with A3-retry × A4-retry = 4 upstream calls
-            when prefix_cache failures arrive as 5xx. ``_`` prefix marks it
-            as an internal contract between EdgeLLM and the base class —
-            callers should not rely on it.
+            when prefix_cache failures arrive as 5xx.
         """
         retry_disabled = bool(kw.pop("_retry_disabled", False))
         attempts = 1 if retry_disabled else (1 + self._retry_on_transient)
         last_exc: BaseException | None = None
         for attempt in range(attempts):
             gen = self._do_stream(messages, **kw)
+            payload_seen = False
+            retry_now = False
             try:
-                first = await gen.__anext__()
-            except StopAsyncIteration:
-                # Empty stream — treat as a successful (if uninteresting)
-                # call. Drain the generator's aclose() for hygiene.
-                await gen.aclose()
-                return
-            except BaseException as e:  # noqa: BLE001
-                # Failure before any token was yielded → safe to retry.
-                await gen.aclose()
-                if _is_retryable(e) and attempt < attempts - 1:
-                    last_exc = e
-                    logger.warning(
-                        "LLM transient failure on attempt %d/%d: %r — "
-                        "retrying in %.2fs",
-                        attempt + 1, attempts, e, self._retry_backoff_s,
-                    )
-                    await asyncio.sleep(self._retry_backoff_s)
-                    continue
-                raise
-            # First token in hand. From here on, do NOT retry — yield
-            # everything through the caller as-is, including any failure.
-            try:
-                yield first
-                async for tok in gen:
-                    yield tok
+                while True:
+                    try:
+                        ev = await gen.__anext__()
+                    except StopAsyncIteration:
+                        return
+                    except BaseException as e:  # noqa: BLE001
+                        if (
+                            not payload_seen
+                            and _is_retryable(e)
+                            and attempt < attempts - 1
+                        ):
+                            last_exc = e
+                            logger.warning(
+                                "LLM transient failure on attempt %d/%d: %r"
+                                " — retrying in %.2fs",
+                                attempt + 1,
+                                attempts,
+                                e,
+                                self._retry_backoff_s,
+                            )
+                            retry_now = True
+                            break
+                        raise
+                    if _has_event_payload(ev):
+                        payload_seen = True
+                    yield ev
             finally:
                 await gen.aclose()
+            if retry_now:
+                await asyncio.sleep(self._retry_backoff_s)
+                continue
             return
         # Loop fell through without a return — means we exhausted retries
         # entirely on the connect/first-token path. Re-raise the last
         # observed exception.
         if last_exc is not None:  # pragma: no cover - defensive
             raise last_exc
+
+    async def stream(
+        self, messages: list[dict[str, Any]], **kw: Any
+    ) -> AsyncIterator[str]:
+        """Backward-compat text-only iterator. Existing callers that
+        only care about assistant text get a plain ``str`` stream and
+        don't need to know tool_calls exist."""
+        async for ev in self.stream_events(messages, **kw):
+            if ev.kind == "text" and ev.text:
+                yield ev.text
 
     async def aclose(self) -> None:
         try:

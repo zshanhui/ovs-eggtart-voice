@@ -37,7 +37,13 @@ class AudioIO:
         self.input_device = input_device
         self.output_device = output_device
         self.input_sr = input_sr
-        self.output_sr = output_sr
+        self.output_sr = output_sr  # fixed device output rate
+        # Source rate of incoming TTS PCM. Defaults to output_sr (no resample).
+        # When the TTS model emits a different rate (matcha=16k vs qwen3=24k),
+        # ``set_source_sample_rate()`` updates this and ``play()`` resamples
+        # rather than tearing down the underlying audio stream — macOS BT
+        # devices often silently fail when their sample rate is switched.
+        self._source_sr = output_sr
         self.chunk_ms = chunk_ms
         self._chunk_frames = int(input_sr * chunk_ms / 1000)
 
@@ -45,6 +51,13 @@ class AudioIO:
         self._in_queue: asyncio.Queue[bytes] | None = None
         self._out_queue: asyncio.Queue[bytes] | None = None
         self._input_stream: "sd.RawInputStream | None" = None
+        self._input_callback = None  # set on first start_capture for reopen
+        # PortAudio bad-state recovery: consecutive open failures trigger
+        # a library terminate+reinit, which clears CoreAudio (macOS)
+        # corruption caused by BT disconnect/reconnect or third-party
+        # apps stealing the device. Reset after this many failures.
+        self._input_open_failures: int = 0
+        self._PA_RESET_THRESHOLD: int = 3
         self._output_stream: "sd.RawOutputStream | None" = None
         self._playback_task: asyncio.Task | None = None
         self._playback_buffer = bytearray()
@@ -56,6 +69,12 @@ class AudioIO:
         # don't resume audible playback after we've silenced the speaker.
         # Cleared by arm_for_next_turn() at the start of the next utterance.
         self._discard_playback = False
+        # Device hot-plug watcher state.
+        self._device_watcher_task: asyncio.Task | None = None
+        self._device_signature: tuple | None = None
+        self._device_watch_interval_s: float = float(
+            __import__("os").environ.get("OVS_AUDIO_WATCH_S", "3.0")
+        )
 
     @property
     def is_playing(self) -> bool:
@@ -88,15 +107,15 @@ class AudioIO:
             except Exception as e:  # pragma: no cover
                 logger.warning("mic cb error: %s", e)
 
-        self._input_stream = sd.RawInputStream(
-            samplerate=self.input_sr,
-            blocksize=self._chunk_frames,
-            device=self.input_device,
-            channels=1,
-            dtype="int16",
-            callback=_cb,
-        )
-        self._input_stream.start()
+        # Capture the callback for device-hot-plug reopen.
+        self._input_callback = _cb
+
+        self._open_input_stream()
+        self._device_signature = self._compute_device_signature()
+        if self._device_watcher_task is None or self._device_watcher_task.done():
+            self._device_watcher_task = self._loop.create_task(
+                self._watch_devices(), name="audio-device-watcher"
+            )
 
         try:
             while True:
@@ -104,6 +123,183 @@ class AudioIO:
                 yield chunk
         finally:
             self._stop_input_stream()
+            if self._device_watcher_task is not None:
+                self._device_watcher_task.cancel()
+                try:
+                    await self._device_watcher_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                self._device_watcher_task = None
+
+    def _build_and_start_input_stream(self):
+        """Construct + start a fresh RawInputStream. Closes the stream
+        handle on start() failure to avoid leaks (Codex review #2)."""
+        # device=None lets PortAudio resolve to the *current* system default,
+        # so a hot-plug change picks up automatically on reopen.
+        stream = sd.RawInputStream(
+            samplerate=self.input_sr,
+            blocksize=self._chunk_frames,
+            device=self.input_device,
+            channels=1,
+            dtype="int16",
+            callback=self._input_callback,
+        )
+        try:
+            stream.start()
+        except Exception:
+            try:
+                stream.close()
+            except Exception:  # pragma: no cover
+                pass
+            raise
+        return stream
+
+    def _reset_portaudio_library(self) -> None:
+        """Terminate + reinitialize PortAudio to clear a bad library state.
+
+        macOS CoreAudio occasionally enters a state where every new
+        ``Pa_OpenStream`` returns ``-9986`` even though the device
+        itself works (verifiable from a fresh Python process). This
+        sequence flushes that state in-process. All existing streams
+        MUST be closed first — calling ``Pa_Terminate`` while streams
+        are open is undefined behavior.
+        """
+        # Close every stream we own, ignoring failures.
+        for attr in ("_input_stream", "_output_stream"):
+            stream = getattr(self, attr, None)
+            if stream is None:
+                continue
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+            setattr(self, attr, None)
+        # PortAudio C library cycle. The sounddevice module exposes the
+        # private helpers; this is the documented way to reinit.
+        try:
+            sd._terminate()
+        except Exception as e:  # pragma: no cover
+            logger.warning("PortAudio terminate failed: %s", e)
+        try:
+            sd._initialize()
+        except Exception as e:  # pragma: no cover
+            logger.warning("PortAudio reinitialize failed: %s", e)
+        # Refresh the cached device signature so the watcher doesn't
+        # treat the post-reset state as another topology change.
+        self._device_signature = self._compute_device_signature()
+
+    def _open_input_stream(self) -> None:
+        """Open (or reopen) the RawInputStream using the current default device.
+
+        Falls back to a PortAudio library reset (terminate+reinit) after
+        ``_PA_RESET_THRESHOLD`` consecutive failures — recovers from
+        macOS CoreAudio corruption (BT bounce, app conflict) without
+        restarting the agent process.
+        """
+        assert self._input_callback is not None
+        try:
+            stream = self._build_and_start_input_stream()
+        except Exception:
+            self._input_open_failures += 1
+            if self._input_open_failures >= self._PA_RESET_THRESHOLD:
+                logger.warning(
+                    "PortAudio refused input %d times in a row; "
+                    "resetting library and retrying",
+                    self._input_open_failures,
+                )
+                self._reset_portaudio_library()
+                # one retry attempt after the reset
+                stream = self._build_and_start_input_stream()
+                self._input_open_failures = 0
+            else:
+                raise
+        self._input_stream = stream
+        self._input_open_failures = 0
+        # Log the resolved device name for field debuggability — useful
+        # to verify which mic the agent ended up on after a hot-plug.
+        try:
+            dev_idx = self._input_stream.device  # PortAudio resolves None
+            name = sd.query_devices(dev_idx)["name"] if dev_idx is not None else "(default)"
+            logger.info(
+                "input stream open: device=%s sr=%d chunk=%d",
+                name, self.input_sr, self._chunk_frames,
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    @staticmethod
+    def _compute_device_signature() -> tuple:
+        """Identity tuple over current PortAudio device topology + default.
+
+        Reopen the streams whenever this changes (BT connect/disconnect,
+        USB hot-plug, default device swap in System Preferences). Polling
+        is preferable to a CoreAudio property listener because it's the
+        same code on Linux/Pi/Jetson hosts.
+        """
+        try:
+            default = tuple(sd.default.device) if isinstance(
+                sd.default.device, (list, tuple)
+            ) else (sd.default.device, sd.default.device)
+            devs = sd.query_devices()
+        except Exception:
+            return ()
+        # Name + channel-count signature; ignore latencies (jitter).
+        return (
+            default,
+            tuple(
+                (d["name"], d["max_input_channels"], d["max_output_channels"])
+                for d in devs
+            ),
+        )
+
+    async def _watch_devices(self) -> None:
+        """Poll PortAudio device list; on change, reopen both streams.
+
+        Cheap (a few hundred μs per poll) and runs at ``OVS_AUDIO_WATCH_S``
+        cadence (default 3s). The reopen swaps the device transparently —
+        the asyncio queue stays the same, so consumers see no break.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self._device_watch_interval_s)
+            except asyncio.CancelledError:
+                return
+            sig = self._compute_device_signature()
+            if sig and sig != self._device_signature:
+                logger.info(
+                    "audio device topology changed; reopening streams"
+                )
+                self._device_signature = sig
+                try:
+                    await self._reopen_streams()
+                except Exception as e:
+                    logger.warning("audio device reopen failed: %s", e)
+
+    async def _reopen_streams(self) -> None:
+        """Stop + reopen input/output streams against the new default device.
+
+        Runs on the event loop thread. ``sd.RawInputStream.stop()`` blocks
+        until the PortAudio callback returns, so this is race-safe.
+        """
+        # Input
+        if self._input_stream is not None and self._input_callback is not None:
+            self._stop_input_stream()
+            try:
+                self._open_input_stream()
+            except Exception as e:
+                logger.warning("input stream reopen failed: %s", e)
+        # Output — re-create lazily on next play() to use the new default
+        if self._output_stream is not None:
+            try:
+                self._output_stream.stop()
+                self._output_stream.close()
+            except Exception:
+                pass
+            self._output_stream = None
 
     def _safe_put(self, data: bytes) -> None:
         """Runs on the asyncio loop thread; drops the chunk if the queue is full."""
@@ -152,6 +348,16 @@ class AudioIO:
         if self._output_stream is not None:
             return
         self._ensure_playback_buffer()
+        # Query the device's preferred sample rate. macOS Bluetooth in HFP
+        # profile is mono 16k; pushing 24k into it produces silent playback.
+        # Use whatever the device wants, and let play() resample to it.
+        device_sr = self._resolve_output_sample_rate()
+        if device_sr != self.output_sr:
+            logger.info(
+                "output stream sample rate %d -> %d (device-preferred)",
+                self.output_sr, device_sr,
+            )
+            self.output_sr = device_sr
         self._output_stream = sd.RawOutputStream(
             samplerate=self.output_sr,
             blocksize=max(1, int(self.output_sr * 0.02)),
@@ -161,6 +367,35 @@ class AudioIO:
             callback=self._output_callback,
         )
         self._output_stream.start()
+        try:
+            dev_idx = self._output_stream.device
+            name = sd.query_devices(dev_idx)["name"] if dev_idx is not None else "(default)"
+            logger.info(
+                "output stream open: device=%s sr=%d", name, self.output_sr,
+            )
+        except Exception:  # pragma: no cover
+            pass
+
+    def _resolve_output_sample_rate(self) -> int:
+        """Pick a sample rate the current default output device accepts.
+
+        macOS Bluetooth in HFP/SCO profile only supports its native rate
+        (typically 16k mono). Opening at 24k or 48k there results in
+        silent playback. Query the device and prefer its declared
+        ``default_samplerate``; fall back to the configured rate when
+        the query fails.
+        """
+        try:
+            if self.output_device is not None:
+                info = sd.query_devices(self.output_device, kind="output")
+            else:
+                info = sd.query_devices(kind="output")
+            sr = int(info.get("default_samplerate") or 0)
+            if sr > 0:
+                return sr
+        except Exception:
+            pass
+        return self.output_sr
 
     async def _playback_loop(self) -> None:
         assert self._out_queue is not None
@@ -205,8 +440,28 @@ class AudioIO:
         self._ensure_output()
         self._ensure_playback_buffer()
         self._is_playing = True
+        # Resample to the device's fixed output rate when source differs.
+        # Linear interpolation on int16 — fine for voice at modest ratios
+        # (e.g. 16k↔24k); avoids scipy dependency on edge images.
+        if self._source_sr != self.output_sr and pcm:
+            pcm = self._resample_int16(pcm, self._source_sr, self.output_sr)
         with self._playback_lock:
             self._playback_buffer.extend(pcm)
+
+    @staticmethod
+    def _resample_int16(pcm: bytes, sr_in: int, sr_out: int) -> bytes:
+        if sr_in == sr_out or not pcm:
+            return pcm
+        x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+        n_out = int(round(len(x) * sr_out / sr_in))
+        if n_out <= 0:
+            return b""
+        y = np.interp(
+            np.linspace(0, len(x) - 1, n_out, dtype=np.float64),
+            np.arange(len(x), dtype=np.float64),
+            x,
+        )
+        return np.clip(y, -32768, 32767).astype(np.int16).tobytes()
 
     def arm_for_next_turn(self) -> None:
         """Re-enable playback for the next turn after a barge-in / sleep /
@@ -214,24 +469,16 @@ class AudioIO:
         self._discard_playback = False
 
     def set_output_sample_rate(self, sr: int) -> None:
-        if sr == self.output_sr and self._output_stream is not None:
-            return
-        self.output_sr = sr
-        # Reconfigure: drop existing stream, recreate lazily next play().
-        if self._output_stream is not None:
-            try:
-                self._output_stream.stop()
-                self._output_stream.close()
-            except Exception:  # pragma: no cover
-                pass
-            self._output_stream = None
-        if self._playback_task is not None:
-            self._playback_task.cancel()
-            self._playback_task = None
-        self._out_queue = None
-        self._ensure_playback_buffer()
-        with self._playback_lock:
-            self._playback_buffer.clear()
+        """Record the *source* sample rate of incoming TTS PCM.
+
+        The device-side output stream stays at the rate that was chosen
+        when the agent started (``self.output_sr``); any mismatch is
+        handled by in-process resampling in ``play()``. This avoids
+        tearing down the audio stream when models switch — which on
+        macOS Bluetooth devices manifests as silent playback because
+        Core Audio negotiates a new rate but the codec can't keep up.
+        """
+        self._source_sr = int(sr)
 
     async def stop_playback(self) -> None:
         """Drain queued audio (barge-in / sleep / stop-intent).

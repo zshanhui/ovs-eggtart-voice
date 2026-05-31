@@ -86,7 +86,22 @@ class Session:
     history: list[dict[str, str]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     locale: str = "zh"
-    cache_warmed: bool = False
+    # Split warmup flags (was single ``cache_warmed`` field, kept as a
+    # backward-compat property below):
+    #   * prefix_cache_warmed — server holds a KV-prefix entry we can
+    #     reuse on the next request (``prefix_cache=True``). Set after
+    #     a successful warmup Step A OR a successful real turn (which
+    #     also saves its prefix). Cleared by session reset / trim /
+    #     echo recovery.
+    #   * graph_warmed — TRT-LLM CUDA graph captured + JIT done for the
+    #     real-shape forward path. Independent of prefix_cache (the
+    #     server can have one without the other after a partial warmup
+    #     failure). Currently informational only: edge_llm doesn't
+    #     change the request based on this flag; the runner logs a hint
+    #     when prefix is hot but graph isn't, because the first tool_call
+    #     decode after a partial warmup may still pay JIT cost.
+    prefix_cache_warmed: bool = False
+    graph_warmed: bool = False
     # Token-aware trim controls (A2). None disables trimming entirely
     # and preserves the original append-only invariant.
     max_input_tokens: int | None = None
@@ -102,18 +117,33 @@ class Session:
     # importing the EventBus type.
     event_bus: Any = None
 
+    # ── backward-compat alias ───────────────────────────────────────
+    # Old field was a single ``cache_warmed`` bool that conflated prefix
+    # cache and CUDA graph warm. We split into two; keep the old name
+    # as a property targeting prefix_cache_warmed (the half that
+    # actually drives ``prefix_cache=True`` on requests). Older callers
+    # and tests that read or assign ``session.cache_warmed`` keep working.
+    @property
+    def cache_warmed(self) -> bool:
+        return self.prefix_cache_warmed
+
+    @cache_warmed.setter
+    def cache_warmed(self, value: bool) -> None:
+        self.prefix_cache_warmed = bool(value)
+
     def reset(self) -> None:
         """Clear conversation history and per-session cache latches.
 
         Called when a new dialogue starts (mode switch / explicit clear /
-        user-driven reset). Both ``cache_warmed`` and the A4
+        user-driven reset). Both warmup flags and the A4
         ``prefix_cache_disabled`` flag get reset so the next turn can
         re-warm normally — otherwise a session that ever hit a prefix-cache
         failure would skip prefix_cache forever, even across logical
         conversations.
         """
         self.history.clear()
-        self.cache_warmed = False
+        self.prefix_cache_warmed = False
+        self.graph_warmed = False
         self.prefix_cache_disabled = False
 
     def add_user(self, text: str) -> None:
@@ -122,6 +152,49 @@ class Session:
     def add_assistant(self, text: str) -> None:
         self.history.append({"role": "assistant", "content": text})
         self._maybe_recover_from_echo()
+
+    def add_assistant_tool_calls(
+        self,
+        content: str | None,
+        tool_calls: list[dict[str, Any]],
+    ) -> None:
+        """Append an assistant message that issues one or more tool_calls.
+
+        ``content`` may be ``None`` (pure tool-call turn) or a short
+        preamble ("好的，我查一下…"). We append ``content`` explicitly
+        rather than omitting it — OpenAI's wire format expects the key
+        to be present with an explicit ``null`` when there's no text."""
+        self.history.append({
+            "role": "assistant",
+            "content": content,
+            "tool_calls": list(tool_calls),
+        })
+
+    def add_tool_result(self, tool_call_id: str, content: str) -> None:
+        """Append a ``role:tool`` message linked to a prior tool_call."""
+        self.history.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": content,
+        })
+
+    def rollback_to(self, anchor: int) -> int:
+        """Truncate ``self.history`` back to ``anchor`` length.
+
+        Returns the number of messages dropped. Idempotent when
+        ``anchor >= len(history)``. Used on cancel / error / iteration
+        cap to keep history strict-valid for OpenAI (no orphan
+        ``assistant(tool_calls)`` without matching ``role:tool``
+        followup, no truncated tool round).
+        """
+        if anchor < 0:
+            anchor = 0
+        current = len(self.history)
+        if anchor >= current:
+            return 0
+        dropped = current - anchor
+        del self.history[anchor:]
+        return dropped
 
     # In-context learning latch: when the model (small / quantised) sees
     # a few short identical assistant replies in history, it pattern-matches
@@ -144,8 +217,11 @@ class Session:
         """
         if len(self.history) < self.ECHO_WINDOW:
             return
+        # Skip tool-call-only assistant messages (content is None) — they
+        # carry no natural-language reply to echo on.
         assistant_turns = [
-            m for m in self.history if m.get("role") == "assistant"
+            m for m in self.history
+            if m.get("role") == "assistant" and m.get("content") is not None
         ]
         if len(assistant_turns) < self.ECHO_WINDOW:
             return
@@ -162,7 +238,8 @@ class Session:
             self.ECHO_WINDOW, first[:60],
         )
         self.history.clear()
-        self.cache_warmed = False
+        self.prefix_cache_warmed = False
+        self.graph_warmed = False
         self.prefix_cache_disabled = False
         bus = getattr(self, "event_bus", None)
         if bus is not None:
@@ -201,63 +278,168 @@ class Session:
         tok = _get_tokenizer(self.tokenizer_model)
         return _count_tokens(tok, text)
 
-    def _msg_tokens(self, msg: dict[str, str]) -> int:
+    def _msg_tokens(self, msg: dict[str, Any]) -> int:
         # Add a small per-message overhead (~4 tokens) to mirror
         # OpenAI's chat template framing — keeps the estimate honest
-        # without needing the full chat template here.
-        return self._count(msg.get("content", "")) + 4
+        # without needing the full chat template here. For tool-call
+        # carrying messages we also charge an estimate against the
+        # JSON-serialized tool_calls payload so a fat function-call
+        # turn isn't undercounted.
+        content = msg.get("content") or ""
+        tokens = self._count(content) if content else 0
+        tcs = msg.get("tool_calls")
+        if tcs:
+            try:
+                import json as _json
+                tokens += self._count(_json.dumps(tcs, ensure_ascii=False))
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return tokens + 4
 
     def _trim_to_budget(
-        self, messages: list[dict[str, str]], max_tokens: int
-    ) -> list[dict[str, str]]:
-        """Drop oldest *whole turns* until the prompt fits the budget.
+        self, messages: list[dict[str, Any]], max_tokens: int
+    ) -> list[dict[str, Any]]:
+        """Drop oldest *whole turns* until the dynamic history fits the budget.
+
+        A *turn* is a ``user`` message followed by all contiguous
+        non-user messages up to (but not including) the next ``user``.
+        With tools, a turn can contain multiple
+        ``assistant(tool_calls)`` + ``tool`` pairs followed by a final
+        ``assistant(text)``. The trim never splits a turn — either the
+        whole thing stays or the whole thing is dropped.
+
+        A trailing turn whose final message is not a normal
+        ``assistant(text)`` (e.g. user just sent a message and the
+        assistant hasn't replied, or an in-flight tool round) is pinned
+        to the tail and never dropped.
+
+        Budget semantics (A1-step2):
+          * Budget = ``max_tokens * 0.75`` and applies ONLY to dynamic
+            turns (user / assistant / tool messages).
+          * The system prompt (messages[0]) is a fixed prefix and is
+            NOT charged against the budget. Tools schemas, which the
+            LLM backend prepends outside of ``Session.history``, are
+            likewise out of scope here.
+          * This decouples trim decisions from system_prompt / tools
+            growth: when those grow we adjust ``session_max_input_tokens``
+            (or the engine ``max_seq_len``) at config time, not at trim
+            time.
 
         Invariants:
           * messages[0] (system prompt) always kept.
-          * Latest user+assistant turn always kept.
-          * Turns are dropped as pairs (user+assistant) — never half.
-          * Budget is ``max_tokens * 0.75`` (25% margin for response).
+          * Latest turn always kept.
         """
         budget = int(max_tokens * 0.75)
         if not messages:
             return messages
 
         system = messages[0]
-        rest = list(messages[1:])  # may be odd-length while a turn is in flight
+        rest = list(messages[1:])
         if not rest:
             return messages
 
-        # Detect a trailing single user message (turn in progress: assistant
-        # hasn't replied yet). Pin it to the tail; only the completed
-        # prefix is grouped into (user, assistant) turns.
-        trailing: list[dict[str, str]] = []
-        if len(rest) % 2 == 1:
-            trailing = [rest[-1]]
-            rest = rest[:-1]
-
-        # Group remaining history into (user, assistant) turns. Skip any
-        # leading orphan assistant defensively.
-        turns: list[list[dict[str, str]]] = []
+        # Group into turns: each starts at a `user` message and runs up to
+        # the next `user` (exclusive). Defensively skip leading non-user
+        # entries (orphan assistant/tool) — those couldn't form a valid
+        # turn anyway.
         i = 0
         while i < len(rest) and rest[i].get("role") != "user":
             i += 1
-        while i + 1 < len(rest):
-            turns.append([rest[i], rest[i + 1]])
-            i += 2
+        turns: list[list[dict[str, Any]]] = []
+        while i < len(rest):
+            start = i
+            i += 1  # skip the user message itself
+            while i < len(rest) and rest[i].get("role") != "user":
+                i += 1
+            turns.append(rest[start:i])
 
-        sys_tokens = self._msg_tokens(system)
+        # Corner case (Plan D item 6): no user-anchored turns at all
+        # (history is exclusively assistant/tool messages — can happen
+        # if an in-flight tool round was rolled back leaving orphan
+        # entries, or a programmatic test populates only tool results).
+        # In this case the regular path returns the input unchanged,
+        # so an oversized all-tool history would silently slip past the
+        # budget and overflow ``max_seq_len`` upstream. Degrade by
+        # dropping oldest non-system messages until under budget, log
+        # ERROR so the underlying invariant violation gets noticed.
+        if not turns:
+            rest_tokens = sum(self._msg_tokens(m) for m in rest)
+            if rest_tokens <= budget:
+                return messages
+            logger.error(
+                "session trim corner case: history has no user-anchored "
+                "turns but total %d tokens > budget %d. Falling back to "
+                "raw drop-oldest until under budget — investigate why "
+                "history is all assistant/tool (orphan rollback?).",
+                rest_tokens, budget,
+            )
+            kept = list(rest)
+            dropped_msgs = 0
+            while kept and rest_tokens > budget:
+                removed = kept.pop(0)
+                rest_tokens -= self._msg_tokens(removed)
+                dropped_msgs += 1
+            # Clear cache_warmed: prefix the upstream KV cache was keyed
+            # against is no longer present.
+            if self.prefix_cache_warmed:
+                self.prefix_cache_warmed = False
+            bus = getattr(self, "event_bus", None)
+            if bus is not None:
+                try:
+                    bus.emit(
+                        "on_session_trimmed",
+                        {
+                            "dropped_messages": dropped_msgs,
+                            "kept_messages": len(kept),
+                            "approx_tokens": rest_tokens,
+                            "budget": budget,
+                            "max_input_tokens": max_tokens,
+                            "sid": self.sid,
+                            "fallback": "all_tool_messages",
+                        },
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    logger.debug(
+                        "event_bus emit on_session_trimmed (fallback) failed",
+                        exc_info=True,
+                    )
+            return [system, *kept]
+
+        # A trailing "incomplete" turn = doesn't end in a normal
+        # assistant(text) message. Pin it; only completed turns are
+        # candidates for dropping.
+        trailing: list[dict[str, Any]] = []
+        if turns:
+            last = turns[-1]
+            last_msg = last[-1] if last else None
+            is_complete = (
+                last_msg is not None
+                and last_msg.get("role") == "assistant"
+                and last_msg.get("content") is not None
+                and not last_msg.get("tool_calls")
+            )
+            if not is_complete:
+                trailing = turns.pop()
+
+        # A1-step2: budget covers only dynamic turns (history). The
+        # system prompt is a fixed prefix and is excluded so config
+        # changes there don't silently shift trim behaviour.
         trailing_tokens = sum(self._msg_tokens(m) for m in trailing)
         turn_tokens = [sum(self._msg_tokens(m) for m in t) for t in turns]
-        total = sys_tokens + trailing_tokens + sum(turn_tokens)
+        total = trailing_tokens + sum(turn_tokens)
 
         if total <= budget:
             return messages
 
-        # Drop from the front (oldest) until under budget OR only one
-        # turn remains — the latest completed turn must stay.
+        # Drop from the front (oldest) until under budget. Stop when:
+        #   * only one completed turn remains AND no trailing turn (must
+        #     keep at least one completed turn for context), or
+        #   * trailing turn exists AND no completed turns left (we can
+        #     drop everything completed; trailing is already pinned).
         kept_turns = list(turns)
         dropped = 0
-        while total > budget and len(kept_turns) > 1:
+        min_keep = 0 if trailing else 1
+        while total > budget and len(kept_turns) > min_keep:
             removed = kept_turns.pop(0)
             total -= sum(self._msg_tokens(m) for m in removed)
             dropped += 1
@@ -286,12 +468,12 @@ class Session:
             # session" — independent of trim. Conflating them would mean
             # a single trim event permanently disables prefix_cache for
             # the rest of the dialogue, which we don't want.
-            if self.cache_warmed:
+            if self.prefix_cache_warmed:
                 logger.info(
                     "session trim invalidates upstream KV cache, "
-                    "clearing cache_warmed (prefix_cache_disabled untouched)"
+                    "clearing prefix_cache_warmed (prefix_cache_disabled untouched)"
                 )
-                self.cache_warmed = False
+                self.prefix_cache_warmed = False
             bus = getattr(self, "event_bus", None)
             if bus is not None:
                 try:

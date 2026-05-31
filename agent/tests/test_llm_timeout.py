@@ -176,7 +176,7 @@ async def test_llm_timeout_resets_to_idle():
 
     app.plugins.append(_ErrorPlugin())
 
-    async def boom(text: str) -> None:
+    async def boom(text: str, detected_language: str | None = None) -> None:
         raise LLMTimeoutError("first_token", 15.0)
 
     app.on_user_utterance = boom  # type: ignore[assignment]
@@ -195,7 +195,7 @@ async def test_generic_exception_also_resets_idle_and_resets_sleep():
     """Regression: non-timeout exceptions must still leave FSM IDLE."""
     app = _fresh_app()
 
-    async def boom(text: str) -> None:
+    async def boom(text: str, detected_language: str | None = None) -> None:
         raise RuntimeError("oops")
 
     app.on_user_utterance = boom  # type: ignore[assignment]

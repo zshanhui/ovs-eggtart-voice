@@ -57,18 +57,27 @@ def test_kokoro_bucket_selection():
 
     backend = KokoroTRTBackend.__new__(KokoroTRTBackend)
     backend._split_engines = {"decoder": object()}
-    backend._split_ctxs = {"decoder": object()}
     backend._split_long_engines = {"decoder": object()}
-    backend._split_long_ctxs = {"decoder": object()}
+    # Per-call ctx rework: ctxs are passed in as kwargs instead of being
+    # backend state; tests pass empty dicts (engine identity is what matters).
+    split_ctxs = {"decoder": object()}
+    split_long_ctxs = {"decoder": object()}
 
-    assert backend._select_split_bucket(256)[0] is backend._split_engines
-    assert backend._select_split_bucket(257)[0] is backend._split_long_engines
-    assert backend._select_split_bucket(512)[0] is backend._split_long_engines
+    assert backend._select_split_bucket(
+        256, split_ctxs=split_ctxs, split_long_ctxs=split_long_ctxs
+    )[0] is backend._split_engines
+    assert backend._select_split_bucket(
+        257, split_ctxs=split_ctxs, split_long_ctxs=split_long_ctxs
+    )[0] is backend._split_long_engines
+    assert backend._select_split_bucket(
+        512, split_ctxs=split_ctxs, split_long_ctxs=split_long_ctxs
+    )[0] is backend._split_long_engines
 
     backend._split_long_engines = {}
-    backend._split_long_ctxs = {}
     try:
-        backend._select_split_bucket(257)
+        backend._select_split_bucket(
+            257, split_ctxs=split_ctxs, split_long_ctxs={}
+        )
     except ValueError as exc:
         assert "outside available TRT buckets" in str(exc)
     else:

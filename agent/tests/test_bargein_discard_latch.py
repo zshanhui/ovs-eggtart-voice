@@ -82,8 +82,24 @@ def _make_app() -> BaseApp:
     app._llm_turn_task = None
     app._state = ConvState.IDLE
     app._slv_reconnect_count = 0
-    app.config = SimpleNamespace(pipeline_mode="always_on", sleep_timeout_s=30.0)
+    app.config = SimpleNamespace(
+        pipeline_mode="always_on",
+        sleep_timeout_s=30.0,
+        barge_in_min_chars=1,
+        barge_in_min_speaking_ms=0,
+    )
     app._sleep_task = None
+    app._eos_sent_this_turn = False
+    app._asr_watchdog_task = None
+    app._thinking_watchdog_task = None
+    app._ptt_explicit_eos_pending = False
+    app._vad_state = "idle"
+    app._vad_speech_ms = 0
+    app._vad_silence_ms = 0
+    app._vad_eos_sent = False
+    app._client_vad = None
+    app._mic_rms_broadcast_task = None
+    app._stop_words_cache = None
     return app
 
 

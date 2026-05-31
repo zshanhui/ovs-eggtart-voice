@@ -78,7 +78,7 @@ def test_qwen3_asr_stream_finalize_after_cancel_returns_cache(qwen3_module):
     s.accept_waveform(16000, _audio(0.5))
     s.cancel_and_finalize()
     # Should return cached "" without invoking backend.transcribe_audio.
-    assert s.finalize() == ""
+    assert s.finalize() == ("", None)
 
 
 def test_qwen3_asr_stream_accept_after_cancel_noop(qwen3_module):
@@ -121,7 +121,7 @@ def test_qwen3_streaming_stream_finalize_after_cancel_returns_cache(qwen3_module
     s._partial_text = "world"
     s.cancel_and_finalize()
     # Non-CJK -> space-joined
-    assert s.finalize() == "hello world"
+    assert s.finalize() == ("hello world", None)
 
 
 def test_qwen3_streaming_stream_accept_after_cancel_noop(qwen3_module):
@@ -171,7 +171,7 @@ def test_trt_edgellm_stream_finalize_after_cancel_returns_cache(trt_edge_module)
     s = trt_edge_module._TRTEdgeLLMAccumulatingASRStream(backend, language="zh")
     s.accept_waveform(16000, _audio(0.5))
     s.cancel_and_finalize()
-    assert s.finalize() == ""
+    assert s.finalize() == ("", None)
     backend.transcribe.assert_not_called()
 
 
@@ -230,7 +230,7 @@ def test_paraformer_stream_finalize_after_cancel_returns_cache(paraformer_module
         pytest.skip(f"ParaformerTRTStream instantiation failed: {e}")
     s._partial_text = "abc"
     s.cancel_and_finalize()
-    assert s.finalize() == "abc"
+    assert s.finalize() == ("abc", None)
     backend._run_encoder.assert_not_called()
 
 
@@ -294,7 +294,7 @@ def test_sherpa_stream_finalize_after_cancel_returns_cache(sherpa_module):
     s = sherpa_module.SherpaASRStream(rec, language_mode="en")
     s._last_text = "cached"
     s.cancel_and_finalize()
-    assert s.finalize() == "cached"
+    assert s.finalize() == ("cached", None)
     native_stream.input_finished.assert_not_called()
     rec.decode_stream.assert_not_called()
 

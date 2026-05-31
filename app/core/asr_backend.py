@@ -13,6 +13,8 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from app.core.concurrency_capability import ConcurrencyCapability
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,8 +42,14 @@ class ASRStream(ABC):
         ...
 
     @abstractmethod
-    def finalize(self) -> str:
-        """Signal end-of-audio and return final transcription text."""
+    def finalize(self) -> tuple[str, Optional[str]]:
+        """Signal end-of-audio.
+
+        Returns ``(final_text, detected_language)``. ``detected_language`` is
+        the human-readable language name (e.g. ``"Chinese"``, ``"English"``)
+        if the backend supports language ID and detected one, otherwise
+        ``None``. Backends without language detection return ``(text, None)``.
+        """
         ...
 
     def get_partial(self) -> tuple[str, bool]:
@@ -72,6 +80,15 @@ class ASRStream(ABC):
         Default: delegate to cancel_and_finalize().
         """
         self.cancel_and_finalize()
+
+    def close(self) -> None:
+        """Release per-stream resources (TRT exec contexts, device buffers).
+
+        Default: no-op. Backends whose stream owns per-instance GPU resources
+        (e.g. paraformer_trt's _ParaformerCtxBundle) override this to drop
+        them deterministically. Safe to call multiple times.
+        """
+        pass
 
 
 class ASRBackend(ABC):
@@ -115,6 +132,19 @@ class ASRBackend(ABC):
         an unload() stay resident, which is fine for 'concurrent' and
         'serialized' modes."""
         pass
+
+    @classmethod
+    def concurrency_capability(
+        cls, profile: Optional[dict] = None
+    ) -> ConcurrencyCapability:
+        """Describe runtime concurrency properties.
+
+        Classmethod (not instance property) so the scheduler can read the
+        ceiling before ``preload()``. Default is conservative (N=1,
+        serialized) — backends opt in by overriding. See
+        ``docs/specs/concurrency-capability-framework.md`` Section 2.
+        """
+        return ConcurrencyCapability.default()
 
 
 _ASR_REGISTRY: Dict[str, Tuple[str, str]] = {

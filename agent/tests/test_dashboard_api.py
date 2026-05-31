@@ -254,4 +254,7 @@ async def test_tts_metrics_emitted_on_audio_frame(unused_tcp_port):
     assert plugin._tts_bytes_current == 72000
     await plugin.on_assistant_done()
     assert plugin._tts_bytes_last == 72000
+    assert plugin._tts_bytes_current == 72000
+    assert plugin._tts_last_duration_s == 1.5
+    await plugin.on_user_utterance("next")
     assert plugin._tts_bytes_current == 0

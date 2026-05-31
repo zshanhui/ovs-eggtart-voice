@@ -127,12 +127,13 @@ class _SlowFinalizeStream:
     def get_partial(self) -> Tuple[str, bool]:
         return "", False
 
-    def finalize(self) -> str:
+    def finalize(self):
         # Block synchronously — this runs in an executor thread, exactly
         # as the real ``stream.finalize()`` does in production.
         time.sleep(self._delay)
         self.finalized = True
-        return self._text
+        # New ABC contract: ``(text, detected_language)``.
+        return self._text, None
 
     def cancel(self) -> None:
         self.cancelled = True
@@ -369,7 +370,7 @@ async def test_preempted_finalize_does_not_emit_empty_asr_final():
     state["asr_active_gen"] = await manager.on_speech_start()
     state["asr_active"] = True
 
-    ran_gen, final_text, accepted = await finalize_task
+    ran_gen, final_text, accepted, _lang = await finalize_task
 
     assert ran_gen == finalize_gen
     assert final_text == ""
@@ -397,7 +398,7 @@ async def test_accepted_finalize_emits_even_if_outer_gen_changed_after_return():
         "endpoint_pending_gen": None,
     }
     finalize_gen = state["asr_active_gen"]
-    ran_gen, final_text, accepted = await manager.finalize_with_status("vad")
+    ran_gen, final_text, accepted, _lang = await manager.finalize_with_status("vad")
 
     state["asr_active_gen"] = finalize_gen + 1
     state["asr_active"] = True

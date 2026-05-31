@@ -290,18 +290,18 @@ class Qwen3ASRStream(ASRStream):
         self._chunks.append(samples)
         self._total_samples += len(samples)
 
-    def finalize(self) -> str:
+    def finalize(self) -> tuple[str, Optional[str]]:
         if self._cancelled:
-            return self._final_text_cache
+            return self._final_text_cache, None
         if not self._chunks:
-            return ""
+            return "", None
         audio = np.concatenate(self._chunks)
         duration = len(audio) / 16000
         logger.info("Qwen3ASR stream finalize: %.1fs audio (%d samples)",
                      duration, len(audio))
 
         result = self._backend.transcribe_audio(audio, language=self._language)
-        return result.text
+        return result.text, getattr(result, "language", None)
 
     def get_partial(self) -> tuple[str, bool]:
         # V1: no partial results; could add duration-based hints later
@@ -450,9 +450,9 @@ class Qwen3StreamingASRStream(ASRStream):
         self._tail_embd = None
         self._tail_audio_len = 0
 
-    def finalize(self) -> str:
+    def finalize(self) -> tuple[str, Optional[str]]:
         if self._cancelled:
-            return self._final_text_cache
+            return self._final_text_cache, None
         # Drain remaining unprocessed audio into encoder buffer
         while len(self._audio_buf) - self._processed_samples >= self._chunk_size_samples:
             self._process_streaming_chunk()
@@ -494,7 +494,10 @@ class Qwen3StreamingASRStream(ASRStream):
             except Exception as e:  # pragma: no cover
                 logger.warning("ASR stream sync on finalize failed: %s", e)
 
-        return self._archive_text.strip()
+        # Qwen3StreamingASRStream streams partial decodes; the language ID
+        # prefix is not parsed in this path. Return None for language —
+        # the offline accumulating stream covers detection.
+        return self._archive_text.strip(), None
 
     def force_endpoint(self) -> str:
         """Trigger endpoint on demand (e.g. end_utterance WS command)."""

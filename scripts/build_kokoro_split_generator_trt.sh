@@ -18,7 +18,7 @@ PYTHON="${PYTHON:-python3}"
 ENGINE_NAME="${ENGINE_NAME:-kokoro_prefix_encoder_dyn4_128_fp16.engine}"
 WS="${WS:-512}"
 
-MIN_T="${MIN_T:-64}"
+MIN_T="${MIN_T:-4}"
 OPT_T="${OPT_T:-150}"
 MAX_T="${MAX_T:-256}"
 MIN_SEQ="${MIN_SEQ:-4}"

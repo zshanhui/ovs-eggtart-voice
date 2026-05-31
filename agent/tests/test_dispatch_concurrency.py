@@ -13,6 +13,7 @@ WebSocket remains alive for ASR continuity.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,12 +66,31 @@ async def test_dispatch_does_not_block_on_llm_turn():
     app._llm_turn_task = None
     app._state = ConvState.IDLE
     app._slv_reconnect_count = 0
+    app._eos_sent_this_turn = False
+    app._asr_watchdog_task = None
+    app._thinking_watchdog_task = None
+    app._sleep_task = None
+    app._ptt_explicit_eos_pending = False
+    app._vad_state = "idle"
+    app._vad_speech_ms = 0
+    app._vad_silence_ms = 0
+    app._vad_eos_sent = False
+    app._client_vad = None
+    app._mic_rms_broadcast_task = None
+    app._stop_words_cache = None
+    app.config = SimpleNamespace(
+        pipeline_mode="always_on",
+        sleep_timeout_s=30.0,
+        thinking_timeout_s=20.0,
+        barge_in_min_chars=1,
+        barge_in_min_speaking_ms=0,
+    )
 
     llm_started = asyncio.Event()
     llm_release = asyncio.Event()
     seen_during_llm: dict[str, bool] = {"audio": False, "stopped": False}
 
-    async def slow_on_user_utterance(text: str) -> None:
+    async def slow_on_user_utterance(text: str, detected_language: str | None = None) -> None:
         llm_started.set()
         try:
             await llm_release.wait()  # block until test releases

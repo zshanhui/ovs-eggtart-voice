@@ -69,6 +69,27 @@ _QWEN3_PRESETS: dict[int, SpeakerSpec] = {
     2302: SpeakerSpec(id=2302, type="preset", label="Female 2", payload="2302"),
 }
 
+
+# Qwen3-CustomVoice ships 9 built-in speakers identified by numeric speaker_id.
+# IDs come from the engines-nx/talker/config.json `speaker_id` field on the
+# tensorrt-edge-llm CustomVoice spike (orin-nx). CustomVoice does NOT support
+# voice cloning (no speaker_encoder, no embedding extractor) — registry holds
+# preset-type entries only.
+_QWEN3_CUSTOMVOICE_PRESETS: dict[int, SpeakerSpec] = {
+    sid: SpeakerSpec(id=sid, type="preset", label=label, payload=str(sid))
+    for sid, label in [
+        (3065, "vivian"),
+        (3061, "ryan"),
+        (2861, "aiden"),
+        (3066, "serena"),
+        (2878, "dylan"),
+        (2875, "eric"),
+        (3010, "uncle_fu"),
+        (2873, "ono_anna"),
+        (2864, "sohee"),
+    ]
+}
+
 # Authoritative speaker labels for 'kokoro-multi-lang-v1_0' (53 speakers, 0-52).
 _KOKORO_LABELS = [
     "af_heart",         # 0  — default female (American)
@@ -140,6 +161,7 @@ _SINGLE_SPEAKER: dict[int, SpeakerSpec] = {
 
 _PRESETS: dict[str, dict[int, SpeakerSpec]] = {
     "qwen3-tts": _QWEN3_PRESETS,
+    "qwen3-tts-customvoice": _QWEN3_CUSTOMVOICE_PRESETS,
     "kokoro-multi-lang-v1_0": _kokoro_presets(),
     "matcha-icefall-zh-en": _SINGLE_SPEAKER,
     "matcha-icefall-zh-en.rknn": _SINGLE_SPEAKER,

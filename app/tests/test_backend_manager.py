@@ -373,19 +373,21 @@ async def test_reload_succeeds_when_supports_hot_reload_true():
 
 
 @asynctest
-async def test_reload_kind_mismatch_returns_400():
+async def test_reload_cross_kind_succeeds():
+    """Cross-kind reload should succeed: the factory (registry-dispatched in
+    real code) builds whatever the new profile declares. The manager no longer
+    gates on old_kind != new_kind."""
     mgr = _make_mgr(name="tts")
     await mgr.start()
 
-    # Patch the kind loader on this instance to declare a different tts_backend.
+    # Patch the kind loader to declare a different tts_backend on the new profile.
     original = BackendManager._load_profile_kind
     BackendManager._load_profile_kind = lambda self, ref: {  # type: ignore[assignment]
         "name": ref, "tts_backend": "other", "asr_backend": "fake"
     }
     try:
-        with pytest.raises(HTTPException) as ei:
-            await mgr.reload("p-new")
-        assert ei.value.status_code == 400
+        out = await mgr.reload("p-new")
+        assert out["status"] == "reloaded"
         assert mgr.state == BackendState.READY
     finally:
         BackendManager._load_profile_kind = original  # type: ignore[assignment]
@@ -669,3 +671,177 @@ def test_init_backend_managers_propagates_initial_profile_ref(monkeypatch):
     assert tts_manager()._initial_profile_ref == "/tmp/seeded-ref.json"
     assert asr_manager()._initial_profile_ref == "/tmp/seeded-ref.json"
     bm_mod._reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# FIX_DRYRUN: pre-flight artifact validation rejects unloadable profiles
+# with HTTP 400 *before* draining the running backend.
+# ---------------------------------------------------------------------------
+
+@asynctest
+async def test_reload_rejects_profile_with_missing_engine_paths():
+    """Profile with a path-like env value that doesn't exist on disk → 400."""
+    mgr = _make_mgr()
+    await mgr.start()
+    old = mgr.get_backend_unsafe()
+
+    bad_path = "/nonexistent/seeed/test/dryrun/foo.engine"
+
+    def loader(self, ref):
+        return {
+            "name": ref,
+            "tts_backend": "fake",
+            "asr_backend": "fake",
+            "env": {"EDGE_LLM_ASR_ENGINE_DIR": bad_path},
+        }
+
+    original = BackendManager._load_profile_kind
+    BackendManager._load_profile_kind = loader  # type: ignore[assignment]
+    try:
+        with pytest.raises(HTTPException) as ei:
+            await mgr.reload("p-bad")
+    finally:
+        BackendManager._load_profile_kind = original  # type: ignore[assignment]
+
+    assert ei.value.status_code == 400
+    detail = ei.value.detail
+    assert detail["error"] == "profile_artifacts_missing"
+    assert detail["kind"] == "tts"
+    assert detail["profile"] == "p-bad"
+    missing_paths = [m["path"] for m in detail["missing"]]
+    assert bad_path in missing_paths
+    # Manager must NOT have entered DRAINING — old backend still serving.
+    assert mgr.state == BackendState.READY
+    assert mgr.get_backend_unsafe() is old
+
+
+@asynctest
+async def test_reload_passes_artifact_check_when_paths_exist():
+    """Profile env points at /tmp (always exists) → check passes, reload proceeds."""
+    mgr = _make_mgr()
+    await mgr.start()
+
+    def loader(self, ref):
+        return {
+            "name": ref,
+            "tts_backend": "fake",
+            "asr_backend": "fake",
+            # /tmp exists on every supported platform; passes the heuristic.
+            "env": {"SOME_DIR": "/tmp"},
+        }
+
+    original = BackendManager._load_profile_kind
+    BackendManager._load_profile_kind = loader  # type: ignore[assignment]
+    try:
+        out = await mgr.reload("p-ok")
+    finally:
+        BackendManager._load_profile_kind = original  # type: ignore[assignment]
+
+    assert out["status"] == "reloaded"
+    assert mgr.state == BackendState.READY
+
+
+# ---------------------------------------------------------------------------
+# Regression: rollback must unload the failed NEW backend before re-invoking
+# the factory, so a factory that caches its instance in a module-level global
+# (mirrors main.py's _asr_backend / _tts_service_mod._backend pattern) gets
+# the cache cleared and rebuilds fresh against the restored env.
+# Without this, the rollback path returns the broken cached NEW instance and
+# preload fails with the same error, sending the manager to FAILED.
+# ---------------------------------------------------------------------------
+
+@asynctest
+async def test_reload_rollback_clears_cached_failed_backend():
+    """When new profile's preload fails, rollback must unload the failed new
+    instance before re-instantiating, so the factory rebuilds against
+    restored env rather than returning the cached broken one."""
+
+    # Simulate main.py's "cache on None" factory pattern.
+    cache: dict[str, FakeBackend | None] = {"backend": None}
+    factory_calls = {"n": 0}
+    # Mark a backend as "broken" if it was built when broken_env is True; its
+    # preload then fails. After unload, cache resets to None so the next
+    # factory() call sees broken_env=False (env restored) and builds fresh.
+    broken_env = {"flag": False}
+
+    class CachingFakeBackend(FakeBackend):
+        def __init__(self, *, broken: bool):
+            super().__init__()
+            self.broken = broken
+
+        def preload(self) -> None:
+            if self.broken:
+                raise FileNotFoundError("engine artifact missing (new profile)")
+
+        def unload(self) -> None:
+            self.unloaded = True
+
+    def factory():
+        factory_calls["n"] += 1
+        if cache["backend"] is None:
+            cache["backend"] = CachingFakeBackend(broken=broken_env["flag"])
+        return cache["backend"]
+
+    def preloader(b):
+        b.preload()
+
+    def unloader(b):
+        b.unload()
+        # Mirror main.py: unloader clears the module-level cache.
+        cache["backend"] = None
+
+    mgr = BackendManager(
+        name="asr",
+        factory=factory,
+        preloader=preloader,
+        unloader=unloader,
+    )
+
+    # Start: env is healthy → build OK instance.
+    await mgr.start()
+    old = mgr.get_backend_unsafe()
+    factory_calls_after_start = factory_calls["n"]
+
+    # Simulate "apply new profile flips env to broken paths" by toggling the
+    # flag right when apply_profile is called. The autouse fixture installed
+    # a MagicMock; reset its side_effect so we don't recursively call
+    # ourselves through the mock.
+    apply_calls: list[dict] = []
+
+    def apply_side_effect(ref, **kw):
+        apply_calls.append({"ref": ref, **kw})
+        # The reload path applies new profile with resolve_engines=True; the
+        # rollback path applies old profile with resolve_engines=False.
+        if kw.get("resolve_engines"):
+            broken_env["flag"] = True  # new env is broken
+        else:
+            broken_env["flag"] = False  # rollback restores healthy env
+        return {"name": ref}
+
+    bm_mod.profile_loader.apply_profile.side_effect = apply_side_effect
+
+    out = await mgr.reload("p-new")
+
+    # 1. Manager rolled back successfully.
+    assert out["status"] == "rolled_back", out
+    assert mgr.state == BackendState.READY
+    assert "engine artifact missing" in out["error"]
+
+    # 2. The broken NEW instance must have had unload() called on it
+    #    (this is what clears the cache).
+    # The broken instance was built between start and reload; capture it
+    # indirectly by checking that the factory was called at least twice
+    # *after* start (once for the failed new, once for the rollback rebuild).
+    assert factory_calls["n"] - factory_calls_after_start >= 2, (
+        f"factory must be called twice during reload+rollback, "
+        f"got {factory_calls['n'] - factory_calls_after_start}"
+    )
+
+    # 3. The rolled-back live backend is a *different* Python object from
+    #    the original old one (old was unloaded too) — proves rollback
+    #    rebuilt rather than reusing a stale reference.
+    rolled = mgr.get_backend_unsafe()
+    assert rolled is not old
+    # And it isn't broken — preload succeeded → it's a working instance.
+    assert isinstance(rolled, CachingFakeBackend)
+    assert rolled.broken is False

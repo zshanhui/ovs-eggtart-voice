@@ -61,8 +61,12 @@ def _make_app() -> BaseApp:
     app._vad_eos_sent = False
     app._client_vad = None
     app._asr_watchdog_task = None
+    app._thinking_watchdog_task = None
     app.config = SimpleNamespace(pipeline_mode="always_on", sleep_timeout_s=30.0)
     app._sleep_task = None
+    app._ptt_explicit_eos_pending = False
+    app._mic_rms_broadcast_task = None
+    app._stop_words_cache = None
     return app
 
 

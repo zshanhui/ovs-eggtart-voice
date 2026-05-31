@@ -40,7 +40,7 @@ async def test_generic_llm_failure_broadcasts_on_error():
 
     app.plugins.append(_ErrPlugin())
 
-    async def boom(text: str) -> None:
+    async def boom(text: str, detected_language: str | None = None) -> None:
         raise RuntimeError("edge-llm down")
 
     app.on_user_utterance = boom  # type: ignore[assignment]
@@ -71,7 +71,7 @@ async def test_llm_stream_error_broadcasts_on_error():
 
     app.plugins.append(_ErrPlugin())
 
-    async def boom(text: str) -> None:
+    async def boom(text: str, detected_language: str | None = None) -> None:
         raise LLMStreamError("finish_reason=error")
 
     app.on_user_utterance = boom  # type: ignore[assignment]

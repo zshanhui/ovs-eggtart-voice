@@ -13,7 +13,7 @@ Coverage:
 * /admin/backend/reload validates ``kind``
 * admin auth: TestClient default host=testclient → 403 when key unset
 * admin auth: loopback host bypass works
-* /admin/backend/reload rejects backend_kind_mismatch profiles
+* /admin/backend/reload swaps to a fresh backend instance
 * successful reload swaps the backend instance
 * /admin/tts/speakers/reload calls into the speakers module
 """
@@ -296,29 +296,6 @@ def test_admin_backend_reload_loopback_allowed(monkeypatch, tmp_path):
     assert body["status"] in ("reloaded", "rolled_back")
     from app.core import backend_manager as bm
     bm._reset_for_tests()
-
-
-def test_admin_backend_reload_kind_mismatch_returns_400(client, monkeypatch, tmp_path):
-    """A profile declaring a different tts_backend than the live one → 400."""
-    from app.core import profile_loader
-
-    # Seed current profile with tts_backend=A so the diff check fires.
-    monkeypatch.setattr(
-        profile_loader, "current_profile",
-        lambda: {"name": "live", "tts_backend": "kokoro"},
-    )
-
-    # Write a fake profile JSON to a tmpdir + alias the path lookup.
-    fake_profile = tmp_path / "configs" / "profiles" / "alt.json"
-    fake_profile.parent.mkdir(parents=True)
-    fake_profile.write_text(json.dumps({"name": "alt", "tts_backend": "qwen3"}))
-
-    from app.core import backend_manager as bm
-    monkeypatch.setattr(bm, "_resolve_profile_path", lambda ref: fake_profile)
-
-    r = client.post("/admin/backend/reload", json={"kind": "tts", "profile": "alt"})
-    assert r.status_code == 400, r.text
-    assert r.json()["detail"]["error"] == "backend_kind_mismatch"
 
 
 def test_admin_backend_reload_success_swaps_backend(client, monkeypatch):

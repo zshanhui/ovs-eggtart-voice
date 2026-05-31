@@ -46,6 +46,27 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+def _emit_state(manager_name: str, state: "BackendState") -> None:
+    """Defensive helper: update ``ovs_backend_state`` for this manager.
+
+    Imported lazily and wrapped in try/except so an early import failure
+    can never break the BackendManager state machine.
+    """
+    try:
+        from app.core import metrics as _m
+        _m.set_backend_state(manager_name, state.value)
+    except Exception:  # pragma: no cover - never block reload on metrics
+        pass
+
+
+def _emit_reload(result: str) -> None:
+    try:
+        from app.core import metrics as _m
+        _m.record_backend_reload(result)
+    except Exception:  # pragma: no cover
+        pass
+
+
 class BackendState(str, Enum):
     INIT = "init"
     READY = "ready"
@@ -110,6 +131,7 @@ class BackendManager(Generic[T]):
         self._initial_profile_ref: str | None = initial_profile_ref
 
         self._state: BackendState = BackendState.INIT
+        _emit_state(self.name, self._state)
         self._current: T | None = None
         self._inflight_http: int = 0
         # FIX_4: remember the *original* profile reference (could be a name or a
@@ -137,6 +159,7 @@ class BackendManager(Generic[T]):
             self._preloader(backend)
         except Exception:
             self._state = BackendState.FAILED
+            _emit_state(self.name, self._state)
             logger.exception("BackendManager[%s] start failed", self.name)
             raise
         self._current = backend
@@ -149,12 +172,14 @@ class BackendManager(Generic[T]):
             self._last_profile_ref = self._initial_profile_ref
         async with self._state_lock:
             self._state = BackendState.READY
+        _emit_state(self.name, self._state)
         logger.info("BackendManager[%s] ready (%s)", self.name, _backend_name_of(backend))
 
     async def shutdown(self) -> None:
         """Tear down the current backend. Intended for tests/fixtures."""
         async with self._state_lock:
             self._state = BackendState.DRAINING
+        _emit_state(self.name, self._state)
         if self._current is not None:
             try:
                 self._unloader(self._current)
@@ -163,6 +188,7 @@ class BackendManager(Generic[T]):
         self._current = None
         async with self._state_lock:
             self._state = BackendState.FAILED  # not-serving sentinel; caller usually discards
+        _emit_state(self.name, self._state)
 
     # ------------------------------------------------------------------- query
 
@@ -349,25 +375,32 @@ class BackendManager(Generic[T]):
                         detail={"error": "invalid_profile", "message": str(exc)},
                     ) from exc
 
-                key = f"{self.name}_backend"
-                old_kind = old_profile.get(key)
-                new_kind = new_profile_preview.get(key)
-                # Only enforce when both sides declare it; profiles that omit
-                # the field are treated as compatible (kind unchanged).
-                if old_kind is not None and new_kind is not None and old_kind != new_kind:
+                # Note: backend_kind_mismatch gate removed — create_tts_backend /
+                # create_asr_backend dispatch via a registry keyed on the
+                # profile's *_backend field, so self._factory() after
+                # apply_profile() builds the correct new-kind backend.
+
+                # FIX_DRYRUN: pre-flight artifact check. Catches "profile for the
+                # wrong device" before we tear down the running backend. Without
+                # this, a missing engine path forces a failed preload + rollback
+                # dance (see commit fd19877 and memory:
+                # backend_manager_rollback_env_pollution).
+                missing = profile_loader.find_missing_artifacts(new_profile_preview)
+                if missing:
                     raise HTTPException(
                         status_code=400,
                         detail={
-                            "error": "backend_kind_mismatch",
+                            "error": "profile_artifacts_missing",
                             "kind": self.name,
-                            "old": old_kind,
-                            "new": new_kind,
+                            "profile": new_profile_preview.get("name"),
+                            "missing": missing,
                         },
                     )
 
             # 4. Drain ---------------------------------------------------------
             async with self._state_lock:
                 self._state = BackendState.DRAINING
+            _emit_state(self.name, self._state)
 
             await self._force_close_ws_sessions()
             drained = await self._wait_for_http_drain(self._drain_timeout_s)
@@ -380,8 +413,10 @@ class BackendManager(Generic[T]):
             # 5. Reload --------------------------------------------------------
             async with self._state_lock:
                 self._state = BackendState.RELOADING
+            _emit_state(self.name, self._state)
             self._current = None
 
+            new_backend: T | None = None
             try:
                 try:
                     self._unloader(old_backend)
@@ -403,6 +438,8 @@ class BackendManager(Generic[T]):
                     self._last_profile_ref = profile_ref
                 async with self._state_lock:
                     self._state = BackendState.READY
+                _emit_state(self.name, self._state)
+                _emit_reload("success")
 
                 logger.info(
                     "BackendManager[%s] reloaded (reason=%s) %s → %s",
@@ -424,7 +461,22 @@ class BackendManager(Generic[T]):
                 }
 
             except Exception as exc:
+                _emit_reload("fail")
                 logger.exception("BackendManager[%s] reload failed; rolling back", self.name)
+                # Unload the partially-constructed NEW backend so the factory's
+                # module-level cache (main.py _asr_backend / _tts_service_mod._backend)
+                # is cleared. Without this, the rollback's self._factory() returns the
+                # broken cached instance whose _config snapshot still points at the
+                # NEW profile's (missing) artifact paths. See memory:
+                # backend_manager_rollback_env_pollution for the orin-nano repro.
+                if new_backend is not None:
+                    try:
+                        self._unloader(new_backend)
+                    except Exception:
+                        logger.exception(
+                            "BackendManager[%s] failed-new-backend unload raised; continuing",
+                            self.name,
+                        )
                 # --- rollback to old profile + fresh factory ----------------
                 try:
                     if profile_ref is not None and old_profile_ref is not None:
@@ -441,6 +493,8 @@ class BackendManager(Generic[T]):
                     self._current = restored
                     async with self._state_lock:
                         self._state = BackendState.READY
+                    _emit_state(self.name, self._state)
+                    _emit_reload("rollback")
                     return {
                         "status": "rolled_back",
                         "kind": self.name,
@@ -455,6 +509,7 @@ class BackendManager(Generic[T]):
                     self._current = None
                     async with self._state_lock:
                         self._state = BackendState.FAILED
+                    _emit_state(self.name, self._state)
                     raise HTTPException(
                         status_code=500,
                         detail={

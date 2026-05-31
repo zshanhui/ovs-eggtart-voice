@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -19,23 +20,24 @@ import base64
 import io
 import wave
 from collections import deque
-from typing import Optional
+from typing import Iterator, Optional
 import importlib
 import uuid
 
 from app.core.tts_backend import TTSBackend, TTSCapability
 from app.core.tts_speakers import resolve_speaker_kwargs
+from app.core.worker_io import WorkerIO, WorkerExitError
 
 from app.backends.jetson.trt_edge_llm_ipc import (
     TTS_BINARY,
-    TTS_WORKER_BINARY,
-    TTS_TALKER_DIR,
-    TTS_CODE_PREDICTOR_DIR,
-    TTS_CODE2WAV_DIR,
-    TTS_TOKENIZER_DIR,
     PLUGIN_PATH,
-    QWEN3_RUNTIME_PROFILE,
     qwen3_highperf_enabled,
+    qwen3_runtime_profile,
+    resolve_tts_talker_dir,
+    resolve_tts_code_predictor_dir,
+    resolve_tts_tokenizer_dir,
+    resolve_tts_code2wav_dir,
+    resolve_tts_worker_binary,
     run_binary,
 )
 
@@ -55,12 +57,19 @@ _QWEN3_TTS_MODEL_BASE = _env(
     "QWEN3_MODEL_BASE",
     default="/opt/models/qwen3-tts",
 )
-_QWEN3_SPEAKER_ENCODER = os.environ.get(
-    "QWEN3_SPEAKER_ENCODER", os.path.join(_QWEN3_TTS_MODEL_BASE, "onnx", "speaker_encoder.onnx")
-)
-_QWEN3_EXTRACT_SCRIPT = os.environ.get(
-    "QWEN3_EXTRACT_SCRIPT", os.path.join(_QWEN3_TTS_MODEL_BASE, "extract_speaker_emb.py")
-)
+def _resolve_speaker_encoder() -> str:
+    """Speaker encoder onnx path, with fallback to the qwen3-edgellm artifact tree."""
+    explicit = os.environ.get("QWEN3_SPEAKER_ENCODER", "")
+    if explicit:
+        return explicit
+    qwen3_root = os.environ.get("QWEN3_ARTIFACT_ROOT", "")
+    if qwen3_root:
+        candidate = os.path.join(qwen3_root, "tts", "speaker_encoder", "speaker_encoder.onnx")
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(_QWEN3_TTS_MODEL_BASE, "onnx", "speaker_encoder.onnx")
+
+
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -100,11 +109,110 @@ def _env_int(default: int, *names: str) -> int:
     return int(_env(*names, default=str(default)))
 
 
-def _code2wav_engine_path() -> str:
-    """Return the Code2Wav engine path used by current Qwen3 artifact sets."""
+_SPEAKER_ENC_SESSION = None  # cached ort session — onnx load is non-trivial
+
+
+def _qwen3_speaker_embed_inproc(audio_wav_bytes: bytes, encoder_path: str) -> bytes:
+    """In-process 1024-d speaker embedding from a reference WAV.
+
+    Drop-in replacement for the previous subprocess + librosa script — uses
+    pure numpy mel + ONNX Runtime. Inputs accepted at any mono PCM WAV rate;
+    audio is linearly resampled to 24 kHz (matches official qwen3-tts pipeline).
+    Returns raw float32 little-endian bytes (4096 bytes for the 1024-d output).
+    """
+    global _SPEAKER_ENC_SESSION
+    import io
+    import numpy as np
+    import soundfile as sf
+    import onnxruntime as ort
+
+    # ── decode WAV → mono float32 @ 24 kHz ────────────────────────
+    data, sr_in = sf.read(io.BytesIO(audio_wav_bytes), always_2d=False, dtype="float32")
+    if data.ndim == 2:  # stereo → mono mix
+        data = data.mean(axis=1).astype(np.float32)
+    if sr_in != 24000:
+        # FFT-based resample (band-limited, anti-aliased). Equivalent to
+        # scipy.signal.resample but pure numpy. Quality matters: linear
+        # interpolation aliases high freq into the mel band → garbage
+        # embedding → unrecognizable cloned voice.
+        n_in = len(data)
+        n_out = int(round(n_in * 24000 / sr_in))
+        spec = np.fft.rfft(data)
+        n_spec_out = n_out // 2 + 1
+        if n_spec_out < len(spec):
+            spec = spec[:n_spec_out]
+        else:
+            spec = np.concatenate(
+                [spec, np.zeros(n_spec_out - len(spec), dtype=spec.dtype)]
+            )
+        data = (np.fft.irfft(spec, n=n_out) * (n_out / n_in)).astype(np.float32)
+    sr = 24000
+
+    # ── mel pipeline matching qwen3-tts mel_spectrogram ───────────
+    N_FFT, HOP, WIN, N_MEL = 1024, 256, 1024, 128
+    FMIN, FMAX = 0.0, 12000.0
+
+    def _hz_to_mel(hz):
+        return 2595.0 * np.log10(1.0 + hz / 700.0)
+
+    def _mel_to_hz(mel):
+        return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+
+    def _slaney_mel_filterbank() -> np.ndarray:
+        mel_pts = np.linspace(_hz_to_mel(FMIN), _hz_to_mel(FMAX), N_MEL + 2)
+        hz_pts = _mel_to_hz(mel_pts)
+        bin_freqs = np.fft.rfftfreq(N_FFT, 1.0 / sr)
+        fb = np.zeros((N_MEL, N_FFT // 2 + 1), dtype=np.float32)
+        for i in range(N_MEL):
+            lo, mid, hi = hz_pts[i], hz_pts[i + 1], hz_pts[i + 2]
+            lt = (bin_freqs >= lo) & (bin_freqs <= mid)
+            rt = (bin_freqs >= mid) & (bin_freqs <= hi)
+            fb[i, lt] = (bin_freqs[lt] - lo) / (mid - lo + 1e-12)
+            fb[i, rt] = (hi - bin_freqs[rt]) / (hi - mid + 1e-12)
+        # Slaney normalization: enorm = 2 / (hi - lo)
+        enorm = 2.0 / (hz_pts[2:] - hz_pts[:-2])
+        fb *= enorm[:, None]
+        return fb
+
+    mel_basis = _slaney_mel_filterbank()
+    hann = np.hanning(WIN).astype(np.float32)
+    pad = (N_FFT - HOP) // 2
+    y = np.pad(data, pad, mode="reflect")
+    num_frames = 1 + (len(y) - WIN) // HOP
+    if num_frames < 1:
+        raise ValueError(f"reference audio too short: {len(data)/sr:.2f}s (need >0.5s)")
+    frames = np.lib.stride_tricks.sliding_window_view(y, WIN)[::HOP][:num_frames] * hann
+    spec = np.fft.rfft(frames, n=N_FFT, axis=-1)
+    mag = np.sqrt(spec.real ** 2 + spec.imag ** 2 + 1e-9).astype(np.float32)
+    mel_spec = mag @ mel_basis.T  # [T, n_mels]
+    mel_spec = np.log(np.clip(mel_spec, 1e-5, None)).astype(np.float32)
+
+    # ── ONNX inference (CPU) ──────────────────────────────────────
+    if _SPEAKER_ENC_SESSION is None or _SPEAKER_ENC_SESSION[0] != encoder_path:
+        sess = ort.InferenceSession(encoder_path, providers=["CPUExecutionProvider"])
+        _SPEAKER_ENC_SESSION = (encoder_path, sess)
+    sess = _SPEAKER_ENC_SESSION[1]
+    inp_name = sess.get_inputs()[0].name
+    out = sess.run(None, {inp_name: mel_spec[None, ...]})  # [1, T, 128]
+    emb = out[0].squeeze().astype(np.float32)
+    if emb.shape != (1024,):
+        raise RuntimeError(f"unexpected speaker embedding shape: {emb.shape}")
+    return emb.tobytes()
+
+
+def _code2wav_engine_path(code2wav_dir: str | None = None) -> str:
+    """Return the Code2Wav engine path used by current Qwen3 artifact sets.
+
+    Re-reads env via resolve_tts_code2wav_dir() when no dir is supplied so
+    callers from module scope (no instance state) still respect hot reload.
+    Backend instances should pass their captured ``self._code2wav_dir`` to
+    keep the resolution consistent with what __init__ saw.
+    """
+    if code2wav_dir is None:
+        code2wav_dir = resolve_tts_code2wav_dir()
     candidates = [
-        os.path.join(TTS_CODE2WAV_DIR, "code2wav.engine"),
-        os.path.join(TTS_CODE2WAV_DIR, "code2wav_stateful.engine"),
+        os.path.join(code2wav_dir, "code2wav.engine"),
+        os.path.join(code2wav_dir, "code2wav_stateful.engine"),
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -241,6 +349,13 @@ def _split_tts_text(text: str, max_chars: Optional[int] = None) -> list[str]:
 
 
 def _segment_pause_ms(segment: str) -> int:
+    """Silence to insert *after* a synthesized segment when concatenating.
+
+    Only inserts when the segment ends in natural punctuation — a comma /
+    period earns a real prosodic pause. A segment cut mid-phrase by the
+    16-char safety limit gets **zero** padding: there's no linguistic
+    reason to break the flow, so the audio should run continuously.
+    """
     if not segment:
         return 0
     pause_ms = int(os.environ.get("EDGE_LLM_TTS_SEGMENT_PAUSE_MS", "80"))
@@ -250,7 +365,7 @@ def _segment_pause_ms(segment: str) -> int:
         return max(0, hard_pause_ms)
     if stripped.endswith(("，", ",", "、", "：", ":")):
         return max(0, pause_ms)
-    return max(0, pause_ms)
+    return 0  # forced cut mid-phrase (no punctuation) — no synthetic silence
 
 
 def _concat_wav_bytes(parts: list[bytes], pauses_ms: Optional[list[int]] = None) -> bytes:
@@ -295,6 +410,25 @@ def _wav_duration_and_samples(wav_bytes: bytes) -> tuple[float, int]:
         samples = reader.getnframes()
         rate = reader.getframerate()
     return (samples / rate if rate > 0 else 0.0), samples
+
+
+def _event_request_id(event: dict) -> str | None:
+    """Return the request id of a worker stdout event.
+
+    Phase 1 of the TTS worker concurrency spec (docs/specs/tts-worker-concurrency.md)
+    adds a ``request_id`` field to every stdout event while keeping the legacy
+    ``id`` field as an alias for back-compat. Callers that need to demux
+    events back to a request (or just defensively verify the worker's
+    response belongs to the request they issued) should read the id through
+    this helper rather than indexing ``event["id"]`` directly. At N=1 with
+    ``_worker_lock`` the demux is implicit, so this is informational today;
+    it becomes load-bearing once the Phase 2/3 reader thread lands.
+    """
+    rid = event.get("request_id")
+    if rid:
+        return rid
+    rid = event.get("id")
+    return rid if rid else None
 
 
 def _pcm16_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
@@ -346,8 +480,41 @@ _DEFAULT_CODEC_EOS_LOGIT_OFFSET = float(os.environ.get("TTS_CODEC_EOS_LOGIT_OFFS
 _DEFAULT_SEGMENT_TEXT = os.environ.get("EDGE_LLM_TTS_SEGMENT_TEXT", "1").lower() not in ("0", "false", "no")
 
 
+
 class TRTEdgeLLMTTSBackend(TTSBackend):
     """TTS via TRT-Edge-LLM qwen3_tts_inference subprocess."""
+
+    @classmethod
+    def concurrency_capability(cls, profile=None):
+        from app.core.concurrency_capability import ConcurrencyCapability
+
+        # _WorkerIO multiplexes N in-flight requests with a single subprocess
+        # (one stdin lock + one stdout reader + per-request queues). See
+        # spec Section 1 table row "trt_edge_llm_tts" and
+        # app/backends/jetson/trt_edge_llm_tts.py:486 (_WorkerIO).
+        env_val = os.environ.get("OVS_TTS_WORKER_CONCURRENCY")
+        profile_val = None
+        if isinstance(profile, dict):
+            # accept both top-level and nested under tts_backend_config
+            profile_val = profile.get("tts_worker_concurrency")
+            if profile_val is None:
+                cfg = profile.get("tts_backend_config")
+                if isinstance(cfg, dict):
+                    profile_val = cfg.get("worker_concurrency")
+        try:
+            n = int(env_val) if env_val is not None else (
+                int(profile_val) if profile_val is not None else 1
+            )
+        except (TypeError, ValueError):
+            n = 1
+        n = max(1, n)
+        return ConcurrencyCapability(
+            supports_parallel=n > 1,
+            max_concurrent=n,
+            is_stateful=True,
+            requires_exclusive_device=True,
+            scaling_mode="single_runtime_multiplex",
+        )
 
     # PR5b: supports_hot_reload is mode-dependent. The default
     # edgellm_worker / official modes spawn a TRT subprocess that can be
@@ -371,9 +538,30 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         self._product_backend = None
         self._resolved_mode: Optional[str] = None
         self._worker: Optional[subprocess.Popen] = None
+        # _worker_lock is retained for unload()/restart lifecycle serialization
+        # (process spawn + handle swap). Per-request I/O serialization moved
+        # to _WorkerIO (see TTS worker concurrency spec §4.2). The fine-grained
+        # stdin lock + reader thread live inside ``self._worker_io``.
         self._worker_lock = threading.Lock()
+        self._worker_io: Optional[WorkerIO] = None
+        self._worker_concurrency: int = max(
+            1, int(os.environ.get("OVS_TTS_WORKER_CONCURRENCY", "1"))
+        )
         self._worker_ready_meta: dict = {}
         self._worker_stderr_tail = deque(maxlen=80)
+        # Capture artifact paths from the *current* env at instance creation
+        # time. BackendManager builds a fresh backend after apply_profile()
+        # clears the factory cache, so __init__ always sees the latest
+        # profile-applied env. Avoid relying on module-level constants in
+        # trt_edge_llm_ipc.py which are frozen at first import — see the
+        # resolve_*() helpers there.
+        self._talker_dir = resolve_tts_talker_dir()
+        self._code_predictor_dir = resolve_tts_code_predictor_dir()
+        self._tokenizer_dir = resolve_tts_tokenizer_dir()
+        self._speaker_encoder = _resolve_speaker_encoder()
+        self._code2wav_dir = resolve_tts_code2wav_dir()
+        self._worker_binary = resolve_tts_worker_binary()
+        self._qwen3_runtime_profile = qwen3_runtime_profile()
 
     # -- TTSBackend interface ------------------------------------------------
 
@@ -443,15 +631,15 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
         explicit_talker_engine = os.environ.get("EDGE_LLM_TTS_TALKER_ENGINE")
         required = [
-            (TTS_WORKER_BINARY if self._use_worker() else TTS_BINARY, "TTS binary"),
+            (self._worker_binary if self._use_worker() else TTS_BINARY, "TTS binary"),
             (PLUGIN_PATH, "TRT-Edge-LLM plugin"),
-            (os.path.join(TTS_TALKER_DIR, "config.json"), "talker config"),
-            (os.path.join(TTS_TOKENIZER_DIR, "tokenizer.json"), "tokenizer"),
+            (os.path.join(self._talker_dir, "config.json"), "talker config"),
+            (os.path.join(self._tokenizer_dir, "tokenizer.json"), "tokenizer"),
         ]
         if explicit_talker_engine:
             required.append((explicit_talker_engine, "explicit Talker engine"))
         else:
-            required.append((os.path.join(TTS_TALKER_DIR, "llm.engine"), "talker engine"))
+            required.append((os.path.join(self._talker_dir, "llm.engine"), "talker engine"))
         missing = []
         for path, label in required:
             if not os.path.exists(path):
@@ -462,7 +650,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             )
 
         # Code2Wav is optional (graceful fallback)
-        c2w_path = _code2wav_engine_path()
+        c2w_path = _code2wav_engine_path(self._code2wav_dir)
         if os.path.exists(c2w_path):
             logger.info("Code2Wav engine found at %s", c2w_path)
         else:
@@ -473,9 +661,9 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
         logger.info(
             "TTS backend preload OK (profile=%s binary=%s talker=%s)",
-            QWEN3_RUNTIME_PROFILE,
-            TTS_WORKER_BINARY if self._use_worker() else TTS_BINARY,
-            TTS_TALKER_DIR,
+            self._qwen3_runtime_profile,
+            self._worker_binary if self._use_worker() else TTS_BINARY,
+            self._talker_dir,
         )
         if self._use_worker():
             self._ensure_worker()
@@ -504,6 +692,10 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             with self._worker_lock:
                 old = self._worker
                 self._worker = None
+                # Drop _WorkerIO first so its reader thread sees EOF
+                # cleanly when we kill the subprocess below, and wakes any
+                # (unexpected) in-flight callers with the exit sentinel.
+                self._worker_io = None
                 if old is not None:
                     try:
                         old.terminate()
@@ -582,15 +774,15 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         if self._worker is not None and self._worker.poll() is None:
             return
         cmd = [
-            TTS_WORKER_BINARY,
+            self._worker_binary,
             "--talkerEngineDir",
-            TTS_TALKER_DIR,
+            self._talker_dir,
             "--codePredictorEngineDir",
-            TTS_CODE_PREDICTOR_DIR,
+            self._code_predictor_dir,
             "--tokenizerDir",
-            TTS_TOKENIZER_DIR,
+            self._tokenizer_dir,
             "--code2wavEngineDir",
-            TTS_CODE2WAV_DIR,
+            self._code2wav_dir,
         ]
         optional_flags = [
             ("EDGE_LLM_TTS_TALKER_BACKEND", "--qwen3TtsTalkerBackend"),
@@ -621,12 +813,30 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         if ready.get("event") != "ready":
             raise RuntimeError(f"TTS worker did not become ready: {ready}")
         self._worker_ready_meta = ready
+        # Re-read concurrency in case the env was applied between __init__
+        # and the first preload (BackendManager applies profile env before
+        # building the backend, but later hot reloads come via __init__ on a
+        # fresh instance — so this is mostly defensive).
+        self._worker_concurrency = max(
+            1, int(os.environ.get("OVS_TTS_WORKER_CONCURRENCY", str(self._worker_concurrency)))
+        )
+        self._worker_io = WorkerIO(self._worker, self._worker_concurrency)
 
     def _restart_worker_locked(self, reason: str) -> None:
-        """Restart the resident TTS worker while ``_worker_lock`` is held."""
+        """Restart the resident TTS worker.
+
+        Called from inside ``_worker_lock`` (held by the streaming retry-on-
+        empty path). Drops the current ``_WorkerIO`` so the daemon reader
+        thread exits cleanly via EOF on the killed process's stdout, then
+        spawns a fresh process + new ``_WorkerIO`` via ``_ensure_worker``.
+        Any other in-flight request on the old ``_WorkerIO`` (none expected
+        in the empty-stream retry path, but safe by construction) receives
+        the ``_worker_exit`` sentinel and raises ``WorkerExitError``.
+        """
         logger.warning("Restarting TTS worker: %s", reason)
         old = self._worker
         self._worker = None
+        self._worker_io = None
         if old is not None:
             try:
                 old.terminate()
@@ -672,18 +882,28 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             request["speaker_embedding_b64"] = base64.b64encode(speaker_embedding).decode("ascii")
         else:
             self._add_speaker_request_fields(request, voice_kwargs)
+        # Phase 3b-B-3 (TTS worker concurrency): one-shot path now goes through
+        # _WorkerIO.request() — same protocol contract (one event per request
+        # in the file-output mode), but the stdin write is serialized only at
+        # the byte level and the response is demuxed by request_id, allowing
+        # other concurrent requests to interleave at the stdout reader.
         with self._worker_lock:
             self._ensure_worker()
-            assert self._worker is not None and self._worker.stdin is not None and self._worker.stdout is not None
-            t0 = time.time()
-            self._worker.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
-            self._worker.stdin.flush()
-            line = self._worker.stdout.readline()
-            elapsed = time.time() - t0
-        if not line:
+            assert self._worker_io is not None
+        t0 = time.time()
+        response = None
+        try:
+            for event in self._worker_io.request(request):
+                response = event
+        except WorkerExitError as exc:
             self._worker = None
-            raise RuntimeError(f"TTS worker exited before response: {self._worker_stderr_snip()}")
-        response = json.loads(line)
+            self._worker_io = None
+            raise RuntimeError(f"TTS worker exited before response: {self._worker_stderr_snip()}") from exc
+        elapsed = time.time() - t0
+        if response is None:
+            self._worker = None
+            self._worker_io = None
+            raise RuntimeError(f"TTS worker returned no events: {self._worker_stderr_snip()}")
         if not response.get("ok"):
             raise RuntimeError(f"TTS worker failed: {response}")
         with open(response["output_file"], "rb") as f:
@@ -862,18 +1082,38 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         retry_after_empty = False
         emitted_chunks = 0
         done_event: dict | None = None
+        # Phase 3b-B-3 (TTS worker concurrency): streaming path now iterates
+        # over _WorkerIO.request() — the daemon reader thread demuxes events
+        # to this request's queue by request_id. The old end-to-end
+        # _worker_lock is no longer held across the chunk loop, so other
+        # in-flight requests can run concurrently up to OVS_TTS_WORKER_CONCURRENCY.
         with self._worker_lock:
             self._ensure_worker()
-            assert self._worker is not None and self._worker.stdin is not None and self._worker.stdout is not None
-            self._worker.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
-            self._worker.stdin.flush()
-
-            while True:
-                line = self._worker.stdout.readline()
-                if not line:
-                    self._worker = None
-                    raise RuntimeError(f"TTS worker exited during stream: {self._worker_stderr_snip()}")
-                event = json.loads(line)
+            assert self._worker_io is not None
+            worker_io = self._worker_io
+        try:
+            for event in worker_io.request(request):
+                # Forward-compat: worker emits both "request_id" and "id".
+                # _WorkerIO already demuxes by request_id, but keep the
+                # mismatch-warn for protocol-drift detection.
+                event_rid = _event_request_id(event)
+                if event_rid is not None and event_rid != req_id and event_rid != "__worker__":
+                    logger.debug(
+                        "TTS worker event id mismatch: expected=%s got=%s event=%s",
+                        req_id,
+                        event_rid,
+                        event.get("event"),
+                    )
+                # Cooperative cancel: terminal "cancelled" event has ok:true
+                # per spec §4.1; check it BEFORE the ok-flag gate so it
+                # never surfaces as a RuntimeError.
+                if event.get("event") == "cancelled":
+                    logger.info(
+                        "TTS worker acknowledged cancel for %s (reason=%s)",
+                        req_id,
+                        event.get("reason"),
+                    )
+                    return
                 if not event.get("ok"):
                     raise RuntimeError(f"TTS streaming worker failed: {event}")
                 if event.get("event") == "chunk":
@@ -904,10 +1144,36 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                         and emitted_chunks == 0
                     ):
                         retry_after_empty = True
-                        self._restart_worker_locked(
-                            f"stateful stream returned 0 chunks for request {req_id}"
-                        )
+                        # Reacquire the lifecycle lock for the restart —
+                        # other concurrent requests on the old worker_io
+                        # will receive _worker_exit sentinels and raise
+                        # WorkerExitError (caller handles).
+                        with self._worker_lock:
+                            self._restart_worker_locked(
+                                f"stateful stream returned 0 chunks for request {req_id}"
+                            )
                     break
+        except GeneratorExit:
+            # Consumer abandoned us mid-stream (HTTP client disconnect /
+            # caller broke out of the for loop). Notify the worker so its
+            # CUDA context doesn't get poisoned by partial cleanup — see
+            # docs/specs/tts-worker-cancel-protocol.md §1.
+            logger.info(
+                "generator exit during TTS stream; cancelling worker for %s",
+                req_id,
+            )
+            try:
+                worker_io.cancel(req_id)
+            except Exception:
+                logger.debug("worker_io.cancel() failed during GeneratorExit",
+                             exc_info=True)
+            raise
+        except WorkerExitError as exc:
+            self._worker = None
+            self._worker_io = None
+            raise RuntimeError(
+                f"TTS worker exited during stream: {self._worker_stderr_snip()}"
+            ) from exc
         if retry_after_empty:
             logger.warning(
                 "Retrying TTS stream after empty stateful result "
@@ -1028,43 +1294,9 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
     def extract_speaker_embedding(self, audio_wav_bytes: bytes) -> bytes:
         if self._product_backend is not None:
             return self._product_backend.extract_speaker_embedding(audio_wav_bytes)
-        if not os.path.exists(_QWEN3_SPEAKER_ENCODER):
-            raise NotImplementedError(f"speaker encoder not found: {_QWEN3_SPEAKER_ENCODER}")
-        if not os.path.exists(_QWEN3_EXTRACT_SCRIPT):
-            raise NotImplementedError(f"speaker extraction script not found: {_QWEN3_EXTRACT_SCRIPT}")
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wf:
-            wf.write(audio_wav_bytes)
-            wav_path = wf.name
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as ef:
-            emb_path = ef.name
-
-        try:
-            result = subprocess.run(
-                [
-                    "python3",
-                    _QWEN3_EXTRACT_SCRIPT,
-                    "--audio",
-                    wav_path,
-                    "--model",
-                    _QWEN3_SPEAKER_ENCODER,
-                    "--output",
-                    emb_path,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(f"Embedding extraction failed: {result.stderr}")
-            with open(emb_path, "rb") as f:
-                return f.read()
-        finally:
-            for path in (wav_path, emb_path):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        if not os.path.exists(self._speaker_encoder):
+            raise NotImplementedError(f"speaker encoder not found: {self._speaker_encoder}")
+        return _qwen3_speaker_embed_inproc(audio_wav_bytes, self._speaker_encoder)
 
     def _synthesize_single(
         self,
@@ -1132,11 +1364,11 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                 "--inputFile",
                 input_path,
                 "--talkerEngineDir",
-                TTS_TALKER_DIR,
+                self._talker_dir,
                 "--codePredictorEngineDir",
-                TTS_CODE_PREDICTOR_DIR,
+                self._code_predictor_dir,
                 "--tokenizerDir",
-                TTS_TOKENIZER_DIR,
+                self._tokenizer_dir,
                 "--outputFile",
                 output_path,
                 "--outputAudioDir",
@@ -1144,9 +1376,9 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             ]
 
             # Add code2wav if engine exists
-            c2w_path = _code2wav_engine_path()
+            c2w_path = _code2wav_engine_path(self._code2wav_dir)
             if os.path.exists(c2w_path):
-                cli_args += ["--code2wavEngineDir", TTS_CODE2WAV_DIR]
+                cli_args += ["--code2wavEngineDir", self._code2wav_dir]
 
             t0 = time.time()
             result = run_binary(TTS_BINARY, cli_args, timeout=120)

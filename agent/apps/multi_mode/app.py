@@ -66,7 +66,18 @@ class MultiModeApp(BaseApp):
         self.modes.register(MonologueMode())
         self.modes.register(TranscribeMode())
 
-    def _make_mode_ctx(self) -> ModeContext:
+    def _make_mode_ctx(
+        self, *, detected_language: str | None = None
+    ) -> ModeContext:
+        """Build a fresh ModeContext.
+
+        ``detected_language`` is passed explicitly at the utterance dispatch
+        site (where the ASRFinal carries the language) and defaults to
+        ``None`` for mode lifecycle calls (enter / exit / on_assistant_done /
+        ModeManager-internal context builds) so those hooks never see a stale
+        per-utterance value. This matches the ``ModeContext.detected_language``
+        contract: ``None`` outside of a user-utterance call.
+        """
         ctx = ModeContext(
             config=self.config,
             slv=self.slv,
@@ -76,6 +87,7 @@ class MultiModeApp(BaseApp):
             audio=self.audio,
             events=self.events,
             broadcast=self.broadcast,
+            detected_language=detected_language,
         )
         # Wire the ModeManager so `_resolve_system_prompt` can find
         # the current mode's class default + per-mode config overrides.
@@ -102,7 +114,9 @@ class MultiModeApp(BaseApp):
             except Exception:  # pragma: no cover - defensive
                 logger.debug("_reset_sleep_timer failed", exc_info=True)
 
-    async def on_user_utterance(self, text: str) -> None:
+    async def on_user_utterance(
+        self, text: str, detected_language: str | None = None
+    ) -> None:
         mode = self.modes.current
         try:
             preprocessed = mode.preprocess_user_text(text)
@@ -116,9 +130,13 @@ class MultiModeApp(BaseApp):
             self._restore_idle_after_silent_turn()
             return
         logger.info(
-            "on_user_utterance: dispatching to mode=%s text=%r", mode.name, preprocessed
+            "on_user_utterance: dispatching to mode=%s text=%r (lang=%r)",
+            mode.name, preprocessed, detected_language,
         )
-        await mode.on_user_utterance(self._make_mode_ctx(), preprocessed)
+        await mode.on_user_utterance(
+            self._make_mode_ctx(detected_language=detected_language),
+            preprocessed,
+        )
         # If the mode declared it doesn't produce TTS, the SPEAKING→IDLE
         # transition will never fire from TTSDone — restore IDLE here.
         if not getattr(mode, "produces_tts", True):

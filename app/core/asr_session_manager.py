@@ -34,6 +34,15 @@ from typing import Any, Awaitable, Callable, Optional
 logger = logging.getLogger(__name__)
 
 
+class ASRSessionUnavailable(RuntimeError):
+    """Raised when on_speech_start cannot produce a working ASR stream.
+
+    Signals to the caller that the ASR worker is unrecoverable for this
+    turn — caller MUST NOT flag the session as active (race #1: silent
+    no-op accept_audio loop with client stuck THINKING).
+    """
+
+
 class SessionState(str, Enum):
     IDLE = "idle"
     ACTIVE = "active"
@@ -60,6 +69,25 @@ def _is_worker_protocol_error(exc: BaseException) -> bool:
         if cls.__name__ in _WORKER_ERROR_NAMES:
             return True
     return False
+
+
+def _safe_close_stream(stream: Any) -> None:
+    """Release per-stream backend resources (TRT contexts, device buffers).
+
+    Default ASRStream.close() is a no-op; backends like paraformer_trt
+    override it to drop per-stream TRT IExecutionContext + cudaMalloc'd
+    buffers (added 2026-05-25 for N>=2 concurrency safety). We swallow any
+    exception so close() never breaks lifecycle teardown.
+    """
+    if stream is None:
+        return
+    close = getattr(stream, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:
+        logger.exception("ASRSessionManager: stream.close raised; ignoring")
 
 
 class ASRSessionManager:
@@ -162,8 +190,19 @@ class ASRSessionManager:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("ASRSessionManager: create_stream failed: %s", exc)
                 await self._handle_error_locked(exc)
-                # After recovery the stream is created lazily on next
-                # accept; for now flag ACTIVE so callers can proceed.
+                # After _handle_error_locked runs the full rebuild ladder
+                # (incl. worker restart). If even that failed, state will
+                # have been set to IDLE and stream remains None — in which
+                # case we MUST surface the failure to the caller rather
+                # than silently flagging ACTIVE (race #1: WS would stay
+                # alive with a dead ASR, audio dropped, no final, client
+                # stuck THINKING forever). If a stream was rebuilt during
+                # recovery, state is already ACTIVE and we can proceed.
+                if self._stream is None:
+                    self._state = SessionState.IDLE
+                    raise ASRSessionUnavailable(
+                        "ASR worker unavailable after rebuild"
+                    ) from exc
             self._state = SessionState.ACTIVE
             return self._generation
 
@@ -220,41 +259,53 @@ class ASRSessionManager:
 
         Returns ``(gen, "")`` on no-op / discarded paths.
         """
-        gen, text, _accepted = await self.finalize_with_status(reason)
+        gen, text, _accepted, _lang = await self.finalize_with_status(reason)
         return gen, text
 
-    async def finalize_with_status(self, reason: str = "vad_end") -> tuple[int, str, bool]:
-        """Like :meth:`finalize_with_generation`, plus an accepted flag.
+    async def finalize_with_status(
+        self, reason: str = "vad_end"
+    ) -> tuple[int, str, bool, Optional[str]]:
+        """Like :meth:`finalize_with_generation`, plus an accepted flag and
+        detected language.
 
         ``accepted`` is False when the manager discarded the finalize
         result because the stream was cancelled, no longer finalizable, or
         superseded by another generation. Callers that emit protocol frames
         should use this flag instead of comparing against mutable outer
         connection state.
+
+        ``detected_language`` is the per-utterance language reported by
+        the ASR backend (e.g. ``"Chinese"``), or ``None`` if the backend
+        does not perform language ID. Always ``None`` on discarded /
+        no-op paths.
         """
         async with self._lock:
             if self._state not in (SessionState.ACTIVE,):
-                return self._generation, "", False
+                return self._generation, "", False, None
             gen = self._generation
             self._state = SessionState.FINALIZING
             stream = self._stream
         if stream is None:
             async with self._lock:
                 self._state = SessionState.IDLE
-            return gen, "", False
+            return gen, "", False, None
         try:
-            final_text = await self._run_sync(stream.finalize)
+            raw = await self._run_sync(stream.finalize)
         except Exception as exc:  # noqa: BLE001
             async with self._lock:
                 await self._handle_error_locked(exc)
-            return gen, "", False
+            return gen, "", False, None
+        # Backends MUST return ``(text, language)``. Per the ASRStream
+        # ABC contract; missed migrations should fail loudly (TypeError
+        # at unpack) rather than silently degrade to ``language=None``.
+        final_text, detected_language = raw
         async with self._lock:
             # If a cancel raced past us (e.g. abort-during-FINALIZING),
             # the cancel routine will have moved us into CANCELLING and
             # already discarded the result. Honor that.
             if self._state != SessionState.FINALIZING:
                 logger.info("ASRSessionManager: finalize result discarded (state=%s)", self._state)
-                return gen, "", False
+                return gen, "", False, None
             # Also drop if the generation advanced (a new speech_start
             # raced past us via _inner_cancel/preempt).
             if self._generation != gen:
@@ -262,10 +313,11 @@ class ASRSessionManager:
                     "ASRSessionManager: finalize result discarded (stale gen %d != current %d)",
                     gen, self._generation,
                 )
-                return gen, "", False
+                return gen, "", False, None
+            _safe_close_stream(self._stream)
             self._stream = None
             self._state = SessionState.IDLE
-            return gen, final_text or "", True
+            return gen, final_text or "", True, detected_language
 
     async def get_partial_for_generation(self) -> tuple[int, str, bool]:
         """Snapshot ``(generation, partial_text, is_endpoint)`` atomically.
@@ -298,6 +350,11 @@ class ASRSessionManager:
         self._state = SessionState.CANCELLING
         stream = self._stream
         self._stream = None
+        # close() is idempotent w.r.t. later cancel()/cancel_and_finalize() —
+        # for paraformer_trt, close() only releases per-stream TRT contexts
+        # and buffers, which are not needed for the cancel ack itself.
+        # We defer close() until *after* the cancel call below so the cancel
+        # path can still touch stream state if it needs to. See finally.
         if stream is None:
             self._state = SessionState.IDLE
             return
@@ -336,6 +393,7 @@ class ASRSessionManager:
                 await self._maybe_restart_worker()
             else:
                 logger.info("ASRSessionManager: cancel(%s) swallowed exc=%s", reason, exc)
+        _safe_close_stream(stream)
         self._state = SessionState.IDLE
 
     def mark_error(self, exc: BaseException) -> None:
@@ -394,6 +452,7 @@ class ASRSessionManager:
         if self._recovery_in_progress:
             return
         self._recovery_in_progress = True
+        _safe_close_stream(self._stream)
         self._stream = None
         self._state = SessionState.ERROR_REBUILD
         if not _is_worker_protocol_error(exc):
@@ -428,6 +487,7 @@ class ASRSessionManager:
             self._state = SessionState.ACTIVE
         except Exception as inner:
             logger.warning("ASRSessionManager: post-restart create_stream failed: %s", inner)
+            _safe_close_stream(self._stream)
             self._stream = None
             self._state = SessionState.IDLE
 

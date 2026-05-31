@@ -302,7 +302,7 @@ async def test_multi_mode_app_restores_idle_for_silent_mode():
     )
     app.broadcast = _br
     # _make_mode_ctx normally reads self.slv etc.; skip that wiring.
-    app._make_mode_ctx = lambda: ctx_holder["ctx"]
+    app._make_mode_ctx = lambda **kw: ctx_holder["ctx"]
 
     # Drive the utterance — TranscribeMode produces no TTS.
     await app.on_user_utterance("hello world")

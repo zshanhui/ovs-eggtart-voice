@@ -37,7 +37,10 @@ class _SlowSLV:
 @pytest.mark.asyncio
 async def test_send_audio_nonblocking_returns_within_timeout():
     """If SLV send_audio is slow (reconnect in progress), the helper
-    must return within ~0.5 s and not block the mic pump indefinitely."""
+    must return within the wait_for ceiling (2.0s) and not block the
+    mic pump indefinitely. (Ceiling was raised from 0.5s → 2.0s as part
+    of race #3 fix; the reconnecting-gate short-circuit handles the
+    common reconnect case without consuming the full 2.0s budget.)"""
     app = BaseApp.__new__(BaseApp)
     app.slv = _SlowSLV(delay=5.0)  # would block 5 s
 
@@ -45,9 +48,9 @@ async def test_send_audio_nonblocking_returns_within_timeout():
     await app._send_audio_nonblocking(b"\x00" * 100)
     elapsed = asyncio.get_running_loop().time() - start
 
-    # Should bail out around 0.5 s (the helper's wait_for ceiling),
+    # Should bail out around 2.0 s (the helper's wait_for ceiling),
     # nowhere near the 5 s slow-send delay.
-    assert elapsed < 1.0, f"send_audio_nonblocking blocked {elapsed:.2f}s"
+    assert elapsed < 2.5, f"send_audio_nonblocking blocked {elapsed:.2f}s"
     # The slow send is still pending in the background; that's fine, we
     # just must not have waited for it.
     assert app.slv.sent == []
@@ -126,6 +129,8 @@ async def test_playback_uses_callback_buffer_and_stop_clears_it():
     audio._discard_playback = False
     audio._is_playing = False
     audio._output_stream = object()
+    audio.output_sr = 24000
+    audio._source_sr = 24000
 
     await audio.play(b"\x01\x02\x03\x04")
     assert audio.is_playing is True

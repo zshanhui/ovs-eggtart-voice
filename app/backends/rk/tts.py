@@ -32,6 +32,24 @@ class RKTTSBackend(TTSBackend):
     delegated to rkvoice-stream via the ``TTS_BACKEND`` env var (set in
     the rk3576/rk3588 profile)."""
 
+    @classmethod
+    def concurrency_capability(cls, profile=None):
+        """Declare concurrency for RK NPU TTS.
+
+        Spec §1 sample row "RK ASR/TTS": rkvoice-stream owns NPU lifecycle
+        (see ``app/backends/rk/tts.py:79`` for the unload-belongs-to-rkvoice
+        comment), serializes through one NPU device, and cannot be safely
+        multiplexed across slots. Single-session only.
+        """
+        from app.core.concurrency_capability import ConcurrencyCapability
+        return ConcurrencyCapability(
+            supports_parallel=False,
+            max_concurrent=1,
+            is_stateful=True,
+            requires_exclusive_device=True,
+            scaling_mode="external_managed",
+        )
+
     def __init__(self):
         from rkvoice_stream import create_tts
         self._inner = create_tts()
@@ -134,6 +152,7 @@ class RKTTSBackend(TTSBackend):
             raise RuntimeError("RKTTSBackend not loaded (was unloaded)")
         voice = resolve_speaker_kwargs(self.model_id, allow_embedding=False, **kwargs)
         speaker_id = voice.get("speaker_id", 0)
+        kwargs.pop("speaker_id", None)
         speed = kwargs.pop("speed", None)
         pitch_shift = kwargs.pop("pitch_shift", None)
         language = detect_zh_en(text, kwargs.pop("language", None))

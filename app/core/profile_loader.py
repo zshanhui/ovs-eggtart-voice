@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import string
 import threading
 from pathlib import Path
 from typing import Mapping
@@ -50,6 +51,16 @@ def _snapshot_operator_keys() -> frozenset[str]:
 
 # Snapshot taken exactly once at module import.
 _OPERATOR_KEYS: frozenset[str] = _snapshot_operator_keys()
+
+# Keys for which an operator/profile mismatch is a hard failure (not a soft
+# "operator wins" silent override). These keys steer downstream backend
+# selection AND model-download routing; a silent mismatch produces
+# misleading runtime failures (e.g. profile picks Qwen3 ASR but
+# LANGUAGE_MODE=zh_en in env shadows it, so the Qwen3 artifacts never
+# download). Fail loud at startup instead.
+CRITICAL_KEYS: frozenset[str] = frozenset({
+    "LANGUAGE_MODE", "ASR_BACKEND", "TTS_BACKEND",
+})
 
 # Keys written by the most recent ``apply_profile`` call. Used to clear stale
 # values when reloading a different profile.
@@ -145,6 +156,34 @@ def current_profile() -> dict:
         return _CURRENT_PROFILE
 
 
+def get_max_concurrent_sessions() -> int | None:
+    """Return the profile's top-level ``max_concurrent_sessions`` (if set).
+
+    Week 1 production hardening: profiles MAY declare a session limit as
+    a top-level integer (not under ``env``); env override
+    ``OVS_MAX_CONCURRENT_SESSIONS`` always wins. See
+    ``docs/specs/prod-hardening-week1.md`` Deliverable 2.
+
+    Returns ``None`` when the profile does not set the field. Raises
+    ``ValueError`` if the value is present but not a positive integer.
+    """
+    with _PROFILE_LOCK:
+        raw = _CURRENT_PROFILE.get("max_concurrent_sessions")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"profile.max_concurrent_sessions must be an integer, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            f"profile.max_concurrent_sessions must be > 0, got {value}"
+        )
+    return value
+
+
 def get_applied_keys() -> frozenset[str]:
     """Return a snapshot of env keys written by the most recent ``apply_profile``."""
     with _PROFILE_LOCK:
@@ -183,9 +222,15 @@ def apply_profile(
             profile = json.load(f)
 
         # Compute the desired env from profile JSON (with $VAR expansion).
+        # Two-pass expansion lets a profile reference its own keys, e.g.:
+        #   QWEN3_ARTIFACT_ROOT=/opt/models/qwen3-edgellm
+        #   EDGE_LLM_ASR_ENGINE_DIR=${QWEN3_ARTIFACT_ROOT}/engines/...
+        # without depending on the current process env having an identically
+        # named (and correct) value already set.
+        env_block = profile.get("env") or {}
         new_env: dict[str, str] = {}
-        for key, value in (profile.get("env") or {}).items():
-            new_env[key] = os.path.expandvars(str(value))
+        for key, value in env_block.items():
+            new_env[key] = _expand_with_profile_env(str(value), env_block)
 
         derived: dict[str, str] = {
             "OVS_PROFILE_NAME": str(profile.get("name", path.stem)),
@@ -211,6 +256,20 @@ def apply_profile(
         # 2. Write new values, unconditionally overwriting unless operator-owned.
         for k, v in merged.items():
             if k in _OPERATOR_KEYS:
+                existing = os.environ.get(k)
+                if existing != v:
+                    if k in CRITICAL_KEYS:
+                        raise RuntimeError(
+                            f"Profile {derived['OVS_PROFILE_NAME']} requires "
+                            f"{k}={v}, but environment has {k}={existing}. "
+                            f"Remove {k} from your environment "
+                            f"(compose/.env/shell) or change OVS_PROFILE to "
+                            f"one that matches."
+                        )
+                    logger.warning(
+                        "Profile %s wants %s=%s but env overrides to %s",
+                        derived["OVS_PROFILE_NAME"], k, v, existing,
+                    )
                 continue
             os.environ[k] = v
 
@@ -243,3 +302,109 @@ def apply_profile_from_env() -> dict:
       4. ``OVS_PRESET`` — resolved via ``profile_selector``.
     """
     return apply_profile(None)
+
+
+# ---------------------------------------------------------------------------
+# Artifact pre-flight helpers
+# ---------------------------------------------------------------------------
+
+# Env-key suffixes that signal "this value is a filesystem path / artifact".
+# Used by ``expected_artifact_paths`` / ``find_missing_artifacts`` to decide
+# which env entries are worth existence-checking before a profile reload.
+#
+# Coverage notes (audit 2026-05-21 against configs/profiles/*.json):
+#   - _DIR / _ENGINE / _PATH / _BIN / _MANIFEST / _SETTINGS / _FILTERS: original
+#     set covers most jetson/rk profile keys.
+#   - _ONNX: KOKORO_SPLIT_*_ONNX, MATCHA_SPLIT_ENCODER_ONNX, PARAFORMER_*_ONNX.
+#   - _ROOT: QWEN3_ARTIFACT_ROOT, QWEN3_EDGELLM_JETSON_ROOT.
+#   - _BASE: KOKORO_MODEL_BASE, MATCHA_MODEL_BASE.
+#   - _VOICES: future Kokoro voices.bin path (not currently in any shipped
+#     profile, but cheap to include — startswith("/") filter catches misuse).
+#   - _TOKENS: future kokoro/matcha tokens.txt path; current profiles use
+#     non-path *_STREAM_MAX_SEGMENT_TOKENS=64 (scalar) — caught by the
+#     startswith("/") safety filter below.
+#   - _LONG: KOKORO_SPLIT_*_ENGINE_LONG (engine paths used for long context).
+#
+# Safety net: ``_JSON`` matches both ``EDGE_LLM_ASR_MANIFEST_JSON`` (a path)
+# and ``OVS_TTS_SPEAKERS_JSON`` (a JSON blob like '{"0":""}', NOT a path).
+# We rely on the ``expanded.startswith("/")`` filter to discard non-path
+# values regardless of suffix — never remove that filter without rethinking
+# how non-path string env entries flow through this helper.
+_PATH_LIKE_SUFFIXES: tuple[str, ...] = (
+    "_DIR", "_ENGINE", "_PATH", "_BIN", "_MANIFEST",
+    "_SETTINGS", "_FILTERS", "_JSON",
+    "_ONNX", "_ROOT", "_BASE", "_VOICES", "_TOKENS", "_LONG",
+)
+
+
+def _expand_with_profile_env(value: str, profile_env: Mapping[str, object]) -> str:
+    """Expand ``$VAR`` / ``${VAR}`` using ``profile_env`` first, then ``os.environ``.
+
+    Two-pass expansion handles cases where a profile both defines a key AND
+    references it from another key, e.g.::
+
+        QWEN3_ARTIFACT_ROOT=/opt/models/qwen3-edgellm        # profile-defined
+        EDGE_LLM_ASR_ENGINE_DIR=${QWEN3_ARTIFACT_ROOT}/...   # profile-referenced
+
+    With plain ``os.path.expandvars`` the second key would resolve against
+    whatever ``QWEN3_ARTIFACT_ROOT`` happened to be in the *current* process
+    env (often empty or wrong), defeating dry-run artifact pre-flight.
+
+    Unknown variables are preserved as-is (``safe_substitute`` behaviour),
+    so a malformed ``$`` in a value never raises.
+    """
+    merged: dict[str, str] = {}
+    # os.environ wins as the fallback layer for things the profile doesn't define.
+    merged.update({k: v for k, v in os.environ.items()})
+    # Profile values override env so a profile-declared key resolves to its
+    # profile value, not whatever stale value is in the current process env.
+    for k, v in profile_env.items():
+        if isinstance(v, str):
+            merged[k] = v
+    try:
+        return string.Template(value).safe_substitute(merged)
+    except (ValueError, KeyError):
+        return value
+
+
+def expected_artifact_paths(profile: dict) -> dict[str, str]:
+    """Return ``{env_key: expanded_absolute_path}`` for env entries that
+    look like filesystem artifacts.
+
+    Variable expansion uses the profile's own env block layered on top of
+    ``os.environ`` (see :func:`_expand_with_profile_env`), so profiles that
+    self-reference (e.g. ``${QWEN3_ARTIFACT_ROOT}/engines/...``) resolve
+    against the profile's own value, not whatever happens to be in the
+    current process env.
+
+    Heuristic: include env keys whose suffix matches
+    :data:`_PATH_LIKE_SUFFIXES` AND whose expanded value starts with ``/``
+    (absolute path only). Non-absolute paths and non-string values are
+    skipped — they're either repo-relative (e.g. ``deploy/artifacts/...``)
+    or non-path config (e.g. ``OVS_TTS_SPEAKERS_JSON='{"0":""}'``).
+    """
+    result: dict[str, str] = {}
+    env_block = profile.get("env") or {}
+    for k, v in env_block.items():
+        if not isinstance(v, str):
+            continue
+        if not any(k.endswith(s) for s in _PATH_LIKE_SUFFIXES):
+            continue
+        expanded = _expand_with_profile_env(v, env_block)
+        if expanded.startswith("/"):
+            result[k] = expanded
+    return result
+
+
+def find_missing_artifacts(profile: dict) -> list[dict]:
+    """Return missing-path records for the given profile.
+
+    Empty list means all expected absolute paths exist on disk. Record
+    shape: ``{"env_var": <key>, "path": <expanded>}``.
+    """
+    paths = expected_artifact_paths(profile)
+    missing: list[dict] = []
+    for k, p in paths.items():
+        if not os.path.exists(p):
+            missing.append({"env_var": k, "path": p})
+    return missing

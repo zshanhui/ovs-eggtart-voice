@@ -102,7 +102,7 @@ async def test_app_base_catches_llm_unavailable_and_returns_idle():
 
     app.plugins.append(_CaptureErrorsPlugin())
 
-    async def _fail(text):
+    async def _fail(text, detected_language=None):
         raise LLMUnavailable("LLM is DOWN (consecutive failures: 3)")
 
     app.on_user_utterance = _fail  # type: ignore[assignment]

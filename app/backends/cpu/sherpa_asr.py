@@ -141,9 +141,9 @@ class SherpaASRStream(ASRStream):
             # Reset stream for next utterance
             self._stream = self._recognizer.create_stream()
 
-    def finalize(self) -> str:
+    def finalize(self) -> tuple[str, Optional[str]]:
         if self._cancelled:
-            return self._final_text_cache
+            return self._final_text_cache, None
         recognizer = self._recognizer
         stream = self._stream
 
@@ -160,7 +160,9 @@ class SherpaASRStream(ASRStream):
         text = recognizer.get_result(stream).strip()
         if self._language_mode == "en":
             text = _fix_bpe_splits(text)
-        return text
+        # Sherpa backends are single-language (LANGUAGE_MODE configured);
+        # no per-utterance language detection.
+        return text, None
 
     def get_partial(self) -> tuple[str, bool]:
         text = self._last_text
@@ -189,6 +191,24 @@ class SherpaASRBackend(ASRBackend):
 
     # PR5: CPU / ORT model — releasable in-process via del + gc.
     supports_hot_reload = True
+
+    @classmethod
+    def concurrency_capability(cls, profile=None):
+        """Declare concurrency for desktop/CPU ASR.
+
+        Spec §1 sample row "desktop/CPU ASR/TTS". CPU/ORT recognizer
+        objects are independent across streams; the soft cap of 4 matches
+        the historical desktop default from session_limiter and bounds
+        CPU thread contention.
+        """
+        from app.core.concurrency_capability import ConcurrencyCapability
+        return ConcurrencyCapability(
+            supports_parallel=True,
+            max_concurrent=4,
+            is_stateful=True,
+            requires_exclusive_device=False,
+            scaling_mode="external_managed",
+        )
 
     def __init__(self):
         self._online_recognizer = None

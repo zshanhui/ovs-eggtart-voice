@@ -97,23 +97,28 @@ on connect and treat every later binary frame as pure PCM payload.
 `False` on WS connect, set `True` on the first successful synth, and
 never reset for the lifetime of the connection.)
 
-## Sentence boundaries (TTS input)
+## TTS chunk boundaries
 
-The server buffers text until it sees a sentence-ending punctuation
-(`。！？；\n` always; ASCII `.!?` only when followed by whitespace or
-end-of-buffer, so "3.14" stays intact). Minimum sentence length is
-2 characters (so "Hi.", "OK." pass through). If no punctuation arrives
-within 200 characters, a force-flush kicks in.
+By default, `WS /v2v/stream` uses low-latency TTS chunking rather than
+waiting for a full sentence. For CJK text, short clauses can be emitted
+on comma-like punctuation once they are useful for synthesis, and
+punctuation-free spans are emitted around 12 characters. Sentence-ending
+punctuation (`。！？；\n`, plus ASCII `.!?;`) still flushes immediately.
 
 `tts_flush` always flushes the remainder, regardless of punctuation.
 
-**Abbreviation handling**: when the `tts_language` config maps to one
-of pysbd's 22 supported languages (zh/en/ja/ko/es/fr/de/it/pt/ru/ar/
-hi/...), the splitter uses pysbd's rule-based segmenter — abbreviations
-("Dr. Smith", "U.S.A.", "Ph.D."), inline numbers ("$3.14"), and URLs
-("example.com") all stay intact. Unsupported languages fall back to a
-simple punctuation regex that over-splits abbreviations into separate
-sentences (still works, just slightly choppier TTS cadence).
+Set `OVS_TTS_LOW_LATENCY_CHUNKING=0` to use the older conservative
+sentence splitter.
+
+The low-latency thresholds can be tuned with
+`OVS_TTS_LOW_LATENCY_CJK_MIN_CHARS`,
+`OVS_TTS_LOW_LATENCY_CJK_TARGET_CHARS`, and
+`OVS_TTS_LOW_LATENCY_CJK_MAX_CHARS` (defaults: 8 / 12 / 16).
+
+In fallback mode, when `tts_language` maps to one of pysbd's supported
+languages (zh/en/ja/ko/es/fr/de/it/pt/ru/ar/hi/...), the splitter uses
+pysbd's rule-based segmenter. This is linguistically cleaner but can
+wait for lookahead before emitting the current sentence.
 
 ## Barge-in
 

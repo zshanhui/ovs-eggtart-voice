@@ -188,6 +188,8 @@
     if (msPanel.classList.contains("hidden")) {
       msPanel.classList.remove("hidden");
       await loadModeOverrides(currentModeName);
+      // Section moved into this panel: load its state too.
+      try { if (typeof loadAgentSettings === "function") await loadAgentSettings(); } catch (e) {}
     } else {
       msPanel.classList.add("hidden");
     }
@@ -352,14 +354,19 @@
   }
   function toggleAgentSettings() {
     const hidden = agentSettingsBody.classList.toggle("hidden");
-    btnAgentSettingsToggle.classList.toggle("open", !hidden);
+    if (btnAgentSettingsToggle) btnAgentSettingsToggle.classList.toggle("open", !hidden);
     if (!hidden) loadAgentSettings();
   }
-  btnAgentSettingsToggle.addEventListener("click", (e) => { e.stopPropagation(); toggleAgentSettings(); });
-  $("agentSettingsCard").querySelector("h3").addEventListener("click", (e) => {
-    if (e.target.id === "btnAgentSettingsToggle") return;
-    toggleAgentSettings();
-  });
+  if (btnAgentSettingsToggle) {
+    btnAgentSettingsToggle.addEventListener("click", (e) => { e.stopPropagation(); toggleAgentSettings(); });
+    const h3 = $("agentSettingsCard")?.querySelector("h3");
+    if (h3) {
+      h3.addEventListener("click", (e) => {
+        if (e.target.id === "btnAgentSettingsToggle") return;
+        toggleAgentSettings();
+      });
+    }
+  }
   $("btnAgentSettingsReload").addEventListener("click", loadAgentSettings);
   $("btnAgentSettingsSave").addEventListener("click", async () => {
     const stop_words = setStopWords.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
@@ -389,6 +396,145 @@
       );
     } catch (e) { showToast("保存失败: " + e.message, "error"); }
   });
+
+  // ── translator card (NLLB Phase 2b) ──────────────────────────────
+  const translatorBody = $("translatorBody");
+  const btnTranslatorToggle = $("btnTranslatorToggle");
+  const setTranslatorTgtLang = $("setTranslatorTgtLang");
+  const translatorBackendBadge = $("translatorBackendBadge");
+  const translatorSrcLangText = $("translatorSrcLangText");
+  const btnTranslatorSave = $("btnTranslatorSave");
+  const btnTranslatorReload = $("btnTranslatorReload");
+  let translatorLoaded = false;
+
+  function applyTranslatorRuntime(d) {
+    if (!d || typeof d !== "object") return;
+    const backend = String(d.backend || "noop");
+    if (translatorBackendBadge) {
+      translatorBackendBadge.textContent = backend;
+      translatorBackendBadge.className = "muted small " + backend;
+    }
+    if (translatorSrcLangText) {
+      translatorSrcLangText.textContent = String(d.src_lang || "–");
+    }
+    if (setTranslatorTgtLang) {
+      const targets = Array.isArray(d.supported_targets) ? d.supported_targets : [];
+      const current = String(d.tgt_lang || "");
+      const prevSel = setTranslatorTgtLang.value;
+      setTranslatorTgtLang.innerHTML = "";
+      targets.forEach((t) => {
+        if (!t || !t.code) return;
+        const opt = document.createElement("option");
+        opt.value = String(t.code);
+        opt.textContent = (t.name ? `${t.name} (${t.code})` : String(t.code));
+        setTranslatorTgtLang.appendChild(opt);
+      });
+      // Prefer payload tgt_lang; fall back to previous selection if still present.
+      const wanted = current || prevSel;
+      if (wanted) setTranslatorTgtLang.value = wanted;
+    }
+    const noop = backend === "noop";
+    if (setTranslatorTgtLang) setTranslatorTgtLang.disabled = noop;
+    if (btnTranslatorSave) {
+      btnTranslatorSave.disabled = noop;
+      btnTranslatorSave.title = noop ? "translator_backend 当前为 noop，不会翻译" : "";
+    }
+  }
+
+  async function loadTranslatorRuntime() {
+    try {
+      const r = await fetch("/api/translator/runtime");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const d = await r.json();
+      applyTranslatorRuntime(d);
+      translatorLoaded = true;
+    } catch (e) {
+      showToast("加载翻译设置失败: " + e.message, "error");
+    }
+  }
+
+  async function saveTranslatorRuntime() {
+    if (!setTranslatorTgtLang) return;
+    const tgt = setTranslatorTgtLang.value;
+    if (!tgt) { showToast("请先选择目标语种", "error"); return; }
+    try {
+      const r = await fetch("/api/translator/runtime", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tgt_lang: tgt }),
+      });
+      if (!r.ok) {
+        let msg = "HTTP " + r.status;
+        try { const j = await r.json(); if (j.error) msg = j.error; } catch (_) {}
+        throw new Error(msg);
+      }
+      const data = await r.json();
+      const label = data.tgt_lang || tgt;
+      const note = data.persisted ? "已写入 yaml" : "运行时已生效，未持久化";
+      showToast("已切换到 " + label + "（" + note + "）", "success");
+      if (data.persist_error) showToast("持久化失败: " + data.persist_error, "error");
+    } catch (e) {
+      showToast("保存翻译设置失败: " + e.message, "error");
+    }
+  }
+
+  function toggleTranslatorCard() {
+    if (!translatorBody) return;
+    const hidden = translatorBody.classList.toggle("hidden");
+    if (btnTranslatorToggle) btnTranslatorToggle.classList.toggle("open", !hidden);
+    if (!hidden && !translatorLoaded) loadTranslatorRuntime();
+  }
+  if (btnTranslatorToggle) {
+    btnTranslatorToggle.addEventListener("click", (e) => { e.stopPropagation(); toggleTranslatorCard(); });
+    const head = $("translatorCard")?.querySelector(".ms-section-head");
+    if (head) {
+      head.addEventListener("click", (e) => {
+        if (e.target.id === "btnTranslatorToggle") return;
+        toggleTranslatorCard();
+      });
+    }
+  }
+  if (btnTranslatorReload) btnTranslatorReload.addEventListener("click", loadTranslatorRuntime);
+  if (btnTranslatorSave) btnTranslatorSave.addEventListener("click", saveTranslatorRuntime);
+
+  // ── subtitle bubble (NLLB Phase 2b) ──────────────────────────────
+  function addSubtitleBubble(payload) {
+    const p = payload || {};
+    const original = String(p.original || "");
+    const translated = String(p.translated || "");
+    const srcTag = String(p.detected_language || p.src_lang || "");
+    const tgtTag = String(p.tgt_lang || "");
+    const b = document.createElement("div");
+    b.className = "bubble subtitle";
+    // Build via DOM nodes (text-only) to avoid any innerHTML user-input path.
+    const roleSpan = document.createElement("span");
+    roleSpan.className = "role";
+    roleSpan.textContent = "翻译";
+    const origDiv = document.createElement("div");
+    origDiv.className = "sub-orig muted small";
+    origDiv.textContent = original;
+    if (srcTag) {
+      const tag = document.createElement("span");
+      tag.className = "sub-tag";
+      tag.textContent = " " + srcTag;
+      origDiv.appendChild(tag);
+    }
+    const transDiv = document.createElement("div");
+    transDiv.className = "sub-trans";
+    transDiv.textContent = translated;
+    if (tgtTag) {
+      const tag = document.createElement("span");
+      tag.className = "sub-tag";
+      tag.textContent = " " + tgtTag;
+      transDiv.appendChild(tag);
+    }
+    b.appendChild(roleSpan);
+    b.appendChild(origDiv);
+    b.appendChild(transDiv);
+    chatEl.appendChild(b);
+    chatEl.parentElement.scrollTop = chatEl.parentElement.scrollHeight;
+    return b;
+  }
 
   // ── tabs ─────────────────────────────────────────────────────────
   document.querySelectorAll(".tab").forEach((t) => {
@@ -848,6 +994,16 @@
       return;
     }
 
+    if (ev === "on_translator_runtime_change") {
+      try { applyTranslatorRuntime(data); translatorLoaded = true; } catch (_) {}
+      return;
+    }
+
+    if (ev === "on_translation") {
+      try { addSubtitleBubble(data || {}); } catch (_) {}
+      return;
+    }
+
     if (ev === "errors_cleared") {
       errors = []; renderErrors();
       return;
@@ -972,6 +1128,311 @@
         btn.disabled = false;
       }
     });
+  })();
+
+  // ── TTS 声音卡 + 声音克隆 ────────────────────────────────────────
+  (function () {
+    const sel = $("voiceSelect");
+    const modelEl = $("voiceModel");
+    const countEl = $("voiceCount");
+    const reloadBtn = $("btnVoiceReload");
+    const cloneBtn = $("btnVoiceClone");
+    const hintEl = $("voiceHint");
+    if (!sel) return;
+
+    const panel = $("voiceClonePanel");
+    const vcClose = $("vcClose");
+    const vcCancel = $("vcCancel");
+    const vcLabel = $("vcLabel");
+    const vcRecBtn = $("vcRecBtn");
+    const vcRecState = $("vcRecState");
+    const vcPreview = $("vcPreview");
+    const vcPreviewWrap = $("vcPreviewWrap");
+    const vcUpload = $("vcUpload");
+    const vcStatus = $("vcStatus");
+
+    let currentSpeakerId = null;
+    let speakers = [];
+    let modelId = null;
+    let supportsVoiceCloning = true;
+
+    function setHint(msg, kind) {
+      hintEl.textContent = msg || "";
+      hintEl.style.color = kind === "error" ? "var(--err, #ef4444)" : "";
+    }
+
+    function applyCloneCapability() {
+      // Show the clone button only when the active TTS backend advertises
+      // voice cloning. Qwen3-CustomVoice ships built-in speakers and has no
+      // speaker_encoder, so cloning is unsupported — grey out + tooltip.
+      if (!cloneBtn) return;
+      if (supportsVoiceCloning) {
+        cloneBtn.classList.remove("hidden");
+        cloneBtn.disabled = false;
+        cloneBtn.removeAttribute("title");
+        cloneBtn.style.opacity = "";
+        cloneBtn.style.cursor = "";
+      } else {
+        // Keep visible but disabled so users see WHY it's gone (a hidden
+        // button would be confusing — tooltip explains the gap).
+        cloneBtn.classList.remove("hidden");
+        cloneBtn.disabled = true;
+        cloneBtn.title = "Voice cloning unavailable with current TTS model";
+        cloneBtn.style.opacity = "0.5";
+        cloneBtn.style.cursor = "not-allowed";
+      }
+    }
+
+    function renderSpeakers() {
+      sel.innerHTML = "";
+      if (!speakers.length) {
+        const opt = document.createElement("option");
+        opt.textContent = "(无)";
+        opt.disabled = true;
+        sel.appendChild(opt);
+        sel.disabled = true;
+      } else {
+        sel.disabled = false;
+        for (const s of speakers) {
+          const opt = document.createElement("option");
+          opt.value = String(s.id);
+          const lbl = s.label ? `${s.id} · ${s.label}` : `speaker ${s.id}`;
+          opt.textContent = s.type === "embedding" ? `${lbl} (clone)` : lbl;
+          sel.appendChild(opt);
+        }
+        if (currentSpeakerId != null) sel.value = String(currentSpeakerId);
+      }
+      countEl.textContent = String(speakers.length);
+      modelEl.textContent = modelId || "–";
+    }
+
+    async function loadSpeakers() {
+      try {
+        const r = await fetch("/api/tts/speakers");
+        if (r.status === 503) { setHint("TTS 未就绪", "error"); return; }
+        if (!r.ok) { setHint("加载失败: HTTP " + r.status, "error"); return; }
+        const j = await r.json();
+        speakers = Array.isArray(j.speakers) ? j.speakers : [];
+        modelId = j.model_id || null;
+        // Server flag drives clone-UI gating. Default true so legacy servers
+        // without the field keep the old behavior.
+        supportsVoiceCloning = j.supports_voice_cloning !== false;
+        if (currentSpeakerId == null && j.default_speaker_id != null) {
+          currentSpeakerId = j.default_speaker_id;
+        }
+        renderSpeakers();
+        applyCloneCapability();
+        setHint("");
+      } catch (e) { setHint("加载失败: " + e.message, "error"); }
+    }
+
+    async function loadRuntime() {
+      try {
+        const r = await fetch("/api/tts/runtime");
+        if (!r.ok) return;
+        const j = await r.json();
+        const eff = (j && j.effective) || {};
+        if (eff.speaker_id != null) {
+          currentSpeakerId = eff.speaker_id;
+          if (sel.options.length) sel.value = String(currentSpeakerId);
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    sel.addEventListener("change", async () => {
+      const sid = parseInt(sel.value, 10);
+      if (!Number.isFinite(sid)) return;
+      try {
+        const r = await fetch("/api/tts/runtime", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ speaker_id: sid }),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          showToast("切换失败: " + (j.error || ("HTTP " + r.status)), "error");
+          return;
+        }
+        currentSpeakerId = sid;
+        showToast("已切换 speaker " + sid, "success");
+      } catch (e) { showToast("切换失败: " + e.message, "error"); }
+    });
+
+    reloadBtn.addEventListener("click", loadSpeakers);
+
+    // 克隆面板
+    let mediaStream = null, audioCtx = null, procNode = null, srcNode = null;
+    let recBuffers = [], recSampleRate = 0, recording = false;
+    let wavBlob = null, recStartedAt = 0;
+
+    function resetCloneUI() {
+      vcLabel.value = "";
+      vcStatus.textContent = "";
+      vcStatus.style.color = "";
+      vcRecState.textContent = "就绪";
+      vcRecBtn.classList.remove("recording");
+      vcRecBtn.textContent = "● 开始录音";
+      vcPreviewWrap.classList.add("hidden");
+      vcPreview.src = "";
+      vcUpload.disabled = true;
+      wavBlob = null;
+      recBuffers = [];
+    }
+    function openClone() { resetCloneUI(); panel.classList.remove("hidden"); }
+    function closeClone() { stopRecording().catch(() => {}); panel.classList.add("hidden"); }
+
+    cloneBtn.addEventListener("click", () => {
+      if (!supportsVoiceCloning) {
+        showToast("当前 TTS backend 不支持克隆，请切到 MOSS", "error");
+        return;
+      }
+      openClone();
+    });
+    vcClose.addEventListener("click", closeClone);
+    vcCancel.addEventListener("click", closeClone);
+
+    function encodeWAV(buffers, sampleRate) {
+      let total = 0;
+      for (const b of buffers) total += b.length;
+      const flat = new Float32Array(total);
+      let off = 0;
+      for (const b of buffers) { flat.set(b, off); off += b.length; }
+      const pcm = new Int16Array(flat.length);
+      for (let i = 0; i < flat.length; i++) {
+        let s = Math.max(-1, Math.min(1, flat[i]));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      const byteLen = pcm.length * 2;
+      const buf = new ArrayBuffer(44 + byteLen);
+      const view = new DataView(buf);
+      const ws = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+      ws(0, "RIFF");
+      view.setUint32(4, 36 + byteLen, true);
+      ws(8, "WAVE"); ws(12, "fmt ");
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      ws(36, "data");
+      view.setUint32(40, byteLen, true);
+      new Int16Array(buf, 44).set(pcm);
+      return new Blob([buf], { type: "audio/wav" });
+    }
+
+    async function startRecording() {
+      if (recording) return;
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false },
+        });
+      } catch (e) {
+        vcStatus.style.color = "var(--err, #ef4444)";
+        vcStatus.textContent = "麦克风权限被拒: " + e.message;
+        return;
+      }
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      recSampleRate = audioCtx.sampleRate;
+      srcNode = audioCtx.createMediaStreamSource(mediaStream);
+      procNode = audioCtx.createScriptProcessor(4096, 1, 1);
+      recBuffers = [];
+      procNode.onaudioprocess = (ev) => {
+        const ch = ev.inputBuffer.getChannelData(0);
+        recBuffers.push(new Float32Array(ch));
+      };
+      srcNode.connect(procNode);
+      procNode.connect(audioCtx.destination);
+      recording = true;
+      recStartedAt = Date.now();
+      vcRecBtn.classList.add("recording");
+      vcRecBtn.textContent = "■ 停止录音";
+      vcRecState.textContent = "录音中…";
+      vcUpload.disabled = true;
+      vcStatus.textContent = "";
+    }
+
+    async function stopRecording() {
+      if (!recording) return;
+      recording = false;
+      try { procNode && procNode.disconnect(); } catch (e) {}
+      try { srcNode && srcNode.disconnect(); } catch (e) {}
+      try { mediaStream && mediaStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+      try { audioCtx && await audioCtx.close(); } catch (e) {}
+      procNode = srcNode = mediaStream = audioCtx = null;
+      const dur = (Date.now() - recStartedAt) / 1000;
+      vcRecBtn.classList.remove("recording");
+      vcRecBtn.textContent = "● 重新录音";
+      vcRecState.textContent = `已录 ${dur.toFixed(1)}s`;
+      if (!recBuffers.length) {
+        vcStatus.style.color = "var(--err, #ef4444)";
+        vcStatus.textContent = "没有捕获到音频";
+        return;
+      }
+      wavBlob = encodeWAV(recBuffers, recSampleRate);
+      vcPreview.src = URL.createObjectURL(wavBlob);
+      vcPreviewWrap.classList.remove("hidden");
+      vcUpload.disabled = !(vcLabel.value || "").trim();
+    }
+
+    vcRecBtn.addEventListener("click", () => {
+      if (recording) stopRecording(); else startRecording();
+    });
+    vcLabel.addEventListener("input", () => {
+      vcUpload.disabled = !((vcLabel.value || "").trim() && wavBlob);
+    });
+
+    vcUpload.addEventListener("click", async () => {
+      const label = (vcLabel.value || "").trim();
+      if (!label || !wavBlob) return;
+      vcUpload.disabled = true;
+      vcStatus.style.color = "";
+      vcStatus.textContent = "提取声纹中…";
+      try {
+        const fd = new FormData();
+        fd.append("file", wavBlob, "reference.wav");
+        const r1 = await fetch("/api/tts/clone/embedding", { method: "POST", body: fd });
+        if (r1.status === 501) {
+          cloneBtn.classList.add("hidden");
+          throw new Error("当前 TTS 后端不支持声音克隆");
+        }
+        if (!r1.ok) {
+          const j = await r1.json().catch(() => ({}));
+          throw new Error(j.error || ("HTTP " + r1.status));
+        }
+        const emb = await r1.json();
+        vcStatus.textContent = "注册 speaker…";
+        const r2 = await fetch("/api/tts/speakers/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            speaker_embedding_b64: emb.speaker_embedding_b64,
+            label: label,
+          }),
+        });
+        if (!r2.ok) {
+          const j = await r2.json().catch(() => ({}));
+          throw new Error(j.error || ("HTTP " + r2.status));
+        }
+        const reg = await r2.json();
+        await loadSpeakers();
+        sel.value = String(reg.speaker_id);
+        sel.dispatchEvent(new Event("change"));
+        showToast(`已注册 speaker ${reg.speaker_id}`, "success");
+        closeClone();
+      } catch (e) {
+        vcStatus.style.color = "var(--err, #ef4444)";
+        vcStatus.textContent = "失败: " + e.message;
+      } finally {
+        vcUpload.disabled = false;
+      }
+    });
+
+    // Initial show — applyCloneCapability() will refine after first speakers
+    // payload arrives (default supportsVoiceCloning=true keeps legacy behavior).
+    cloneBtn.classList.remove("hidden");
+    loadSpeakers().then(loadRuntime);
   })();
 
   // ── WS connection ────────────────────────────────────────────────

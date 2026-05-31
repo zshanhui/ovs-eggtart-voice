@@ -59,6 +59,36 @@ class Config:
     # utterance boundaries instead. Enable only if Paraformer endpoints
     # arrive too late or not at all for your audio.
     client_vad_drive_eos: bool = False
+
+    # ── continuous-dialogue mic-pump (server-VAD path, client_vad off) ──
+    # All OFF by default so existing deployments are unchanged. A solution
+    # tunes these in its agent.yaml for its specific mic / acoustics.
+    # energy_gate: substitute true-zero PCM for sub-threshold chunks so the
+    # server VAD sees clean silence between utterances and endpoints (else
+    # continuous room/echo audio never reaches speech_end → "silent mute").
+    energy_gate_enabled: bool = False
+    energy_gate_open_rms: float = 0.08        # >= open (raw RMS) → gate opens
+    energy_gate_close_rms: float = 0.05       # < close for hangover_ms → gate shuts
+    energy_gate_hangover_ms: float = 250.0    # bridge word-internal dips
+    # makeup_gain: linear gain on forwarded mic audio so a quiet mic reaches
+    # the server VAD/ASR's trained level range. 1.0 = no-op.
+    mic_makeup_gain: float = 1.0
+    # drive an explicit asr_eos on the gate's open→close edge so the server
+    # finalizes each utterance immediately instead of relying on its own VAD
+    # endpoint (which can wedge). Needs multi_utterance so the session stays
+    # open. Only fires after >= eos_min_speech_ms of real speech.
+    gate_drive_eos: bool = False
+    gate_eos_min_speech_ms: float = 250.0
+    # drop mic audio while the agent is SPEAKING/THINKING (its own TTS echo)
+    # so it can't open a server-VAD segment that never cleanly ends.
+    mic_drop_while_speaking: bool = False
+    # force a fresh SLV session (new ASR worker) on EVERY wake, not just on
+    # long idle. A single streaming-ASR worker can degrade after several
+    # utterances on one persistent multi_utterance session (returns empty
+    # finals); a per-wake reconnect makes the user's natural recovery
+    # action ("say the wake word again") actually fetch a healthy worker.
+    reconnect_on_wake: bool = False
+
     # Stop-intent recognition: when the ASR final exactly matches one of
     # these (after normalisation), abort current TTS, drop the turn, and
     # transition state→IDLE without consulting the LLM. Chinese strings
@@ -121,10 +151,27 @@ class Config:
     llm_availability_unknowns_to_unknown_state: int = 3
     # Session history trim (A2). When set, the oldest turns are dropped
     # before the prompt is shipped to the LLM so total input tokens stay
-    # below this ceiling. Default 3000 leaves a small margin under the
-    # engines-3072 build's max_seq_len. Set to None to disable (matches
+    # below this ceiling. Trim fires at ``session_max_input_tokens * 0.75``
+    # (see Session._trim_to_budget). The fixed prefix (system_prompt +
+    # tools schema) is charged against the same budget, so this value
+    # must be large enough that the fixed prefix is a small fraction of
+    # ``max * 0.75`` — otherwise every turn trims, clears cache_warmed,
+    # and the upstream KV-cache hot path is permanently defeated.
+    #
+    # Default 7000: tuned for an 8K (8192-token) engine context window
+    # with ~1K output headroom (7000 + ~1000 generated ≈ 8K). Trim
+    # budget (history-only) = 7000 * 0.75 = 5250 tokens; with a typical
+    # 3-4K system+tools prefix that still leaves ~1500-2000 tokens for
+    # history (~5-6 turns). Set to None to disable trimming (matches
     # the original append-only invariant).
-    session_max_input_tokens: int | None = 3000
+    #
+    # Override per-deployment if the engine uses a different context
+    # window (engines-3072 → ~2000; 16K engines → ~14000). EdgeLLMBackend
+    # warmup() will log an INFO/WARNING comparing this value to the
+    # observed engine context when it can be inferred (currently best-
+    # effort — the upstream server does not yet expose max_seq_len via
+    # /v1/info, so we rely on operator configuration).
+    session_max_input_tokens: int | None = 7000
     # Tokenizer used to estimate prompt size. Default matches the most
     # common edge-llm engine; override per-deployment if your engine
     # ships a different vocabulary.
@@ -141,6 +188,21 @@ class Config:
     translator_tgt_lang: str = "eng_Latn"
     # Request timeout for translator service (seconds).
     translator_timeout_s: float = 5.0
+    # ── Tool calling (see docs/agent/tool-usage.md) ────────────────
+    # Master switch. When False, app_mode bypasses the tool runner
+    # entirely and behaves identically to the pre-tool implementation
+    # (single LLM stream → TTS). When True, the runner is invoked with
+    # the effective allowlist resolved per turn.
+    tools_enabled: bool = False
+    # Global default allowlist. Per-mode override via
+    #   mode_overrides[<mode>].tools_allowlist
+    # takes precedence. Tools list MUST stay stable per session+mode for
+    # the edge-llm prefix_cache to hit (changing the list mid-session is
+    # safe but degrades to a cache miss).
+    tools_default_allowlist: list[str] = field(default_factory=list)
+    # Maximum number of LLM ↔ tool round trips per user turn. After this
+    # the runner rolls the partial round back and returns empty text.
+    tools_max_iterations: int = 5
     # Path the config was loaded from (set by `load_config`); used by
     # the dashboard's per-mode override editor to persist changes back
     # to disk. None when the Config was constructed in code.

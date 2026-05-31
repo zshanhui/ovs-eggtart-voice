@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import deque
 from pathlib import Path
@@ -62,9 +63,12 @@ class DebugDashboardPlugin(Plugin):
         self._tts_bytes_current: int = 0
         self._tts_bytes_last: int = 0
         self._tts_last_sample_rate: int = 24000
+        self._tts_last_duration_s: float = 0.0
         # ── idempotent start guard (avoids double-subscribe on EventBus
         #    when the plugin is started twice without an intervening stop) ──
         self._started: bool = False
+        # ── lazy HTTP client to SLV (used by /api/tts/* proxy routes) ──
+        self._slv_http: Any = None  # aiohttp.ClientSession
 
     # ── lifecycle ─────────────────────────────────────────────────
 
@@ -99,6 +103,9 @@ class DebugDashboardPlugin(Plugin):
         web_app.router.add_post("/api/control/restart_mic", self._api_restart_mic)
         web_app.router.add_post("/api/control/abort", self._api_abort)
         web_app.router.add_post("/api/control/send_text", self._api_send_text)
+        web_app.router.add_post(
+            "/api/control/inject_user_text", self._api_inject_user_text
+        )
         web_app.router.add_get("/api/session/history", self._api_session_history)
         web_app.router.add_post("/api/session/clear", self._api_session_clear)
         # AppMode framework endpoints.
@@ -116,11 +123,30 @@ class DebugDashboardPlugin(Plugin):
         web_app.router.add_post("/api/control/sleep", self._api_sleep)
         web_app.router.add_post("/api/control/ptt/start", self._api_ptt_start)
         web_app.router.add_post("/api/control/ptt/end", self._api_ptt_end)
+        # TTS speaker / voice-clone proxy routes (forward to SLV).
+        web_app.router.add_get("/api/tts/speakers", self._api_tts_speakers_list)
+        web_app.router.add_get("/api/tts/runtime", self._api_tts_runtime_get)
+        web_app.router.add_patch("/api/tts/runtime", self._api_tts_runtime_patch)
+        web_app.router.add_post(
+            "/api/tts/clone/embedding", self._api_tts_clone_embedding
+        )
+        web_app.router.add_post(
+            "/api/tts/speakers/register", self._api_tts_speakers_register
+        )
+        web_app.router.add_delete(
+            "/api/tts/speakers/{speaker_id}", self._api_tts_speakers_delete
+        )
         # Errors management + agent settings.
         web_app.router.add_post("/api/errors/clear", self._api_errors_clear)
         web_app.router.add_get("/api/agent/settings", self._api_agent_settings_get)
         web_app.router.add_post("/api/agent/settings", self._api_agent_settings_post)
         web_app.router.add_post("/api/llm/probe", self._api_llm_probe)
+        web_app.router.add_get(
+            "/api/translator/runtime", self._api_translator_runtime_get
+        )
+        web_app.router.add_patch(
+            "/api/translator/runtime", self._api_translator_runtime_patch
+        )
 
         # Static assets (css/js).
         if _STATIC_DIR.exists():
@@ -128,9 +154,23 @@ class DebugDashboardPlugin(Plugin):
 
         self._runner = web.AppRunner(web_app)
         await self._runner.setup()
-        self._site = web.TCPSite(self._runner, "0.0.0.0", self._port)
+        # Default-bind to loopback. The dashboard exposes unauthenticated
+        # control endpoints (e.g. /api/control/inject_user_text can trigger
+        # arbitrary tool/arm actions); binding to 0.0.0.0 by default would
+        # let any host on the LAN drive the robot. Operators who need
+        # remote access can opt-in via OVS_DEBUG_DASHBOARD_BIND=0.0.0.0
+        # (and should put a firewall / SSH tunnel in front).
+        bind_host = os.environ.get("OVS_DEBUG_DASHBOARD_BIND", "127.0.0.1").strip() or "127.0.0.1"
+        self._site = web.TCPSite(self._runner, bind_host, self._port)
         await self._site.start()
-        logger.info("debug_dashboard listening on http://0.0.0.0:%d", self._port)
+        logger.info("debug_dashboard listening on http://%s:%d", bind_host, self._port)
+        if bind_host != "127.0.0.1":
+            logger.warning(
+                "debug_dashboard bound to %s — /api/control/inject_user_text "
+                "and other control endpoints are UNAUTHENTICATED. Restrict "
+                "access via firewall / SSH tunnel.",
+                bind_host,
+            )
 
         self._stats_task = asyncio.create_task(self._stats_loop(), name="dashboard-stats")
 
@@ -179,6 +219,13 @@ class DebugDashboardPlugin(Plugin):
             except Exception:
                 pass
         self._browser_clients.clear()
+
+        if self._slv_http is not None:
+            try:
+                await self._slv_http.close()
+            except Exception:
+                pass
+            self._slv_http = None
 
         if self._site is not None:
             try:
@@ -347,6 +394,98 @@ class DebugDashboardPlugin(Plugin):
             return web.json_response({"ok": True})
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _api_inject_user_text(self, request):  # noqa: ANN001
+        # DEBUG-ONLY: bypasses ASR/wake-word for end-to-end testing without a mic.
+        # Production deployments should gate this behind an auth check or env flag.
+        """Debug-only: fake an ASRFinal so the dialogue runner (and any
+        tool-call / preamble path) executes end-to-end without a real mic.
+
+        Unlike /api/control/send_text (which only forwards the string to
+        SLV's TTS-ish ``send_text``), this synthesises a real
+        ``ASRFinal`` event and feeds it through ``_dispatch_one`` — i.e.
+        exactly the entrypoint a server-VAD ASR final would hit. The
+        result: full LLM turn, tool_call dispatch, preamble emission,
+        arm action — same code paths a spoken utterance walks.
+        """
+        from aiohttp import web
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad json"}, status=400)
+        text = (body or {}).get("text")
+        if not isinstance(text, str) or not text.strip():
+            return web.json_response(
+                {"ok": False, "error": "missing text"}, status=422
+            )
+        language = (body or {}).get("language")
+        if language is not None and not isinstance(language, str):
+            return web.json_response(
+                {"ok": False, "error": "language must be string"}, status=422
+            )
+
+        app = self.app
+        # Reject if a prior LLM turn is still in flight — injecting a
+        # second utterance mid-turn would race the FSM and confuse the
+        # preamble / tool-dispatch sequencing this endpoint exists to
+        # validate.
+        turn_task = getattr(app, "_llm_turn_task", None)
+        if turn_task is not None and not turn_task.done():
+            return web.json_response(
+                {"ok": False, "status": "busy",
+                 "error": "previous llm_turn still running"},
+                status=409,
+            )
+
+        # Clear discard latch (typed-text bypass of ASR doesn't run the
+        # normal arm_for_next_turn path in _dispatch_one's ASRFinal
+        # branch — _dispatch_one does it itself, but harmless to do here
+        # too in case state is mid-SPEAKING). Also wake if pipeline_mode
+        # gated us into SLEEPING — _dispatch_one would otherwise drop the
+        # event with no LLM turn.
+        try:
+            arm = getattr(app.audio, "arm_for_next_turn", None)
+            if callable(arm):
+                arm()
+        except Exception:  # pragma: no cover - defensive
+            pass
+        try:
+            if getattr(app, "_state", ConvState.IDLE) == ConvState.SLEEPING:
+                wake = getattr(app, "wake", None)
+                if callable(wake):
+                    await wake(source="inject_user_text")
+        except Exception:
+            logger.debug("pre-inject wake failed", exc_info=True)
+
+        try:
+            from ..slv_client import ASRFinal
+        except Exception as e:  # pragma: no cover - defensive
+            return web.json_response(
+                {"ok": False, "error": f"ASRFinal import failed: {e}"},
+                status=500,
+            )
+
+        evt = ASRFinal(text=text, session_complete=False, language=language)
+        logger.info(
+            "inject_user_text: faking ASRFinal text=%r language=%r",
+            text, language,
+        )
+        try:
+            # Dispatch in a fire-and-forget task: _dispatch_one spawns
+            # the LLM turn via asyncio.create_task and returns, so doing
+            # this inline is fine. We still create_task so the HTTP
+            # response isn't blocked by dispatcher work (broadcast etc).
+            asyncio.create_task(
+                app._dispatch_one(evt), name="inject-user-text"
+            )
+        except Exception as e:
+            return web.json_response(
+                {"ok": False, "error": str(e)}, status=500
+            )
+        return web.json_response(
+            {"ok": True, "status": "dispatched", "text": text}
+        )
 
     async def _api_modes_list(self, request):  # noqa: ANN001
         from aiohttp import web
@@ -588,11 +727,217 @@ class DebugDashboardPlugin(Plugin):
                 pass
             try:
                 self.app._set_state(ConvState.THINKING)
+                # Symmetric with the server-VAD / client-VAD THINKING
+                # entries: arm the thinking-watchdog so a wedged SLV
+                # TTS can't strand this PTT turn forever.
+                arm = getattr(self.app, "_arm_thinking_watchdog", None)
+                if callable(arm):
+                    arm()
             except Exception:
                 pass
             return web.json_response({"ok": True})
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    # ── SLV TTS proxy (speakers + voice clone) ──────────────────
+
+    def _slv_http_base(self) -> str:
+        cfg = getattr(self.app, "config", None)
+        base = getattr(cfg, "slv_http_base", None) if cfg is not None else None
+        return base or "http://localhost:8621"
+
+    def _admin_headers(self) -> dict[str, str]:
+        """Inject X-Admin-Key from OVS_ADMIN_KEY env when set.
+
+        Loopback SLV deployments don't need the key (admin_auth bypasses
+        loopback unconditionally); remote deployments do. We always pass
+        the header when the env var is set — harmless on loopback.
+        """
+        key = os.environ.get("OVS_ADMIN_KEY", "").strip()
+        return {"X-Admin-Key": key} if key else {}
+
+    async def _get_slv_http(self):
+        """Lazily create aiohttp.ClientSession on first use."""
+        if self._slv_http is None:
+            import aiohttp
+            self._slv_http = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30.0),
+            )
+        return self._slv_http
+
+    async def _proxy_json(self, method: str, path: str, *,
+                          json_body: Any = None,
+                          admin: bool = False):
+        """Forward a JSON request to SLV; return (status, payload).
+
+        Payload is the parsed JSON, or {"error": <text>} if SLV's body
+        isn't JSON.
+        """
+        from aiohttp import web  # noqa: F401 — needed by callers in same file
+        sess = await self._get_slv_http()
+        url = self._slv_http_base().rstrip("/") + path
+        headers = self._admin_headers() if admin else {}
+        try:
+            async with sess.request(
+                method, url, json=json_body, headers=headers,
+            ) as resp:
+                ct = resp.headers.get("Content-Type", "")
+                if "application/json" in ct:
+                    return resp.status, await resp.json()
+                txt = await resp.text()
+                return resp.status, {"error": txt or f"HTTP {resp.status}"}
+        except Exception as e:
+            logger.warning("SLV proxy %s %s failed: %s", method, path, e)
+            return 502, {"error": f"SLV unreachable: {e}"}
+
+    async def _api_tts_speakers_list(self, request):  # noqa: ANN001
+        from aiohttp import web
+        status, payload = await self._proxy_json("GET", "/tts/speakers")
+        return web.json_response(payload, status=status)
+
+    async def _api_tts_runtime_get(self, request):  # noqa: ANN001
+        from aiohttp import web
+        status, payload = await self._proxy_json(
+            "GET", "/admin/tts/runtime", admin=True,
+        )
+        return web.json_response(payload, status=status)
+
+    async def _api_tts_runtime_patch(self, request):  # noqa: ANN001
+        from aiohttp import web
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "bad json"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "body must be object"}, status=400)
+        # Whitelist fields so we don't smuggle arbitrary payloads upstream.
+        allowed = {"speaker_id", "speed", "pitch_shift"}
+        upstream = {k: body[k] for k in body if k in allowed}
+        status, payload = await self._proxy_json(
+            "PATCH", "/admin/tts/runtime", json_body=upstream, admin=True,
+        )
+        # SLV's v2v WS path resolves tts_speaker_id once from CLIENT_CONFIG
+        # (main.py: "avoids mid-session changes affecting later sentences"),
+        # so /admin/tts/runtime alone does NOT change the voice of the
+        # ongoing WS conversation. We additionally mutate our own slv_config
+        # and reconnect so the new speaker_id rides on the next CLIENT_CONFIG.
+        # Also warm the worker for this speaker — qwen3-tts is deterministic
+        # post-warm but the first synth per speaker differs ("cold worker"
+        # state). Warming here trades ~600ms switch latency for stable voice
+        # on the user's next utterance.
+        if status < 400 and "speaker_id" in upstream:
+            sid = upstream["speaker_id"]
+            try:
+                slv = getattr(self.app, "slv", None)
+                if slv is not None and isinstance(slv.config, dict):
+                    slv.config["tts_speaker_id"] = (
+                        None if sid is None else int(sid)
+                    )
+                    # Warm + reconnect in parallel — reconnect doesn't touch
+                    # the TTS worker, so they're independent.
+                    await asyncio.gather(
+                        self._warm_tts_speaker(sid),
+                        slv.reconnect(),
+                        return_exceptions=True,
+                    )
+            except Exception as e:
+                logger.warning("post-patch slv reconnect failed: %s", e)
+        return web.json_response(payload, status=status)
+
+    async def _warm_tts_speaker(self, speaker_id) -> None:
+        """One dummy /tts/stream call so qwen3-tts worker is warm for this
+        speaker. After this, subsequent synths are byte-identical (verified
+        via md5). Non-fatal — switch still proceeds if warmup fails."""
+        if speaker_id is None:
+            return
+        try:
+            import aiohttp
+            sess = await self._get_slv_http()
+            url = self._slv_http_base().rstrip("/") + "/tts/stream"
+            body = {
+                "text": "你好",
+                "speaker_id": int(speaker_id),
+                "language": "chinese",
+            }
+            async with sess.post(
+                url, json=body, timeout=aiohttp.ClientTimeout(total=5.0),
+            ) as resp:
+                # Drain so the connection returns to the pool.
+                await resp.read()
+                logger.info(
+                    "tts warmup for speaker %s: HTTP %s", speaker_id, resp.status,
+                )
+        except Exception as e:
+            logger.info("tts warmup for speaker %s skipped: %s", speaker_id, e)
+
+    async def _api_tts_clone_embedding(self, request):  # noqa: ANN001
+        """Forward a multipart WAV upload to SLV's /tts/clone/embedding."""
+        from aiohttp import web, FormData
+        # Re-package the incoming multipart as a fresh FormData so aiohttp
+        # owns the boundary + Content-Length.
+        try:
+            reader = await request.multipart()
+        except Exception as e:
+            return web.json_response({"error": f"bad multipart: {e}"}, status=400)
+        field = None
+        while True:
+            part = await reader.next()
+            if part is None:
+                break
+            if part.name == "file":
+                field = part
+                break
+        if field is None:
+            return web.json_response({"error": "missing 'file' field"}, status=400)
+        data = await field.read(decode=False)
+        if not data:
+            return web.json_response({"error": "empty file"}, status=400)
+
+        sess = await self._get_slv_http()
+        url = self._slv_http_base().rstrip("/") + "/tts/clone/embedding"
+        form = FormData()
+        form.add_field(
+            "file", data,
+            filename=field.filename or "reference.wav",
+            content_type=field.headers.get("Content-Type", "audio/wav"),
+        )
+        try:
+            async with sess.post(url, data=form) as resp:
+                ct = resp.headers.get("Content-Type", "")
+                if "application/json" in ct:
+                    return web.json_response(await resp.json(), status=resp.status)
+                txt = await resp.text()
+                return web.json_response(
+                    {"error": txt or f"HTTP {resp.status}"}, status=resp.status,
+                )
+        except Exception as e:
+            logger.warning("clone/embedding proxy failed: %s", e)
+            return web.json_response(
+                {"error": f"SLV unreachable: {e}"}, status=502,
+            )
+
+    async def _api_tts_speakers_register(self, request):  # noqa: ANN001
+        from aiohttp import web
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "bad json"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "body must be object"}, status=400)
+        status, payload = await self._proxy_json(
+            "POST", "/tts/speakers/register", json_body=body,
+        )
+        return web.json_response(payload, status=status)
+
+    async def _api_tts_speakers_delete(self, request):  # noqa: ANN001
+        from aiohttp import web
+        sid = request.match_info.get("speaker_id", "")
+        if not sid:
+            return web.json_response({"error": "missing speaker_id"}, status=400)
+        status, payload = await self._proxy_json(
+            "DELETE", f"/tts/speakers/{sid}",
+        )
+        return web.json_response(payload, status=status)
 
     # ── errors / agent-settings endpoints ───────────────────────
 
@@ -717,6 +1062,127 @@ class DebugDashboardPlugin(Plugin):
             )
         tmp.replace(path)
 
+    # ── translator runtime endpoints (Phase 2a) ──────────────────
+    #
+    # GET  /api/translator/runtime   → current backend / src / tgt + the
+    #                                  full list of supported FLORES
+    #                                  targets (from translator/lang_map).
+    # PATCH /api/translator/runtime  → mutate target language at runtime.
+    #
+    # Only ``tgt_lang`` is mutable today. ``src_lang`` is decided
+    # per-utterance from the ASR-detected language (with the config
+    # default as fallback). ``backend`` / ``url`` / ``timeout_s`` are
+    # set at process start and not hot-swappable here.
+
+    def _build_translator_runtime_payload(self) -> dict[str, Any]:
+        from ..translator.lang_map import supported_target_languages
+        cfg = getattr(self.app, "config", None)
+        backend = "noop"
+        src_lang = "zho_Hans"
+        tgt_lang = "eng_Latn"
+        url = "http://localhost:9001"
+        timeout_s = 5.0
+        if cfg is not None:
+            backend = str(getattr(cfg, "translator_backend", backend))
+            src_lang = str(getattr(cfg, "translator_src_lang", src_lang))
+            tgt_lang = str(getattr(cfg, "translator_tgt_lang", tgt_lang))
+            url = str(getattr(cfg, "translator_url", url))
+            try:
+                timeout_s = float(getattr(cfg, "translator_timeout_s", timeout_s))
+            except Exception:
+                timeout_s = 5.0
+        return {
+            "backend": backend,
+            "src_lang": src_lang,
+            "tgt_lang": tgt_lang,
+            "url": url,
+            "timeout_s": timeout_s,
+            "supported_targets": supported_target_languages(),
+        }
+
+    async def _api_translator_runtime_get(self, request):  # noqa: ANN001
+        from aiohttp import web
+        return web.json_response(self._build_translator_runtime_payload())
+
+    async def _api_translator_runtime_patch(self, request):  # noqa: ANN001
+        import re
+
+        from aiohttp import web
+
+        from ..translator.lang_map import FLORES_DISPLAY_NAMES
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "bad json"}, status=400
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"ok": False, "error": "body must be object"}, status=400
+            )
+        if "tgt_lang" not in body:
+            return web.json_response(
+                {"ok": False, "error": "tgt_lang is required"}, status=400
+            )
+        tgt = body["tgt_lang"]
+        if not isinstance(tgt, str) or not re.match(
+            r"^[a-z]{3}_[A-Z][a-z]{3}$", tgt
+        ):
+            return web.json_response(
+                {"ok": False,
+                 "error": "tgt_lang must match NLLB format (e.g. 'eng_Latn')"},
+                status=400,
+            )
+        if tgt not in FLORES_DISPLAY_NAMES:
+            return web.json_response(
+                {"ok": False,
+                 "error": f"tgt_lang {tgt!r} not in supported targets"},
+                status=400,
+            )
+        cfg = getattr(self.app, "config", None)
+        if cfg is None:
+            return web.json_response(
+                {"ok": False, "error": "no config"}, status=500
+            )
+        old = getattr(cfg, "translator_tgt_lang", None)
+        cfg.translator_tgt_lang = tgt
+        # Persist to YAML if we have a source path (same pattern as
+        # _api_agent_settings_post). Restart-survives the runtime swap.
+        persisted = False
+        persist_error: str | None = None
+        src = getattr(cfg, "_source_path", None)
+        if src is not None and old != tgt:
+            try:
+                self._persist_agent_settings_to_yaml(
+                    Path(src), {"translator_tgt_lang": tgt}
+                )
+                persisted = True
+            except Exception as e:  # pragma: no cover - defensive
+                persist_error = str(e)
+                logger.exception("persist translator_tgt_lang failed")
+        logger.info(
+            "translator_tgt_lang switched: %r → %r (persisted=%s)",
+            old, tgt, persisted,
+        )
+        # Broadcast so any subscribed dashboard reflects the change live.
+        bcast_payload: dict[str, Any] = {
+            **self._build_translator_runtime_payload(),
+            "persisted": persisted,
+        }
+        if persist_error is not None:
+            bcast_payload["persist_error"] = persist_error
+        try:
+            await self.app.broadcast(
+                "on_translator_runtime_change", bcast_payload
+            )
+        except Exception:
+            logger.exception("on_translator_runtime_change broadcast failed")
+        resp = {"ok": True, "tgt_lang": tgt, "persisted": persisted}
+        if persist_error is not None:
+            resp["persist_error"] = persist_error
+        return web.json_response(resp)
+
     async def _api_session_history(self, request):  # noqa: ANN001
         from aiohttp import web
         system_prompt = getattr(self.app.config, "system_prompt", "")
@@ -791,6 +1257,15 @@ class DebugDashboardPlugin(Plugin):
         self._latency_history[kind].append(float(ms))
         await self._broadcast("latency", {"kind": kind, "ms": int(ms)})
 
+    def _tts_metrics_payload(self) -> dict[str, Any]:
+        return {
+            "sentence_count": self._tts_sentence_count,
+            "bytes_current": self._tts_bytes_current,
+            "bytes_last": self._tts_bytes_last,
+            "last_duration_s": round(self._tts_last_duration_s, 2),
+            "sample_rate": self._tts_last_sample_rate,
+        }
+
     async def _stats_loop(self) -> None:
         try:
             while True:
@@ -819,6 +1294,7 @@ class DebugDashboardPlugin(Plugin):
                     "stats",
                     {"mic_queue_depth": mic_qsize, "slv_ws_state": ws_state},
                 )
+                await self._broadcast("tts_metrics", self._tts_metrics_payload())
                 await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             raise
@@ -871,35 +1347,23 @@ class DebugDashboardPlugin(Plugin):
         )
         await self._broadcast(
             "tts_metrics",
-            {
-                "sentence_count": self._tts_sentence_count,
-                "bytes_current": self._tts_bytes_current,
-                "bytes_last": self._tts_bytes_last,
-                "sample_rate": self._tts_last_sample_rate,
-            },
+            self._tts_metrics_payload(),
         )
 
     async def on_assistant_sentence_start(self, sentence: str) -> None:
         await self._broadcast("on_assistant_sentence_start", sentence)
 
     async def on_assistant_done(self) -> None:
-        # Snapshot per-turn TTS metrics into "last", then reset current.
+        # Snapshot per-turn TTS metrics into "last". Keep the current-turn
+        # total visible while idle; reset it only when the next user turn
+        # starts in on_user_utterance().
         self._tts_bytes_last = self._tts_bytes_current
-        duration_s = 0.0
+        duration_s = self._tts_last_duration_s
         if self._tts_last_sample_rate > 0:
             # 16-bit PCM mono → 2 bytes per sample.
             duration_s = self._tts_bytes_last / float(self._tts_last_sample_rate) / 2.0
-        await self._broadcast(
-            "tts_metrics",
-            {
-                "sentence_count": self._tts_sentence_count,
-                "bytes_current": 0,
-                "bytes_last": self._tts_bytes_last,
-                "last_duration_s": round(duration_s, 2),
-                "sample_rate": self._tts_last_sample_rate,
-            },
-        )
-        self._tts_bytes_current = 0
+            self._tts_last_duration_s = duration_s
+        await self._broadcast("tts_metrics", self._tts_metrics_payload())
         await self._broadcast("on_assistant_done", None)
 
     async def on_tts_audio_frame(self, data: dict) -> None:

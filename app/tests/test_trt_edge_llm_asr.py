@@ -34,7 +34,10 @@ def test_trt_edgellm_asr_stream_accumulates_and_finalizes(monkeypatch):
     stream.accept_waveform(16000, np.zeros(8000, dtype=np.float32))
 
     assert stream.get_partial() == ("", False)
-    assert stream.finalize() == "你好"
+    # finalize() now returns (text, detected_language) per the
+    # language-pipeline migration. Backend's fake_transcribe returns a
+    # plain Result without language → detected stays None.
+    assert stream.finalize() == ("你好", None)
     assert calls[0][1] == "Chinese"
     assert calls[0][0][:4] == b"RIFF"
 
@@ -210,9 +213,12 @@ def test_worker_request_injects_worker_exit_on_empty_line():
 def test_worker_request_broken_pipe_raises_worker_exit():
     """SIGKILL of the worker causes BrokenPipeError on stdin.write. Without
     classification, that escapes as a raw IOError and the session manager
-    cannot route it to ERROR_REBUILD. After the fix, _worker_request must
-    surface this as WorkerExitError so restart_worker fires."""
+    cannot route it to ERROR_REBUILD. After the WorkerIO migration,
+    _worker_request must still surface this as WorkerExitError so
+    restart_worker fires.
+    """
     import pytest
+    from app.core.worker_io import WorkerIO
     backend = TRTEdgeLLMASRBackend()
 
     class _DeadStdin:
@@ -221,11 +227,20 @@ def test_worker_request_broken_pipe_raises_worker_exit():
         def flush(self):
             raise BrokenPipeError("worker dead")
 
+    class _Stdout:
+        # WorkerIO's reader thread iterates stdout; an empty iterator
+        # just causes it to EOF immediately (we never get there because
+        # the stdin.write above fires first).
+        def __iter__(self):
+            return iter(())
+
     class _Worker:
         stdin = _DeadStdin()
-        stdout = object()  # truthy, never read because write fails first
+        stdout = _Stdout()
 
-    backend._worker = _Worker()
+    proc = _Worker()
+    backend._worker = proc
+    backend._wio = WorkerIO(proc, concurrency=1)
     backend._ensure_worker = lambda: None  # don't try to spawn
 
     with pytest.raises(WorkerExitError):
@@ -245,3 +260,45 @@ def test_typed_errors_subclass_worker_protocol_error():
     assert issubclass(NoActiveSessionError, WorkerProtocolError)
     assert issubclass(SessionAlreadyActiveError, WorkerProtocolError)
     assert issubclass(WorkerExitError, WorkerProtocolError)
+
+
+def test_supports_hot_reload_true_when_worker_mode():
+    backend = TRTEdgeLLMASRBackend()
+    backend._config["use_worker"] = True
+    assert backend.supports_hot_reload is True
+
+
+def test_supports_hot_reload_false_when_inprocess():
+    backend = TRTEdgeLLMASRBackend()
+    backend._config["use_worker"] = False
+    assert backend.supports_hot_reload is False
+
+
+def test_unload_idempotent_when_not_ready():
+    backend = TRTEdgeLLMASRBackend()
+    # Fresh: _ready=False, _worker=None — must early return without raising.
+    backend.unload()
+    assert backend._ready is False
+    assert backend._worker is None
+
+
+def test_unload_kills_worker_and_marks_not_ready(monkeypatch):
+    backend = TRTEdgeLLMASRBackend()
+    backend._ready = True
+    called = {"restart": 0}
+
+    def fake_restart():
+        called["restart"] += 1
+        backend._worker = None
+
+    monkeypatch.setattr(backend, "restart_worker", fake_restart)
+
+    class _Dummy:
+        def poll(self):
+            return None
+
+    backend._worker = _Dummy()
+    backend.unload()
+    assert called["restart"] == 1
+    assert backend._ready is False
+    assert backend._worker is None

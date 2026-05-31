@@ -3,9 +3,10 @@
 # OpenVoiceStream — Jetson Orin Nano / NX / AGX (JetPack 6.x, CUDA 12.6, TRT 10.3)
 #
 # Single Python dependency set, selected at runtime by profile:
-#   jetson-zh-en              — Paraformer ASR + Matcha TTS
-#   jetson-multilang-highperf — Qwen3 ASR + Qwen3 TTS high-performance workers
-#   jetson-qwen3asr-matcha    — Qwen3 ASR + Matcha TTS
+#   jetson-zh-en                 — Paraformer ASR + Matcha TTS (zh_en default)
+#   jetson-qwen3asr-matcha-nx    — Qwen3 ASR + Matcha TTS (multilanguage default,
+#                                  runs on Nano 8GB and NX 16GB)
+#   jetson-multilang-highperf    — Qwen3 ASR + Qwen3 TTS heavy preset (NX/AGX only)
 #
 # Build:
 #   docker build -f deploy/docker/Dockerfile.jetson \
@@ -68,7 +69,7 @@ ENV LANGUAGE_MODE=${LANGUAGE_MODE}
 RUN set -eux; \
     case "$LANGUAGE_MODE" in \
       zh_en) echo "OVS_PROFILE_DEFAULT=jetson-zh-en" >> /etc/openvoicestream.env ;; \
-      multilanguage) echo "OVS_PROFILE_DEFAULT=jetson-multilang-highperf" >> /etc/openvoicestream.env ;; \
+      multilanguage) echo "OVS_PROFILE_DEFAULT=jetson-qwen3asr-matcha-nx" >> /etc/openvoicestream.env ;; \
       *) echo "Unknown LANGUAGE_MODE=$LANGUAGE_MODE (expected zh_en|multilanguage)" >&2; exit 1 ;; \
     esac; \
     rm -rf /root/.cache /tmp/*
@@ -92,10 +93,29 @@ COPY third_party/qwen3-edgellm-jetson/ /opt/qwen3-edgellm-jetson/
 RUN set -eux; \
     mkdir -p /opt/models /opt/edgellm /opt/edgellm-bin /opt/models/qwen3-edgellm; \
     chmod +x /opt/jv-workers/qwen3_asr_worker /opt/jv-workers/qwen3_tts_worker; \
+    if [ -f /opt/jv-workers/moss_tts_nano_worker ]; then chmod +x /opt/jv-workers/moss_tts_nano_worker; fi; \
     cp /opt/jv-workers/libNvInfer_edgellm_plugin.so /opt/edgellm/libNvInfer_edgellm_plugin.so; \
     cp /opt/jv-workers/libNvInfer_edgellm_plugin_asr.so /opt/edgellm/libNvInfer_edgellm_plugin_asr.so; \
     cp /opt/jv-workers/libNvInfer_edgellm_plugin.so /opt/edgellm-bin/libNvInfer_edgellm_plugin.so; \
     cp /opt/jv-workers/libNvInfer_edgellm_plugin_asr.so /opt/edgellm-bin/libNvInfer_edgellm_plugin_asr.so
+
+# CustomVoice v0.7.1 fork-port artifacts (binary + patched plugin + reference
+# talker embeds). These are kept side-by-side with the production worker so
+# the default ASR+TTS paths are untouched; CustomVoice profiles opt-in via
+# EDGE_LLM_TTS_BIN / EDGELLM_PLUGIN_PATH / QWEN3_TTS_PRELOAD_TALKER_EMBEDS.
+# Source: orin-nx ~/customvoice-v071-snapshot/20260526/ (W8A16 PASS, 2026-05-26).
+#   qwen3_tts_inference            md5 f50fedc960d8edf7304f897cddbbdaf7
+#   libNvInfer_edgellm_plugin.so.1.0 md5 3d6761ebbe0946720f9c1d35a56c1cda
+#   ref_talker_embeds_15row.bin    md5 fed8b23ca46246f5993ec26ab7d5c0f4
+COPY deploy/jetson-workers/customvoice-v071/qwen3_tts_inference            /opt/edgellm-bin/qwen3_tts_inference
+COPY deploy/jetson-workers/customvoice-v071/libNvInfer_edgellm_plugin.so.1.0 /opt/edgellm-bin/libNvInfer_edgellm_plugin.so.1.0
+COPY deploy/jetson-workers/customvoice-v071/ref_talker_embeds_15row.bin    /opt/edgellm-bin/ref_talker_embeds_15row.bin
+RUN set -eux; \
+    chmod +x /opt/edgellm-bin/qwen3_tts_inference; \
+    chmod +x /opt/edgellm-bin/libNvInfer_edgellm_plugin.so.1.0; \
+    echo "CUSTOMVOICE_BIN=/opt/edgellm-bin/qwen3_tts_inference"                   >> /etc/openvoicestream.env; \
+    echo "CUSTOMVOICE_PLUGIN=/opt/edgellm-bin/libNvInfer_edgellm_plugin.so.1.0"   >> /etc/openvoicestream.env; \
+    echo "CUSTOMVOICE_TALKER_EMBEDS=/opt/edgellm-bin/ref_talker_embeds_15row.bin" >> /etc/openvoicestream.env
 
 ENV MODEL_DIR=/opt/models \
     NVIDIA_VISIBLE_DEVICES=all \
@@ -105,6 +125,7 @@ ENV MODEL_DIR=/opt/models \
     OVS_WORKER_BUILD=/opt/jv-workers \
     QWEN3_EDGELLM_JETSON_ROOT=/opt/qwen3-edgellm-jetson \
     EDGELLM_PLUGIN_PATH=/opt/edgellm-bin/libNvInfer_edgellm_plugin.so \
+    QWEN3_TTS_PRELOAD_TALKER_EMBEDS=/opt/edgellm-bin/ref_talker_embeds_15row.bin \
     LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/onnxruntime/capi:/host-cuda:/host-nvidia-libs:/host-libs \
     PYTHONPATH=/opt/speech:/usr/lib/python3.10/dist-packages
 

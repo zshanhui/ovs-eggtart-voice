@@ -89,7 +89,8 @@ def test_finalize_delegates():
 
     # input_finished must be called on the inner stream
     inner_stream.input_finished.assert_called_once()
-    assert result == "final text"
+    # finalize() now returns (text, detected_language).
+    assert result == ("final text", None)
 
 
 # ---------------------------------------------------------------------------

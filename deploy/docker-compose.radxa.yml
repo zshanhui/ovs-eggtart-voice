@@ -26,6 +26,8 @@ services:
       - rk-tts-models:/opt/tts/models
     environment:
       - OVS_PROFILE=${OVS_PROFILE:-}
+      # Week 2: structured JSON logs in production.
+      - OVS_LOG_FORMAT=${OVS_LOG_FORMAT:-json}
       # Admin endpoints are loopback-only by default. Set OVS_ADMIN_KEY (in
       # .env or shell) and pass it back as the X-Admin-Key header to enable
       # remote admin. Unset keeps remote admin disabled (403).
@@ -74,6 +76,13 @@ services:
       # ── Misc ────────────────────────────────────────────────────────
       - MODEL_DIR=/opt/tts/models
     restart: unless-stopped
+    # Week 1 hardening: rely on /readyz; /health is deprecated.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8621/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   # ── LLM chat server (RKLLM on NPU) ────────────────────────────────────
   llm:

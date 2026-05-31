@@ -28,10 +28,12 @@ Thumbs.db
 # Runtime bundles copied from device builds or release artifacts.
 deploy/jetson-workers/
 deploy/rk-runtime/
+deploy/kokoro-artifacts/
 
 # Generated performance artifacts
 bench/perf/__pycache__/
 bench/perf/results/
+bench/parity/results/
 bench/perf/corpus/short/*.wav
 bench/perf/corpus/long/*.wav
 bench/perf/corpus/multilingual/**/*.wav
@@ -45,3 +47,6 @@ artifacts/engines/
 artifacts/onnx/
 
 *.rkllm
+
+# Local Claude Code session state (settings, worktrees, lock files)
+.claude/
