@@ -5,7 +5,7 @@ Operators set ``OVS_PRESET`` (or pass an explicit ``OVS_PROFILE`` to override).
 This module owns:
 
   1. Detecting which device the container is running on (Jetson Nano/NX/AGX
-     are the same image but different SKUs; RK and RPi each have their own
+     are the same image but different SKUs; RK has its own
      image already, but the detector still works so a future "one image"
      redesign is possible).
   2. Looking up the (device, preset) → profile_name mapping table for the
@@ -54,8 +54,6 @@ TIER_JETSON_ORIN_NX = "jetson-orin-nx"
 TIER_JETSON_ORIN_AGX = "jetson-orin-agx"
 TIER_RK3576 = "rk3576"
 TIER_RK3588 = "rk3588"
-TIER_RPI5 = "rpi5"
-TIER_RPI4 = "rpi4"
 TIER_UNKNOWN = "unknown"
 
 
@@ -123,24 +121,6 @@ def _detect_rk_tier() -> Optional[str]:
     return None
 
 
-def _detect_rpi_tier() -> Optional[str]:
-    # /proc/device-tree is not exposed inside an unprivileged Docker
-    # container; fall back to /proc/cpuinfo's "Model" field which IS
-    # visible (kernel-populated, not bind-mounted).
-    model = _read("/proc/device-tree/model").lower()
-    if not model:
-        for line in _read("/proc/cpuinfo").splitlines():
-            if line.lower().startswith("model"):
-                _, _, val = line.partition(":")
-                model = val.strip().lower()
-                break
-    if "raspberry pi 5" in model or "raspberry pi compute module 5" in model:
-        return TIER_RPI5
-    if "raspberry pi 4" in model or "raspberry pi compute module 4" in model:
-        return TIER_RPI4
-    return None
-
-
 def detect_device_tier() -> str:
     """Best-effort detection. Falls back to ``unknown`` so callers can decide
     whether to error or accept an explicit override.
@@ -151,12 +131,12 @@ def detect_device_tier() -> str:
     if override:
         logger.info("device tier from env: %s", override)
         return override
-    for fn in (_detect_jetson_tier, _detect_rk_tier, _detect_rpi_tier):
+    for fn in (_detect_jetson_tier, _detect_rk_tier):
         tier = fn()
         if tier:
             logger.info("device tier auto-detected: %s", tier)
             return tier
-    logger.warning("device tier unknown — no Jetson/RK/RPi signature found")
+    logger.warning("device tier unknown — no Jetson/RK signature found")
     return TIER_UNKNOWN
 
 
@@ -182,14 +162,7 @@ PRESET_TABLE: dict[tuple[str, str], str] = {
     (TIER_JETSON_ORIN_NX,   "lite_zh_en"):  "jetson-zh-en",
     (TIER_JETSON_ORIN_AGX,  "lite_zh_en"):  "jetson-zh-en",
 
-    # RPi — ASR-only preset (asr_zh_en) for CM4 / RPi4 with no spare CPU
-    # budget for TTS. Reference: https://github.com/Allenkzl/Local-Automatic-Speech-Recognition
-    (TIER_RPI4, "asr_zh_en"): "rpi4-asr-zh-en",
-    # RPi5 inherits the same ASR-only profile by default; future
-    # rpi5-lite-zh-en would add Matcha TTS on top when validated.
-    (TIER_RPI5, "asr_zh_en"): "rpi4-asr-zh-en",
-
-    # RK — multilang preset (Qwen3 ASR via RKNN/RKLLM + Matcha TTS via RKNN).
+    # RK — multilang preset(Qwen3 ASR via RKNN/RKLLM + Matcha TTS via RKNN).
     # Backed by rkvoice-stream submodule; needed env to drive its backend
     # away from the rk3576/w8a8 defaults is set in the profile JSON.
     (TIER_RK3576, "multilang"): "rk3576-multilang",
@@ -198,7 +171,6 @@ PRESET_TABLE: dict[tuple[str, str], str] = {
     # Future entries (profiles not yet authored):
     #   (TIER_RK3576, "lite_zh_en"): "rk3576-lite-zh-en",
     #   (TIER_RK3588, "lite_zh_en"): "rk3588-lite-zh-en",
-    #   (TIER_RPI5,   "lite_zh_en"): "rpi5-lite-zh-en",
 }
 
 KNOWN_PRESETS = sorted({preset for _, preset in PRESET_TABLE.keys()})

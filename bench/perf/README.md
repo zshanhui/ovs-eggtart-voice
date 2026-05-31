@@ -55,7 +55,6 @@ python bench/perf/perf.py v2v --base-url http://localhost:8621 --llm-delay 800 -
 python bench/perf/perf.py concurrent --parallel 2 --mode asr_tts_simul \
   --base-url http://localhost:8621
 
-# Full matrix (10-15 min on Jetson; longer on RPi)
 python bench/perf/perf.py matrix --base-url http://localhost:8621 \
   --container seeed-nano-v111
 
@@ -129,9 +128,8 @@ python bench/perf/perf.py matrix --base-url http://orin-nano.local:8621 \
 python bench/perf/perf.py matrix --base-url http://radxa.local:8621 \
   --container seeed-rk-v11
 
-# Raspberry Pi 5 (lite_zh_en preset)
+# [unsupported] 5 (lite_zh_en preset)
 python bench/perf/perf.py matrix --base-url http://harvest-pi.local:8621 \
-  --container seeed-rpi-litezhen
 ```
 
 ## Metric definitions

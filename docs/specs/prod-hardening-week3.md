@@ -641,7 +641,7 @@ Recommendation rationale:
 - If Approach C cannot pass the qwen3-style gate, do not keep iterating blindly.
 ## Deliverable 3: Multi-Device E2E Parity Test Harness
 ### Overview
-Deliverable 3 designs a parity harness across Jetson, RK3576/RK3588, and Raspberry Pi plus Hailo.
+Deliverable 3 designs a parity harness across Jetson, RK3576/RK3588, and [unsupported] plus Hailo.
 Goal:
 - The same API calls should produce functionally equivalent results across device classes.
 This is not a benchmark leaderboard.

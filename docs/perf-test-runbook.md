@@ -12,7 +12,6 @@ Branch: `qwen3tts-accurate-20260507` (latest commit ≥ `f3ab241`).
 |---|---|---|
 | Jetson Orin (Nano/NX/AGX) | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.12-highperf` | 3.14 GB class |
 | RK3576 / RK3588 | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rk-v1.4-closedloop` | 767 MB |
-| RPi 4 / 5 (CM4 / CM5) | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rpi-v1.0-onnx` | 560 MB class |
 
 History — Jetson image patches (each fix forced a rebake):
 - v1.0 → first slim bake (CMD `sleep 9999` bug, no TRT libs)
@@ -31,16 +30,13 @@ History — Jetson image patches (each fix forced a rebake):
 Use v1.12-highperf going forward.
 
 All three are self-contained for their device family. Jetson and RK images are
-in the mission registry; RPi images may still be on-device builds, so use
 `docker save` or registry push when distributing to new boards.
 
 ## Preset matrix (verified end-to-end)
 
-| Preset | Jetson Nano | Jetson NX/AGX | RK3576 | RK3588 | RPi5/CM5 | RPi4/CM4 |
 |---|---|---|---|---|---|---|
 | **voice_clone**  (Qwen3 ASR + Qwen3 TTS) | ✅ | ☐ | — | — | — | — |
 | **multilang**    (Qwen3 ASR + Matcha TTS) | ✅ | ☐ | ☐ | ✅ | — | — |
-| **lite_zh_en**   (Paraformer + Matcha) | ☐ DL slow | ☐ DL slow | ☐ planned | ☐ planned | ✅ via rpi5-default | — |
 | **asr_zh_en**    (Paraformer only) | — | — | — | — | ✅ | ✅ |
 
 Legend: ✅ verified `/health` 200 on real hardware. ⚠️ runs but needs an
@@ -55,7 +51,6 @@ After today's sweep:
 |---|---|---|---|---|---|
 | orin-nano | `seeed-local-voice` | jetson-v1.12-highperf | 8621 (host net) | jetson-multilang-highperf | ✅ both ready in latest product gate |
 | radxa | `seeed-local-voice` | rk-v1.4-closedloop | 8621 (host net) | rk3588-default / multilang | ✅ both ready in latest product gate |
-| harvest-pi | `seeed-local-voice` | rpi-v1.0-onnx | 8000 | rpi5-default | ✅ both ready in latest product gate |
 
 `docker ps` on each device confirms current state.
 
@@ -144,7 +139,6 @@ The analogous RK flow should be:
    mounts, update the device BSP/runtime, or use an artifact set that matches
    the installed runtime. `RK_RUNTIME_STRICT=0` is only for debugging.
 
-RPi/CM profiles are simpler: there is no compiled engine gate; download the
 ONNX/sherpa model package and run it directly with CPU ONNX Runtime.
 
 **multilang on RK3588 (Qwen3 ASR via NPU + hybrid Matcha TTS)**
@@ -169,26 +163,17 @@ validated RK3588 TTS release path uses `TTS_BACKEND=matcha_rknn`,
 acoustic runs on ORT and Vocos runs on RKNN/NPU. The full RKNN Matcha path
 (`MATCHA_USE_ORT=0`, sequence length 96, frames 256) remains experimental.
 
-### Raspberry Pi 5 / 4 / CM4 / CM5 (harvest-pi)
 
 CPU-only (sherpa-onnx). No `--runtime nvidia`, no `--privileged`.
 
-**asr_zh_en (RPi4/CM4 minimum: Paraformer streaming, no TTS)**
 ```bash
-docker run -d --name seeed-rpi-asr -p 8621:8000 \
   -e OVS_PRESET=asr_zh_en \
   -v seeed-models:/opt/models \
-  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rpi-v1.0-onnx
 ```
 
-**lite_zh_en on RPi5/CM5 (Paraformer + Matcha CPU)**
 
-Until `lite_zh_en × rpi5` is added to PRESET_TABLE, use explicit profile:
 ```bash
-docker run -d --name seeed-rpi-lite -p 8621:8000 \
-  -e OVS_PROFILE=rpi5-default \
   -v seeed-models:/opt/models \
-  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rpi-v1.0-onnx
 ```
 
 ## Endpoints to measure
@@ -263,21 +248,18 @@ Corpus: 20 FLEURS files (10 zh + 10 en, 3-15s, sha256-locked). CER is character-
 
 `fRTF = eos_to_final_ms / audio_dur_ms`. Independent of client-side realtime pacing.
 
-| Group | **Jetson Orin Nano** (Qwen3 TRT, voice_clone) | **RK3588** (Qwen3 RKNN w8a8, multilang) | **RK3576** (Qwen3 RKNN w4a16, multilang) | **RPi5** (sherpa-onnx, lite_zh_en) |
 |---|---:|---:|---:|---:|
 | short/zh (~3s) | **0.084** | 0.220 | 0.397 | **0.000** |
 | short/en (~3s) | **0.072** | 0.254 | 0.386 | **0.000** |
 | long/zh (~13s)  | 0.063 | **0.030** | 0.538 | **0.000** |
 | long/en (~12s)  | 0.064 | 0.063 | 0.666 | **0.000** |
 
-- **RPi5 ≈ 0**: sherpa is fully streaming, encoder + decoder both emit during chunk send; finalize is just a flush
 - **Nano/RK3588 long-audio ~0.03-0.06**: both run Qwen3 ASR, encoder is fast for long content because mel batches stack efficiently
 - **RK3576 ~0.4-0.7**: smaller NPU + w4a16 (4-bit) quant trade speed for fit; still well under realtime (RTF<1.0)
 - **Nano short-after-long was a 4× cold-tactic regression**, fixed by pre-warming TRT shapes 1..6 at boot (see `EDGE_LLM_ASR_PREWARM_MAX`)
 
 ### Quality: CER/WER p50 (lower=better)
 
-| Group | Nano | RK3588 | RK3576 | RPi5 |
 |---|---:|---:|---:|---:|
 | short/zh CER | 5.3% | **2.6%** | 5.3% | 10.5% |
 | short/en WER | **0.0%** | 10.0% | 13.1% | 35.7% |
@@ -285,7 +267,6 @@ Corpus: 20 FLEURS files (10 zh + 10 en, 3-15s, sha256-locked). CER is character-
 | long/en WER | **3.0%** | 5.5% | 5.5% | 23.6% |
 
 - **English short**: Nano wins (0%) — Qwen3 + TRT-EdgeLLM clearly better than RKNN port + sherpa
-- **Chinese**: Nano/RK3588/RK3576 (all Qwen3 family) within ~5pp of each other; RPi5 (sherpa) trails by ~10pp
 - **All Qwen3 variants share the same proper-noun limitation** ("Oravec" → "Work" on zh_long_03); fixing requires model-side tuning, not a device problem
 
 ### Known shared issues (today, not blocking)
@@ -295,7 +276,6 @@ Corpus: 20 FLEURS files (10 zh + 10 en, 3-15s, sha256-locked). CER is character-
 
 ## Measured TTS perf (local mode, 2026-05-13)
 
-| Group | Nano (Qwen3 TRT voice_clone) | RK3588 (matcha_rknn) | RK3576 (matcha_rknn + ORT) | RPi5 (sherpa matcha) |
 |---|---:|---:|---:|---:|
 | short/zh RTF | 0.425 | **0.071** | 0.163 | **0.078** |
 | long/zh RTF  | 0.410 | **0.135** | 0.144 | **0.077** |
@@ -303,7 +283,6 @@ Corpus: 20 FLEURS files (10 zh + 10 en, 3-15s, sha256-locked). CER is character-
 | short/zh TFD | 4ms | 4ms | 6ms | 2ms |
 | long/zh total | 6738ms | 812ms | 1560ms | 941ms |
 
-- **RK3588 matcha_rknn ≈ RPi5 sherpa matcha** (both ~0.07-0.08 RTF) — RK NPU lifts Matcha decoder ~3-5× faster than ARM CPU, but Matcha's CNN backbone is small enough that sherpa-onnx on RPi5 stays competitive
 - **RK3576 ~2× slower than RK3588**: smaller NPU (2 cores @ 2 TOPS vs 6 TOPS on RK3588) + matcha encoder/estimator/decoder on ORT-CPU fallback (only vocos on NPU). Still well under realtime (0.14-0.22 RTF).
 - **Nano Qwen3 TTS slowest** (0.4× RTF) because it's a much bigger model targeting voice cloning + multi-language; tradeoff: highest quality (voice clone)
 
@@ -316,25 +295,20 @@ Corpus: 20 FLEURS files (10 zh + 10 en, 3-15s, sha256-locked). CER is character-
 
 EOS → first TTS audio chunk, `--llm-delay=0` (forced EOS):
 
-| Group | Nano | RPi5 |
 |---|---:|---:|
 | short/zh | 325ms | **5ms** |
 | long/zh  | 909ms | **4ms** |
 | short/en | 277ms | 3ms |
 | long/en  | 810ms | 4ms |
 
-- **RPi5 EOS→Audio ~4ms** because forced-EOS skips LLM and sherpa offline ASR finalize is ~1ms. Realistic V2V on RPi5 = forced-EOS = (4ms) + LLM placeholder + sherpa TTS TFD ≈ LLM bound + 2ms.
-- **Nano dominated by Qwen3 ASR finalize** (TRT accumulating encoder + LLM decode at EOS). RPi5 streaming sherpa-CTC has none.
 
 ## Measured concurrent (parallel=2, asr+tts simul, 2026-05-13)
 
 | Device | ASR RTF p50 | TTS RTF p50 | ASR wall p50 | TTS wall p50 |
 |---|---:|---:|---:|---:|
 | Nano | 1.095 | **1.232** ⚠️ | 4298ms | 5323ms |
-| RPi5 | 1.025 | **0.121** 🌟 | 4011ms | 281ms |
 
 - Nano TTS RTF > 1 at parallel=2 — GPU saturated. Voice_clone path is compute-bound.
-- RPi5 sherpa: massive headroom under concurrent load — TTS RTF stays 0.12 (vs 0.08 single-stream).
 
 ## Suggested perf table (template)
 
@@ -345,9 +319,6 @@ EOS → first TTS audio chunk, `--llm-delay=0` (forced EOS):
 | Jetson Orin NX | sm87 16GB | voice_clone | **0.400** | **0.079** | **0.066** | 5.3% | **0.0%** | 3.14 GB (v1.12 + hot-mount workers)¹ |
 | RK3588 (Radxa ROCK 5T) | rk3588 16GB | multilang | **0.071** | 0.220 | **0.030** | **2.6%** | 10.0% | 1.38 GB (rk-v1.2) |
 | RK3576 (cat-remote) | rk3576 8GB | multilang | **0.163** | 0.397 | 0.538 | 5.3% | 13.1% | 1.38 GB (rk-v1.2) |
-| RPi5 | BCM2712 8GB | lite_zh_en | **0.078** | **0.000** | **0.000** | 10.5% | 35.7% | 560 MB (rpi-v1.1) |
-| RPi5 | BCM2712 8GB | asr_zh_en | — | TBD | TBD | TBD | TBD | 560 MB |
-| RPi4 / CM4 | BCM2711 4GB | asr_zh_en | — | TBD | TBD | TBD | TBD | 560 MB |
 
 Measured 2026-05-13 (local mode, 5 warmup + 10 runs); see "Measured ASR perf" section above for full breakdown.
 
@@ -365,7 +336,6 @@ V2V forced-EOS llm=0 (warmup 3 + 5 runs): short/zh 323ms; long/zh 876ms; short/e
 
 ## Common gotchas
 
-- **`OVS_PROFILE=...` overrides PRESET.** Don't pass both. New v1.7 / rk-v1.1 / rpi-v1.1 images do NOT bake a default PROFILE.
 - **HF_ENDPOINT for China users**: set `https://hf-mirror.com` so engine_resolver can pull bundles. Defaults to `https://huggingface.co` (works internationally).
 - **Jetson multilang requires the `qwen3-edgellm-jetson` artifact set** at the path the profile expects. The `-v /tmp/nano-audit:/opt/models/qwen3-edgellm:ro` mount is what supplies it on Nano; for AGX/NX you must `hf download harvestsu/qwen3-edgellm-jetson-artifacts --local-dir <path>` first.
 - **RK image vendors userspace runtime libs.** Do not bind-mount
@@ -401,6 +371,4 @@ docker run -d --runtime nvidia --network host \
 # RK
 docker run ... seeed-local-voice:rk-v1.0   # works but uses old (rk3576-default) baked profile
 
-# RPi
-docker run ... seeed-local-voice:rpi-v1.0  # original Allenkzl-inspired CLI was the reference
 ```

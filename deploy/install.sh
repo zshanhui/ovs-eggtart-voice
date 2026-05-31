@@ -4,14 +4,12 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  deploy/install.sh [--target auto|jetson|rk3576|rk3588|rpi] [--pull] [--build] [--verify]
+  deploy/install.sh [--target auto|jetson|rk3576|rk3588] [--pull] [--build] [--verify]
 
 Examples:
   deploy/install.sh --pull --verify
   deploy/install.sh --target jetson --pull --verify
   deploy/install.sh --target rk3588 --pull --verify
-  deploy/install.sh --target rpi --pull --verify
-
 Environment overrides:
   LANGUAGE_MODE, OVS_PROFILE, RK_ARTIFACT_SET,
   QWEN3_ARTIFACT_SET, QWEN3_HF_REPO_ID, OVS_PORT,
@@ -39,10 +37,6 @@ detect_target() {
     else
       echo "rk3576"
     fi
-    return
-  fi
-  if [[ -r /proc/device-tree/model ]] && tr -d '\0' < /proc/device-tree/model | grep -qi "raspberry pi"; then
-    echo "rpi"
     return
   fi
   case "$(uname -m)" in
@@ -90,7 +84,7 @@ done
 
 if [[ -z "$target" || "$target" == "auto" ]]; then
   if ! target="$(detect_target)"; then
-    echo "Could not auto-detect target. Re-run with --target jetson|rk3576|rk3588|rpi." >&2
+    echo "Could not auto-detect target. Re-run with --target jetson|rk3576|rk3588." >&2
     usage >&2
     exit 2
   fi
@@ -111,10 +105,6 @@ case "$target" in
   rk3588|radxa)
     canonical_target="rk3588"
     compose_file="deploy/docker-compose.radxa.yml"
-    ;;
-  rpi|rpi4|rpi5|cm4|cm5)
-    canonical_target="rpi"
-    compose_file="deploy/docker-compose.rpi.yml"
     ;;
   *)
     echo "Unsupported target: $target" >&2
@@ -168,12 +158,6 @@ case "$canonical_target" in
     fi
     echo "RK artifact manifest: ${RK_ARTIFACT_MANIFEST:-deploy/artifacts/rk_manifest.json}"
     echo "RK artifact set: ${RK_ARTIFACT_SET:-compose default}"
-    ;;
-  rpi)
-    arch="$(uname -m)"
-    if [[ "$arch" != "aarch64" && "$arch" != "arm64" ]]; then
-      warn "Raspberry Pi images are built for 64-bit ARM; current architecture is ${arch}."
-    fi
     ;;
 esac
 

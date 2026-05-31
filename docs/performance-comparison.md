@@ -1,7 +1,7 @@
 # Performance Comparison — Choosing a Device
 
 OpenVoiceStream runs the same HTTP/WS API across Jetson, Rockchip, and
-Raspberry Pi. This page shows **measured numbers** for each platform so
+[unsupported]. This page shows **measured numbers** for each platform so
 you can pick the device that fits your product, not your spec sheet.
 
 All numbers are **local-mode** (client runs on the device, talks to
@@ -17,7 +17,7 @@ no network noise.
 | Highest accuracy on English + multilingual | **Jetson Orin Nano** |
 | Same as Nano but 2-3 concurrent users | **Jetson Orin NX 16GB** |
 | Best Chinese accuracy, mid-tier latency | **Radxa ROCK 5T (RK3588)** |
-| Lowest cost, decent zh+en for voice commands | **Raspberry Pi 5** |
+| Lowest cost, decent zh+en for voice commands | **[unsupported] 5** |
 | Multilingual on a tight budget (ja/ko/es/de/fr) | **RK3576** |
 | Voice cloning (your own voice synthesised) | **Jetson Orin Nano** (the only platform that supports it today) |
 
@@ -65,18 +65,16 @@ analysis.
 |---|---|---|---|---:|---:|---|---|
 | Jetson Orin Nano | `jetson-v1.12-highperf` / `jetson-zh-en` | `matcha_trt` | `paraformer_trt` | smoke PASS | closed-loop PASS | PASS | Rerun on 2026-05-17 after Paraformer FP32 encoder, profile selection, preroll, and decode fix. Round-trip similarity 1.00 (`你好，今天天气真不错。` -> `你好今天天气真不错`). |
 | RK3588 | `rk-v1.4-closedloop` / `rk3588-default` | `matcha_rknn` hybrid | `rk:qwen3_asr_rk` | 0.161 | 30.8% | PASS | Rerun on 2026-05-17 15:23:34. Release profile uses Matcha acoustic on ORT and Vocos on RKNN/NPU; full RKNN Matcha remains experimental. Round-trip similarity 1.00. |
-| Raspberry Pi 5 | `rpi-v1.0-onnx` / `rpi5-default` | `sherpa` | `sherpa_asr` | 0.172 | 7.7% | PASS | Rerun on 2026-05-17 15:23:34. CPU-only zh+en path, round-trip similarity 0.80. |
 
 Raw reports:
 
 - `bench/product_results/product_eval_20260517-135525.md` — Jetson Orin Nano
-- `bench/product_results/product_eval_20260517-152334.md` — RK3588 and Raspberry Pi 5
+- `bench/product_results/product_eval_20260517-152334.md` — RK3588 and [unsupported] 5
 
 ## Historical measured numbers (2026-05-13)
 
 ### Speech recognition
 
-| Group | **Orin Nano** (voice_clone) | **Orin NX** (voice_clone) | **RK3588** (multilang) | **RK3576** (multilang) | **RPi5** (lite_zh_en) |
 |---|---:|---:|---:|---:|---:|
 | Short Chinese CER | 5.3 % | 5.3 % | **2.6 %** | 5.3 % | 10.5 % |
 | Short English WER | **0.0 %** | **0.0 %** | 10.0 % | 13.1 % | 35.7 % |
@@ -91,7 +89,6 @@ normalisation, the raw CER on `long/zh` looks 3-4× worse purely from
 
 ### Speech synthesis
 
-| Group | Orin Nano (voice_clone) | Orin NX (voice_clone) | RK3588 (matcha_rknn) | RK3576 (matcha + ORT) | RPi5 (sherpa matcha) |
 |---|---:|---:|---:|---:|---:|
 | Short Chinese TTS RTF | 0.42 | 0.40 | **0.07** | 0.16 | **0.08** |
 | Long Chinese TTS RTF  | 0.41 | 0.39 | 0.14 | 0.14 | **0.08** |
@@ -107,14 +104,12 @@ V2V means: user says something, the device transcribes it, then speaks
 back. The number below is purely the speech part of that round-trip —
 your LLM adds however long it takes to respond on top.
 
-| Group | Orin Nano | Orin NX | RPi5 |
 |---|---:|---:|---:|
 | Short Chinese | 325 ms | 323 ms | **5 ms**³ |
 | Long Chinese  | 909 ms | 876 ms | **4 ms**³ |
 | Short English | 277 ms | 276 ms | **3 ms**³ |
 | Long English  | 810 ms | 823 ms | **4 ms**³ |
 
-³ RPi5 looks unbelievably fast because sherpa-onnx is *fully streaming* —
 the transcription is already done by the time the user stops speaking,
 so finalize is essentially free. Nano's Qwen3 model is more accurate but
 processes audio in one batch at the end, paying ~300-900 ms there.
@@ -125,7 +120,6 @@ processes audio in one batch at the end, paying ~300-900 ms there.
 |---|---:|---:|---|
 | Orin Nano | 1.10 | 1.23 | GPU saturates at 2 concurrent users — still works, but slows down |
 | **Orin NX** | 1.11 | **0.42** | **3× headroom over Nano** — 2-3 concurrent users without RTF blowup, the standout NX advantage |
-| RPi5      | 1.03 | **0.12** | Loads of headroom — sherpa-onnx on RPi5 can handle 4+ concurrent streams |
 
 ---
 
@@ -133,7 +127,7 @@ processes audio in one batch at the end, paying ~300-900 ms there.
 
 ### "Speech-controlled appliance / robot, 1 user, mostly commands"
 
-→ **Raspberry Pi 5** with `lite_zh_en` preset. Costs ~$80, 1-2 s ASR
+→ **[unsupported] 5** with `lite_zh_en` preset. Costs ~$80, 1-2 s ASR
 latency, decent zh+en for command vocabulary. WER 36 % on free-form
 English is noticeable but fine for fixed command sets.
 
@@ -155,7 +149,6 @@ where Nano would visibly degrade.
 
 → **Radxa ROCK 5T (RK3588)** with `multilang` preset. ~$200, best CER
 on Chinese short sentences (2.6 %), supports 50+ languages via Qwen3.
-TTS is on par with RPi5 (Matcha 0.07 RTF). Mature, well-tested.
 
 ### "Tightest BOM, multilingual end-to-end"
 
@@ -168,7 +161,6 @@ the matrix but the cheapest with multilingual coverage.
 
 → **Jetson Orin Nano**. Today, this is the only device in the matrix
 with a working voice clone path. The trade-off: slower TTS (RTF 0.42
-vs 0.07-0.08 on RK / RPi), so your speakers wait ~half the audio
 duration before they hear anything.
 
 ---
@@ -177,8 +169,7 @@ duration before they hear anything.
 
 - **Jetson AGX Orin 32GB** — supports all presets, including the
   largest multilang model. Not on the bench rack yet.
-- **Raspberry Pi 4 / CM4** — only `asr_zh_en` preset (no TTS). Smaller
-  Cortex-A72; expect 2-3× slower than RPi5.
+- **[unsupported] 4 / CM4** — only `asr_zh_en` preset (no TTS). Smaller
 - **RK3576 multilingual smoke** (ja/ko/es/de/fr) — corpus is in place
   but a full multilingual run hasn't been done yet on RK3576.
 
@@ -229,7 +220,6 @@ Full methodology notes, raw run data, and the internal runbook live in
    would judge correct ("the model said the number, just in a
    different form"). Both numbers are recorded in the raw JSON if you
    need the unforgiving version.
-3. **RPi5's 0 ms finalize is a methodology artefact** of forced-EOS
    mode (we tell the server "the audio is done now"). Real users
    tend to trail off and rely on the server's VAD to detect that;
    add ~300-500 ms of VAD hangover for product latency budgets.

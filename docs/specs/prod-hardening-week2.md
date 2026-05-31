@@ -18,7 +18,6 @@ Repository: `seeed-local-voice`.
 - Read `deploy/docker-compose.yml`.
 - Read `deploy/docker-compose.radxa.yml`.
 - Read `deploy/docker-compose.rk.yml`.
-- Read `deploy/docker-compose.rpi.yml`.
 - This spec does not re-spec Week 1 behavior already shipped.
 - This spec covers exactly three deliverables.
 
@@ -223,8 +222,6 @@ Repository: `seeed-local-voice`.
 - `deploy/docker-compose.radxa.yml:27` starts its environment block.
 - `deploy/docker-compose.rk.yml:13` defines the RK3576 `speech` service.
 - `deploy/docker-compose.rk.yml:29` starts its environment block.
-- `deploy/docker-compose.rpi.yml:10` defines the RPi `speech` service.
-- `deploy/docker-compose.rpi.yml:18` starts its environment block.
 
 ### 2. New Module Paths And Function Signatures
 
@@ -690,7 +687,6 @@ Repository: `seeed-local-voice`.
 - Adding `status()` should not change old monkeypatches.
 - `/readyz` response schema additions should be additive.
 - Compose healthchecks already use `/readyz`; watchdog false will restart or mark unhealthy depending orchestrator policy.
-- On RPi CPU-only, watchdog must always OK.
 
 ### 8. Test Checklist
 
@@ -720,7 +716,6 @@ Repository: `seeed-local-voice`.
 - Integration: `/readyz` returns 503 when watchdog cached state is false.
 - Integration: `/readyz` not-ready body includes `gpu_watchdog_failed`.
 - Integration: `/readyz` not-ready body includes watchdog detail with reason.
-- Smoke: RPi CPU-only profile remains ready after watchdog starts.
 - Smoke: RK profile can read at least one RK health signal.
 - Smoke: Jetson profile can read at least one Jetson health signal.
 - Smoke: watchdog loop CPU overhead is negligible over 60 seconds idle.
@@ -767,7 +762,6 @@ Repository: `seeed-local-voice`.
 - `deploy/docker-compose.yml:28` starts Jetson speech environment block.
 - `deploy/docker-compose.radxa.yml:27` starts Radxa speech environment block.
 - `deploy/docker-compose.rk.yml:29` starts RK3576 speech environment block.
-- `deploy/docker-compose.rpi.yml:18` starts RPi speech environment block.
 
 ### 2. New Module Paths And Function Signatures
 
@@ -901,8 +895,6 @@ Repository: `seeed-local-voice`.
 - Add `OVS_LOG_FORMAT=${OVS_LOG_FORMAT:-json}` to the environment block starting at `deploy/docker-compose.radxa.yml:27`.
 - `deploy/docker-compose.rk.yml` has `speech` service at `deploy/docker-compose.rk.yml:13`.
 - Add `OVS_LOG_FORMAT=${OVS_LOG_FORMAT:-json}` to the environment block starting at `deploy/docker-compose.rk.yml:29`.
-- `deploy/docker-compose.rpi.yml` has `speech` service at `deploy/docker-compose.rpi.yml:10`.
-- Add `OVS_LOG_FORMAT=${OVS_LOG_FORMAT:-json}` to the environment block starting at `deploy/docker-compose.rpi.yml:18`.
 - Do not add the env var to the Jetson `translator` service at `deploy/docker-compose.yml:81`.
 - Do not change healthcheck commands.
 - Do not rename services.

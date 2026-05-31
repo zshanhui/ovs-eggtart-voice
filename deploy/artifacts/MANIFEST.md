@@ -65,13 +65,6 @@ Artifact sets:
 
 ## Raspberry Pi / CPU Artifacts
 
-Raspberry Pi uses ONNX through sherpa-onnx. It does not use precompiled engine
-artifacts and therefore has no device-runtime compatibility matrix.
-
-Validated image:
-
-- `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rpi-v1.0-onnx`
-
 ## Legacy Local Files
 
 The older files under `deploy/artifacts/engines/` and `deploy/artifacts/onnx/` describe the

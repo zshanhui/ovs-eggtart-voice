@@ -32,8 +32,6 @@ jobs:
           docker compose -f deploy/docker-compose.yml config --quiet
           docker compose -f deploy/docker-compose.rk.yml config --quiet
           docker compose -f deploy/docker-compose.radxa.yml config --quiet
-          docker compose -f deploy/docker-compose.rpi.yml config --quiet
-
       - name: Python compile gate
         run: |
           python -m py_compile \

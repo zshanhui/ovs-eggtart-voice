@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project is an edge V2V voice pipeline for ASR, LLM-driven turn handling, and TTS on Jetson Orin Nano/NX, RK3576/RK3588, and Raspberry Pi plus Hailo.
+This project is an edge V2V voice pipeline for ASR, LLM-driven turn handling, and TTS on Jetson Orin Nano/NX, RK3576/RK3588, and [unsupported] plus Hailo.
 Week 1 hardening protects the public API boundary, rejects overload immediately, and separates process liveness from backend readiness.
 This is design only; it specifies behavior, modules, touch points, and verification, with no implementation code.
 
@@ -127,7 +127,6 @@ Docker discovery:
 - `deploy/docker/` contains Dockerfiles and entrypoint scripts.
 - `deploy/docker/docker-compose*.yml`: not found — verify before implementing.
 - `deploy/docker/docker-compose*.yaml`: not found — verify before implementing.
-- Repo-level compose files outside that requested directory exist: `deploy/docker-compose.yml`, `deploy/docker-compose.radxa.yml`, `deploy/docker-compose.rk.yml`, `deploy/docker-compose.rpi.yml`.
 
 ## Deliverable 1: Optional API-Key Auth
 
@@ -872,7 +871,6 @@ Files found outside requested path:
 - `deploy/docker-compose.yml`.
 - `deploy/docker-compose.radxa.yml`.
 - `deploy/docker-compose.rk.yml`.
-- `deploy/docker-compose.rpi.yml`.
 
 Before implementation:
 
@@ -1135,7 +1133,6 @@ Likely files if scope is corrected:
 - `deploy/docker-compose.yml`
 - `deploy/docker-compose.radxa.yml`
 - `deploy/docker-compose.rk.yml`
-- `deploy/docker-compose.rpi.yml`
 
 Verify:
 

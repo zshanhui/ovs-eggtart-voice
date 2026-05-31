@@ -1,6 +1,6 @@
 # OpenVoiceStream
 
-**Native-engine streaming ASR + TTS for edge dialogue.** One container, stable HTTP/WebSocket APIs, and validated paths across Jetson, Rockchip, and Raspberry Pi ecosystems.
+**Native-engine streaming ASR + TTS for edge dialogue.** One container, stable HTTP/WebSocket APIs, and validated paths across Jetson, Rockchip ecosystems.
 
 <p align="center">
   <a href="https://github.com/suharvest/openvoicestream"><img src="https://img.shields.io/github/stars/suharvest/openvoicestream?style=social" alt="GitHub stars" /></a>
@@ -8,7 +8,7 @@
   <a href="#tts-model-comparison"><img src="https://img.shields.io/badge/TTS-Matcha--TTS%20%7C%20Qwen3--TTS%20%7C%20Kokoro-f97316.svg" alt="TTS: Matcha-TTS, Qwen3-TTS, Kokoro" /></a>
   <a href="#architecture"><img src="https://img.shields.io/badge/engines-TensorRT--EdgeLLM%20%7C%20RKNN%20%7C%20sherpa--onnx-16a34a.svg" alt="Engines: TensorRT-EdgeLLM, RKNN, sherpa-onnx" /></a>
   <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/deploy-Docker-2563eb.svg" alt="Deploy with Docker" /></a>
-  <a href="#supported-devices"><img src="https://img.shields.io/badge/ecosystems-Jetson%20%7C%20Rockchip%20%7C%20Raspberry%20Pi-65a30d.svg" alt="Supported ecosystems: Jetson, Rockchip, Raspberry Pi" /></a>
+  <a href="#supported-devices"><img src="https://img.shields.io/badge/ecosystems-Jetson%20%7C%20Rockchip%20%7C%20Raspberry%20Pi-65a30d.svg" alt="Supported ecosystems: Jetson, Rockchip, [unsupported]" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-facc15.svg" alt="MIT license" /></a>
 </p>
 
@@ -29,13 +29,13 @@ local voice + LLM loop without changing the client API.
 </p>
 
 Board prices vary by region and kit contents. The point is the order of
-magnitude: simple Raspberry Pi-class boards can handle real-time voice input and
+magnitude: simple edge-class boards can handle real-time voice input and
 output, while Jetson-class edge AI boards can run expressive speech and local LLM
 dialogue without a per-call speech API bill.
 
 ## Quick Start
 
-Clone once on the target device. The installer validates the host, selects the
+Clone once on the target Jetson device. The installer validates the host, selects the
 right compose file, pulls the image, starts the service, and can run health,
 capability, TTS smoke, and TTS-to-ASR round-trip checks.
 
@@ -43,7 +43,7 @@ capability, TTS smoke, and TTS-to-ASR round-trip checks.
 git clone --recurse-submodules https://github.com/suharvest/openvoicestream.git
 cd openvoicestream
 
-# Auto-detect Jetson, Rockchip, or Raspberry Pi.
+# Auto-detect Jetson or Rockchip.
 deploy/install.sh --pull --verify
 ```
 
@@ -53,7 +53,7 @@ Choose explicitly when auto-detect is not enough:
 deploy/install.sh --target jetson --pull --verify
 deploy/install.sh --target rk3588 --pull --verify
 deploy/install.sh --target rk3576 --pull --verify
-deploy/install.sh --target rpi --pull --verify
+deploy/install.sh 
 ```
 
 After startup, the service listens on `http://device:8621`:
@@ -63,7 +63,6 @@ After startup, the service listens on `http://device:8621`:
 | Jetson | `http://device:8621` | `deploy/docker-compose.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.14-hotswap` |
 | RK3576 | `http://device:8621` | `deploy/docker-compose.rk.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rk-v1.4-closedloop` |
 | RK3588 | `http://device:8621` | `deploy/docker-compose.radxa.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rk-v1.4-closedloop` |
-| Raspberry Pi | `http://device:8621` | `deploy/docker-compose.rpi.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rpi-v1.0-onnx` |
 
 The published Docker images currently keep the previous registry namespace so
 existing deployments can pull the same artifacts during the rename.
@@ -71,7 +70,7 @@ existing deployments can pull the same artifacts during the rename.
 Manual verification:
 
 ```bash
-# Same default URL on Jetson, RK3576, RK3588, and Raspberry Pi.
+# Same default URL on Jetson, RK3576, RK3588.
 deploy/verify.sh --url http://device:8621 --tts-smoke --roundtrip
 curl http://device:8621/health
 ```
@@ -113,7 +112,7 @@ OVS_PROFILE=rk3576-paraformer-matcha \
 docker compose -f deploy/docker-compose.rk.yml up -d
 ```
 
-`deploy/install.sh --pull --verify` auto-detects Jetson/RK/RPi when run on the
+`deploy/install.sh --pull --verify` auto-detects Jetson/RK when run on the
 target device. The Jetson default stays on the lightweight `zh_en` path (Paraformer +
 Matcha) because it is the fastest path to reproduce. Use `jetson-paraformer-kokoro`
 for bilingual ASR with expressive English TTS, `jetson-kokoro-trt` for TTS-only,
@@ -153,7 +152,6 @@ Paraformer RKNN ASR with Matcha TTS.
 
 ```text
 ┌───────────────────────────────────────────────────────────┐
-│  Edge device (Jetson Orin / RK3576 / RK3588 / RPi 4–5)    │
 │                                                           │
 │  FastAPI service (container :8000; host default :8621)     │
 │  ├── WS /asr/stream    Streaming ASR                      │
@@ -310,7 +308,6 @@ tracked in [`docs/productization-status.md`](docs/productization-status.md).
 
 ### Cross-Device Benchmarks (measured 2026-05-18)
 
-Jetson/RPi rows are from the original local forced-EOS gate against
 `http://127.0.0.1:8621`. RK rows were rerun after the true-streaming fix with
 `QWEN3_ASR_CHUNK_CONFIRM=0`, `--eos vad`, and `--vad-silence-ms 800`; their V2V
 column is split `/asr/stream` plus `/tts/stream`.
@@ -325,7 +322,6 @@ column is split `/asr/stream` plus `/tts/stream`.
 | Orin NX `jetson-zh-en` | `jetson-v1.12-highperf` | `matcha_trt` | `paraformer_trt` | 0.018 | 0.015 | 10.5% | 58 ms |
 | RK3588 `rk3588-default` | `rk-v1.4-closedloop` | `rk:matcha_rknn` | `rk:qwen3_asr_rk` | 0.124 | 0.318 | 60.7% | 394 ms |
 | RK3576 `rk3576-default` | `rk-v1.4-closedloop` | `rk:matcha_rknn` | `rk:qwen3_asr_rk` | 0.290 | 0.265 | 63.2% | 1099 ms |
-| Raspberry Pi 5 `rpi5-default` | `rpi-v1.0-onnx` | `sherpa` | `sherpa_asr` | 0.078 | 0.000 | 20.0% | 3 ms |
 
 The previous RK rows were stale forced-EOS/chunk-confirm results. In the fixed
 rerun, standalone Matcha TTS first audio is 51 ms p50 on RK3588 and 65 ms p50
@@ -341,10 +337,9 @@ Deployment footprint from the same run:
 | Orin NX | 2.02 GB | 5.45 GB | 1.02 GiB | 13 s |
 | RK3588 | 767 MB | 3.31 GB ASR + 301 MB TTS | 4.09 GiB | 9 s |
 | RK3576 | 767 MB | 2.21 GB ASR + 351 MB TTS | 2.71 GiB | 15 s |
-| Raspberry Pi 5 | 568 MB | 2.19 GB | n/a from Docker stats | 9 s |
 
 Concurrency smoke (`parallel=2`, `asr_tts_simul`) passed on Jetson Nano/NX
-Paraformer+Matcha, RK3588, RK3576, and Raspberry Pi 5. Jetson p=2 is
+Paraformer+Matcha, RK3588, RK3576 5. Jetson p=2 is
 functional but TTS becomes throughput-bound (RTF ~1.3-1.4), so use Orin NX or a
 Qwen3 ASR + Matcha split when low-latency concurrent dialogue matters. Full raw
 JSON paths and methodology are in
@@ -359,7 +354,6 @@ available; the unused research models are kept as historical context.
 
 | Model | Current role | Streaming RTF p50 | First audio p50 | Notes |
 |-------|--------------|------------------:|----------------:|-------|
-| **Matcha-TTS + Vocos** | Default bilingual TTS | 0.018 on Orin NX, 0.075 on RK3588, 0.078 on RPi5 | 2.6-7.5 ms | Fastest practical TTS path; no voice clone. |
 | **Qwen3-TTS** | Multilingual voice clone | 0.417 on Orin NX, 0.470 on Orin Nano | 4.4-7.3 ms | Higher quality/features, much heavier than Matcha. |
 | **Kokoro v1.0** | English-only TTS | Not in this benchmark run | Historical ~130 ms TTFT | Kept for English-only deployments. |
 | CosyVoice3 | Research only | Not shipped | Historical ~800 ms TTFT | Higher quality, too heavy for this release. |
@@ -383,7 +377,6 @@ This sets MAXN power mode, locks CPU/GPU clocks, and disables dynamic frequency 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OVS_PROFILE` | unset | Preferred OpenVoiceStream profile selector, e.g. `jetson-zh-en`, `jetson-multilang-highperf-nx`, `rk3588-default`, `rpi5-default` |
 | `LANGUAGE_MODE` | `zh_en` | `zh_en` (Chinese+English), `en` (English only), or `multilanguage` (Qwen3, 52 langs; profiles usually set this for you) |
 | `TTS_PROVIDER` | `cuda` | ONNX execution provider |
 | `TTS_DEFAULT_SID` | `52` | Default TTS speaker ID (52=af_cute, 3=af_heart) — Sherpa only |
@@ -457,7 +450,7 @@ Auto-downloaded on first start and cached in a Docker volume:
 Measured Docker volume sizes in the current release are larger than individual
 model tarballs because they include compiled engines and profile-specific
 artifacts: 5.14-5.45 GB on Jetson, 2.56-3.61 GB on RK, and 2.19 GB on
-Raspberry Pi 5.
+[unsupported] 5.
 
 ## Supported Devices
 
@@ -467,12 +460,11 @@ OpenVoiceStream is validated on the following hardware. Any device in the same c
 |---|---|---|
 | **NVIDIA Jetson Orin** | Jetson Orin Nano 8GB, Orin NX 16GB, AGX Orin | CUDA 12.6 / JetPack 6.2. Full feature set including Qwen3 multilingual + voice clone. |
 | **Rockchip NPU** | Radxa ROCK 5T (RK3588), Banana Pi BPI-M5 Pro (RK3576) | RKNN runtime. Qwen3-ASR works; release TTS uses the validated hybrid Matcha path. |
-| **Raspberry Pi (CPU)** | Raspberry Pi 5 8GB, Raspberry Pi 4 4GB | CPU inference. Lowest BOM (~$80). Real-time zh+en commands. |
 
 Requirements: Docker plus enough disk for the image and model volume. Current
 measured footprints are about 7.5 GB total for Jetson, 3.2-4.4 GB for RK, and
-2.8 GB for Raspberry Pi 5. Runtime memory depends on the profile: about 1.0-2.1
-GiB on Jetson, 2.7-4.1 GiB on RK, and CPU-only on Raspberry Pi. On Jetson,
+2.8 GB for [unsupported] 5. Runtime memory depends on the profile: about 1.0-2.1
+GiB on Jetson, 2.7-4.1 GiB on RK, and CPU-only on [unsupported]. On Jetson,
 NVIDIA Container Runtime is required; on Rockchip, the host NPU driver
 (`rknpu`) must be loaded.
 
@@ -509,8 +501,6 @@ openvoicestream/
 │   └── docker/
 │       ├── Dockerfile.jetson  # Jetson Orin Nano/NX/AGX (zh_en or multilingual)
 │       ├── Dockerfile.rk      # Rockchip RK3576/RK3588 NPU
-│       └── Dockerfile.rpi     # Raspberry Pi 4/5 (CPU)
-├── configs/                 # Device profiles (Jetson, RK, RPi)
 ├── third_party/             # Submodules (independently maintained)
 │   ├── qwen3-edgellm-jetson # Qwen3 export + engine build for Jetson
 │   └── rkvoice-stream       # Rockchip NPU streaming voice runtime
@@ -525,7 +515,6 @@ Clone with `--recurse-submodules` to pull `third_party/*`, or run `git submodule
 
 - **Jetson highperf image** — `jetson-v1.13-highperf`, 2.02 GB, with host CUDA/TensorRT libraries mounted from JetPack and models/engines cached in `speech-models`. Ships the BackendManager hot-reload state machine (`POST /admin/backend/reload`, `GET /admin/backend/status`) for live profile swaps without container recreate. Image tags follow `jetson-v<MAJOR>.<MINOR>-<variant>` and are immutable once published; each release bumps the version and READMEs/compose files reference it explicitly so production upgrades require a deliberate commit rather than a floating tag.
 - **RK release image** — `rk-v1.4-closedloop`, 767 MB, with runtime-pinned RKNN dependencies and validated hybrid Matcha TTS.
-- **Raspberry Pi image** — `rpi-v1.0-onnx`, 568 MB, CPU-only ONNX path.
 
 See the 2026-05-18 benchmark report for image size, model volume,
 resident memory, startup time, and concurrency results.

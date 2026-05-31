@@ -18,9 +18,9 @@ services:
       dockerfile: deploy/docker/Dockerfile.jetson
       args:
         LANGUAGE_MODE: ${LANGUAGE_MODE:-zh_en}
-    # NOTE: this file covers the Jetson target. RK and Raspberry Pi run on
-    # different hosts (different runtime, different volumes) and have their
-    # own compose files: deploy/docker-compose.rk.yml, deploy/docker-compose.rpi.yml.
+    # NOTE: this file covers the Jetson target. RK runs on different hosts
+    # (different runtime, different volumes) and has its own compose files:
+    # deploy/docker-compose.rk.yml, deploy/docker-compose.radxa.yml.
     runtime: nvidia
     ipc: host
     ports:

@@ -22,7 +22,7 @@ _backend: Optional[TTSBackend] = None
 
 def is_configured() -> bool:
     """Profiles can declare tts_backend = null / omit it to run in ASR-only
-    mode (e.g. RPi4/CM4 with no spare CPU budget for TTS). Returns False in
+    mode. Returns False in
     that case; callers should skip preload and let /tts endpoints return 503.
     """
     try:
